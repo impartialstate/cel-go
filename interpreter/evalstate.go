@@ -30,6 +30,9 @@ type EvalState interface {
 	// SetValue sets the observed value of the expression id.
 	SetValue(int64, ref.Val)
 
+	// SetDetailedValue sets the observed value of the expression id along with its evaluation path.
+	SetDetailedValue(int64, []any, ref.Val)
+
 	// Reset clears the previously recorded expression values.
 	Reset()
 }
@@ -71,6 +74,13 @@ func (s *evalState) SetValue(exprID int64, val ref.Val) {
 	} else {
 		s.values[exprID] = val
 	}
+}
+
+// SetDetailedValue is an implementation of the EvalState interface method.
+func (s *evalState) SetDetailedValue(exprID int64, path []any, val ref.Val) {
+	// The default implementation of EvalState does not record detailed values.
+	// TODO: Implement detailed value recording.
+	// s.SetValue(exprID, val)
 }
 
 // Reset implements the EvalState interface method.

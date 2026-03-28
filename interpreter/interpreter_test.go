@@ -2503,3 +2503,70 @@ type testActivationWrapper struct {
 func (tw *testActivationWrapper) Unwrap() Activation {
 	return tw.Activation
 }
+
+func TestInterpreter_DetailedEvalState(t *testing.T) {
+	p, err := parser.NewParser(
+		parser.Macros(parser.AllMacros...),
+	)
+	if err != nil {
+		t.Fatalf("parser.NewParser() failed: %v", err)
+	}
+	parsed, errs := p.Parse(common.NewTextSource("[1, 2].all(x, x > 0)"))
+	if len(errs.GetErrors()) != 0 {
+		t.Fatalf("Parse() failed: %v", errs.ToDisplayString())
+	}
+	state := &testDetailedEvalState{
+		EvalState: NewEvalState(),
+		detailed:  make(map[int64][]detailedValue),
+	}
+	cont := containers.DefaultContainer
+	reg := newTestRegistry(t)
+	attrs := NewAttributeFactory(cont, reg, reg)
+	intr := newStandardInterpreter(t, cont, reg, reg, attrs)
+	interpretable, _ := intr.NewInterpretable(parsed,
+		EvalStateObserver(EvalStateFactory(func() EvalState { return state }), TrackDetailedState(true)))
+	vars := EmptyActivation()
+	result := interpretable.Eval(vars)
+	if result != types.True {
+		t.Errorf("Expected true, got: %v", result)
+	}
+
+	// The expression 'x > 0' has ID 4 in the parsed expression.
+	// We expect two detailed values for ID 4, one for each iteration.
+	details, found := state.detailed[13]
+	if !found {
+		t.Fatalf("No detailed values found for ID 14")
+	}
+	if len(details) != 2 {
+		t.Errorf("Expected 2 detailed values, got %d", len(details))
+	}
+	// Verify paths. Path should contain [comprehension_id, iter_val]
+	// Comprehension ID is 1.
+	for i, d := range details {
+		if len(d.path) < 2 {
+			t.Errorf("Iteration %d: expected path length >= 2, got %d", i, len(d.path))
+			continue
+		}
+		if d.path[len(d.path)-2] != int64(15) {
+			t.Errorf("Iteration %d: expected comprehension ID 1, got %v", i, d.path[len(d.path)-2])
+		}
+		expectedVal := types.Int(i + 1)
+		if !reflect.DeepEqual(d.path[len(d.path)-1], expectedVal) {
+			t.Errorf("Iteration %d: expected iter value %v, got %v", i, expectedVal, d.path[len(d.path)-1])
+		}
+	}
+}
+
+type testDetailedEvalState struct {
+	EvalState
+	detailed map[int64][]detailedValue
+}
+
+type detailedValue struct {
+	path []any
+	val  ref.Val
+}
+
+func (s *testDetailedEvalState) SetDetailedValue(exprID int64, path []any, val ref.Val) {
+	s.detailed[exprID] = append(s.detailed[exprID], detailedValue{path: path, val: val})
+}

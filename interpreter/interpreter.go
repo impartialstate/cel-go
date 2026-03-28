@@ -78,6 +78,15 @@ const (
 	CostLimitExceeded
 )
 
+// TrackDetailedState configures the EvalStateObserver to record the detailed evaluation path for
+// expressions evaluated within comprehensions.
+func TrackDetailedState(enabled bool) evalStateOption {
+	return func(fac *evalStateFactory) *evalStateFactory {
+		fac.trackDetailedState = enabled
+		return fac
+	}
+}
+
 // evalStateOption configures the evalStateFactory behavior.
 type evalStateOption func(*evalStateFactory) *evalStateFactory
 
@@ -166,7 +175,8 @@ func asEvalState(vars Activation) (EvalState, bool) {
 
 // evalStateFactory holds a reference to a factory function that produces an EvalState instance.
 type evalStateFactory struct {
-	factory func() EvalState
+	factory            func() EvalState
+	trackDetailedState bool
 }
 
 // InitState produces an EvalState instance and bundles it into the Activation in a way which is
@@ -191,6 +201,25 @@ func (et *evalStateFactory) Observe(vars Activation, id int64, programStep any, 
 		return
 	}
 	state.SetValue(id, val)
+	if et.trackDetailedState {
+		if path, found := findEvalPath(vars); found {
+			state.SetDetailedValue(id, path, val)
+		}
+	}
+}
+
+func findEvalPath(vars Activation) ([]any, bool) {
+	if p, ok := vars.(evalPathFinder); ok {
+		return p.EvalPath(), true
+	}
+	if vars.Parent() != nil {
+		return findEvalPath(vars.Parent())
+	}
+	return nil, false
+}
+
+type evalPathFinder interface {
+	EvalPath() []any
 }
 
 // CustomDecorator configures a custom interpretable decorator for the program.

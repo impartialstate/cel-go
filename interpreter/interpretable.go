@@ -1364,6 +1364,22 @@ func (f *folder) FoldEntry(key, val any) bool {
 	return true
 }
 
+// EvalPath returns the evaluation path for the folder, which is the list of evaluation IDs of the
+// enclosing folders and the current folder's evaluation ID followed by the current folder's iteration
+// variable values.
+func (f *folder) EvalPath() []any {
+	var path []any
+	p := f.Parent()
+	for p != nil {
+		if fp, ok := p.(*folder); ok {
+			path = append(path, fp.EvalPath()...)
+			break
+		}
+		p = p.Parent()
+	}
+	return append(path, f.ID(), f.iterVar1Val)
+}
+
 // ResolveName overrides the default Activation lookup to perform lazy initialization of the accumulator
 // and specialized lookups of iteration values with consideration for whether the final result is being
 // computed and the iteration variables should be ignored.
