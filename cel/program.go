@@ -160,7 +160,7 @@ type prog struct {
 	regexOptimizations []*interpreter.RegexOptimization
 
 	// Interpretable configured from an Ast and aggregate decorator set based on program options.
-	interpretable     interpreter.Interpretable
+	interpretable     interpreter.InterpretableV2
 	observable        *interpreter.ObservableInterpretable
 	callCostEstimator interpreter.ActualCostEstimator
 	costOptions       []interpreter.CostTrackerOption
@@ -313,22 +313,30 @@ func (p *prog) Eval(input any) (out ref.Val, det *EvalDetails, err error) {
 		}
 	}()
 	// Build a hierarchical activation if there are default vars set.
-	var vars Activation
+	var frame *interpreter.ExecutionFrame
 	switch v := input.(type) {
+	case *interpreter.ExecutionFrame:
+		frame = v
 	case Activation:
-		vars = v
+		frame = framePool.Setup(v, nil, p.interruptCheckFrequency)
+		defer framePool.Put(frame)
 	case map[string]any:
-		vars = activationPool.Setup(v)
+		vars := activationPool.Setup(v)
 		defer activationPool.Put(vars)
+		frame = framePool.Setup(vars, nil, p.interruptCheckFrequency)
+		defer framePool.Put(frame)
 	default:
 		return nil, nil, fmt.Errorf("invalid input, wanted Activation or map[string]any, got: (%T)%v", input, input)
 	}
 	if p.defaultVars != nil {
-		vars = interpreter.NewHierarchicalActivation(p.defaultVars, vars)
+		vars := interpreter.NewHierarchicalActivation(p.defaultVars, frame.Activation)
+		framePool.Put(frame)
+		frame = framePool.Setup(vars, nil, p.interruptCheckFrequency)
+		defer framePool.Put(frame)
 	}
 	if p.observable != nil {
 		det = &EvalDetails{}
-		out = p.observable.ObserveEval(vars, func(observed any) {
+		out = p.observable.ObserveExec(frame, func(observed any) {
 			switch o := observed.(type) {
 			case interpreter.EvalState:
 				det.state = o
@@ -337,7 +345,7 @@ func (p *prog) Eval(input any) (out ref.Val, det *EvalDetails, err error) {
 			}
 		})
 	} else {
-		out = p.interpretable.Eval(vars)
+		out = p.interpretable.Exec(frame)
 	}
 	// The output of an internal Eval may have a value (`v`) that is a types.Err. This step
 	// translates the CEL value to a Go error response. This interface does not quite match the
@@ -355,65 +363,31 @@ func (p *prog) ContextEval(ctx context.Context, input any) (ref.Val, *EvalDetail
 	}
 	// Configure the input, making sure to wrap Activation inputs in the special ctxActivation which
 	// exposes the #interrupted variable and manages rate-limited checks of the ctx.Done() state.
-	var vars Activation
+	var frame *interpreter.ExecutionFrame
 	switch v := input.(type) {
 	case Activation:
-		vars = ctxActivationPool.Setup(v, ctx.Done(), p.interruptCheckFrequency)
-		defer ctxActivationPool.Put(vars)
+		frame = framePool.Setup(v, ctx.Done(), p.interruptCheckFrequency)
+		defer framePool.Put(frame)
 	case map[string]any:
 		rawVars := activationPool.Setup(v)
 		defer activationPool.Put(rawVars)
-		vars = ctxActivationPool.Setup(rawVars, ctx.Done(), p.interruptCheckFrequency)
-		defer ctxActivationPool.Put(vars)
+		frame = framePool.Setup(rawVars, ctx.Done(), p.interruptCheckFrequency)
+		defer framePool.Put(frame)
 	default:
 		return nil, nil, fmt.Errorf("invalid input, wanted Activation or map[string]any, got: (%T)%v", input, input)
 	}
-	out, det, err := p.Eval(vars)
+	out, det, err := p.Eval(frame)
 	if err != nil && errors.Is(err, interpreter.InterruptError{}) {
 		return out, det, fmt.Errorf("%w: %w", err, context.Cause(ctx))
 	}
 	return out, det, err
 }
 
-type ctxEvalActivation struct {
-	parent                  Activation
-	interrupt               <-chan struct{}
-	interruptCheckCount     uint
-	interruptCheckFrequency uint
-}
-
-// ResolveName implements the Activation interface method, but adds a special #interrupted variable
-// which is capable of testing whether a 'done' signal is provided from a context.Context channel.
-func (a *ctxEvalActivation) ResolveName(name string) (any, bool) {
-	if name == "#interrupted" {
-		a.interruptCheckCount++
-		if a.interruptCheckCount%a.interruptCheckFrequency == 0 {
-			select {
-			case <-a.interrupt:
-				return true, true
-			default:
-				return nil, false
-			}
-		}
-		return nil, false
-	}
-	return a.parent.ResolveName(name)
-}
-
-func (a *ctxEvalActivation) Parent() Activation {
-	return a.parent
-}
-
-func (a *ctxEvalActivation) AsPartialActivation() (interpreter.PartialActivation, bool) {
-	pa, ok := a.parent.(interpreter.PartialActivation)
-	return pa, ok
-}
-
-func newCtxEvalActivationPool() *ctxEvalActivationPool {
+func newExecFramePool() *ctxEvalActivationPool {
 	return &ctxEvalActivationPool{
 		Pool: sync.Pool{
 			New: func() any {
-				return &ctxEvalActivation{}
+				return &interpreter.ExecutionFrame{}
 			},
 		},
 	}
@@ -424,12 +398,12 @@ type ctxEvalActivationPool struct {
 }
 
 // Setup initializes a pooled Activation with the ability check for context.Context cancellation
-func (p *ctxEvalActivationPool) Setup(vars Activation, done <-chan struct{}, interruptCheckRate uint) *ctxEvalActivation {
-	a := p.Pool.Get().(*ctxEvalActivation)
-	a.parent = vars
-	a.interrupt = done
-	a.interruptCheckCount = 0
-	a.interruptCheckFrequency = interruptCheckRate
+func (p *ctxEvalActivationPool) Setup(vars Activation, done <-chan struct{}, interruptCheckRate uint) *interpreter.ExecutionFrame {
+	a := p.Pool.Get().(*interpreter.ExecutionFrame)
+	a.Activation = vars
+	a.Interrupt = done
+	a.InterruptCheckCount = 0
+	a.InterruptCheckFrequency = interruptCheckRate
 	return a
 }
 
@@ -511,6 +485,6 @@ var (
 	// activationPool is an internally managed pool of Activation values that wrap map[string]any inputs
 	activationPool = newEvalActivationPool()
 
-	// ctxActivationPool is an internally managed pool of Activation values that expose a special #interrupted variable
-	ctxActivationPool = newCtxEvalActivationPool()
+	// framePool is an internally managed pool of Activation values that expose a special #interrupted variable
+	framePool = newExecFramePool()
 )

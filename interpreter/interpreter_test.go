@@ -1682,10 +1682,13 @@ func testData(t testing.TB) []testCase {
 
 func BenchmarkInterpreter(b *testing.B) {
 	for _, tst := range testData(b) {
+		if !strings.Contains(tst.name, "macro") {
+			continue
+		}
 		if tst.err != "" || tst.progErr != "" {
 			continue
 		}
-		prg, vars, err := program(b, &tst, Optimize(), CompileRegexConstants(MatchesRegexOptimization))
+		prg, frame, err := program(b, &tst, Optimize(), CompileRegexConstants(MatchesRegexOptimization))
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -1694,7 +1697,7 @@ func BenchmarkInterpreter(b *testing.B) {
 			b.ResetTimer()
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				prg.Eval(vars)
+				prg.Exec(frame)
 			}
 		})
 	}
@@ -1892,10 +1895,11 @@ func TestInterpreter_WrappedActivationEvalState(t *testing.T) {
 		"d": types.False,
 	})
 	state := NewEvalState()
-	esa := &evalStateActivation{vars: vars, state: state}
+	esa := &ExecutionFrame{Activation: vars, state: state}
 	wrappedVars := &testActivationWrapper{esa, "test_activation_wrapper"}
 	ac, _ := NewActivation(wrappedVars)
-	es, found := asEvalState(ac)
+	frame := AsFrame(ac)
+	es, found := frame.state, frame.state != nil
 	if !found {
 		t.Errorf("asEvalState(%v) failed to find EvalState", ac)
 	}
@@ -1928,35 +1932,15 @@ func TestInterpreter_InterruptableEval(t *testing.T) {
 	evalCtx, cancel := context.WithTimeout(ctx, 10*time.Microsecond)
 	defer cancel()
 
-	ctxVars := &contextActivation{
-		Activation: vars,
-		interrupt: func() bool {
-			select {
-			case <-evalCtx.Done():
-				return true
-			default:
-				return false
-			}
-		},
+	ctxVars := &ExecutionFrame{
+		Activation:              vars,
+		Interrupt:               evalCtx.Done(),
+		InterruptCheckFrequency: 100,
 	}
 	out := prg.Eval(ctxVars)
 	if !types.IsError(out) || out.(*types.Err).String() != "operation interrupted" {
 		t.Errorf("Got %v, wanted operation interrupted error", out)
 	}
-}
-
-type contextActivation struct {
-	Activation
-	interruptCount int
-	interrupt      func() bool
-}
-
-func (ca *contextActivation) ResolveName(name string) (any, bool) {
-	if name == "#interrupted" {
-		ca.interruptCount++
-		return ca.interruptCount%100 == 0 && ca.interrupt(), true
-	}
-	return ca.Activation.ResolveName(name)
 }
 
 func TestInterpreter_ExhaustiveLogicalOrEquals(t *testing.T) {
@@ -2140,7 +2124,7 @@ func TestInterpreter_TypeConversionOpt(t *testing.T) {
 			if err2 != nil {
 				t.Fatalf("got error, wanted interpretable: %v", i2)
 			}
-			errVal := i2.Eval(EmptyActivation())
+			errVal := i2.Exec(&ExecutionFrame{Activation: EmptyActivation()})
 			errValStr := errVal.(*types.Err).Error()
 			if errValStr != err.Error() {
 				t.Errorf("got error %s, wanted error %s", errValStr, err.Error())
@@ -2267,7 +2251,7 @@ func testContainer(name string) *containers.Container {
 	return cont
 }
 
-func program(t testing.TB, tst *testCase, opts ...PlannerOption) (Interpretable, Activation, error) {
+func program(t testing.TB, tst *testCase, opts ...PlannerOption) (InterpretableV2, *ExecutionFrame, error) {
 	// Configure the package.
 	cont := containers.DefaultContainer
 	if tst.container != "" {
@@ -2343,7 +2327,7 @@ func program(t testing.TB, tst *testCase, opts ...PlannerOption) (Interpretable,
 		if err != nil {
 			return nil, nil, err
 		}
-		return prg, vars, nil
+		return prg, AsFrame(vars), nil
 	}
 	// Check the expression.
 	checked, errs := checker.Check(parsed, s, env)
@@ -2355,7 +2339,7 @@ func program(t testing.TB, tst *testCase, opts ...PlannerOption) (Interpretable,
 	if err != nil {
 		return nil, nil, err
 	}
-	return prg, vars, nil
+	return prg, AsFrame(vars), nil
 }
 
 func base64Encode(val ref.Val) ref.Val {

@@ -1104,7 +1104,7 @@ func TestAttributeStateTracking(t *testing.T) {
 				},
 				NewAttributePattern("a").QualString("b"),
 			),
-			out: types.NewUnknown(5, types.QualifyAttribute[string](types.NewAttributeTrail("a"), "b")),
+			out: types.NewUnknown(5, types.QualifyAttribute(types.NewAttributeTrail("a"), "b")),
 		},
 		{
 			expr: `['a', b.val, 'c'].filter(i, i + 'b' != 'ab')`,
