@@ -765,7 +765,7 @@ func (l *evalList) Exec(frame *ExecutionFrame) ref.Val {
 		}
 		elemVals = append(elemVals, elemVal)
 	}
-	return l.adapter.NativeToValue(elemVals)
+	return types.NewRefValList(l.adapter, elemVals)
 }
 
 // Eval implements the Interpretable interface method.
@@ -797,7 +797,7 @@ func (m *evalMap) ID() int64 {
 
 // Exec implements the InterpretableV2 interface method.
 func (m *evalMap) Exec(frame *ExecutionFrame) ref.Val {
-	entries := make(map[ref.Val]ref.Val)
+	entries := make(map[ref.Val]ref.Val, len(m.keys))
 	// If any argument is unknown or error early terminate.
 	for i, key := range m.keys {
 		keyVal := key.Exec(frame)
@@ -821,7 +821,7 @@ func (m *evalMap) Exec(frame *ExecutionFrame) ref.Val {
 		}
 		entries[keyVal] = valVal
 	}
-	return m.adapter.NativeToValue(entries)
+	return types.NewRefValMap(m.adapter, entries)
 }
 
 // Eval implements the Interpretable interface method.
@@ -866,7 +866,7 @@ func (o *evalObj) ID() int64 {
 
 // Exec implements the InterpretableV2 interface method.
 func (o *evalObj) Exec(frame *ExecutionFrame) ref.Val {
-	fieldVals := make(map[string]ref.Val)
+	fieldVals := make(map[string]ref.Val, len(o.fields))
 	// If any argument is unknown or error early terminate.
 	for i, field := range o.fields {
 		val := o.vals[i].Exec(frame)
