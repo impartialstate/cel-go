@@ -1682,9 +1682,6 @@ func testData(t testing.TB) []testCase {
 
 func BenchmarkInterpreter(b *testing.B) {
 	for _, tst := range testData(b) {
-		if !strings.Contains(tst.name, "macro") {
-			continue
-		}
 		if tst.err != "" || tst.progErr != "" {
 			continue
 		}

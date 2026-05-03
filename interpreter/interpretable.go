@@ -1467,7 +1467,7 @@ func invalidOptionalElementInit(value ref.Val) ref.Val {
 func newFolder(eval *evalFold, frame *ExecutionFrame) *folder {
 	f := folderPool.Get().(*folder)
 	f.evalFold = eval
-	f.frame = frame
+	f.frame = frame.Push(f)
 	return f
 }
 
@@ -1507,14 +1507,14 @@ func (f *folder) foldIterable(iterable traits.Iterable) ref.Val {
 	for it.HasNext() == types.True {
 		f.iterVar1Val = it.Next()
 
-		cond := f.cond.Eval(f)
+		cond := f.cond.Exec(f.frame)
 		condBool, ok := cond.(types.Bool)
 		if f.interrupted || (!f.exhaustive && ok && condBool != types.True) {
 			return f.evalResult()
 		}
 
 		// Update the accumulation value and check for eval interuption.
-		f.accuVal = f.step.Eval(f)
+		f.accuVal = f.step.Exec(f.frame)
 		f.initialized = true
 		if f.interruptable && f.frame.CheckInterrupt() {
 			f.interrupted = true
@@ -1533,14 +1533,14 @@ func (f *folder) FoldEntry(key, val any) bool {
 
 	// Terminate evaluation if evaluation is interrupted or the condition is not true and exhaustive
 	// eval is not enabled.
-	cond := f.cond.Eval(f)
+	cond := f.cond.Exec(f.frame)
 	condBool, ok := cond.(types.Bool)
 	if f.interrupted || (!f.exhaustive && ok && condBool != types.True) {
 		return false
 	}
 
 	// Update the accumulation value and check for eval interuption.
-	f.accuVal = f.step.Eval(f)
+	f.accuVal = f.step.Exec(f.frame)
 	f.initialized = true
 	if f.interruptable && f.frame.CheckInterrupt() {
 		f.interrupted = true
@@ -1556,7 +1556,7 @@ func (f *folder) ResolveName(name string) (any, bool) {
 	if name == f.accuVar {
 		if !f.initialized {
 			f.initialized = true
-			initVal := f.accu.Eval(f.frame)
+			initVal := f.accu.Exec(f.frame.parent)
 			if !f.exhaustive {
 				if l, isList := initVal.(traits.Lister); isList && l.Size() == types.IntZero {
 					initVal = types.NewMutableList(f.adapter)
@@ -1581,23 +1581,23 @@ func (f *folder) ResolveName(name string) (any, bool) {
 			return f.iterVar2Val, true
 		}
 	}
-	return f.frame.ResolveName(name)
+	return f.frame.parent.ResolveName(name)
 }
 
 // Parent returns the activation embedded into the folder.
 func (f *folder) Parent() Activation {
-	return f.frame
+	return f.frame.parent
 }
 
 // Unwrap returns the parent activation, thus omitting access to local state
 func (f *folder) Unwrap() Activation {
-	return f.frame
+	return f.frame.parent
 }
 
 // UnknownAttributePatterns implements the PartialActivation interface returning the unknown patterns
 // if they were provided to the input activation, or an empty set if the proxied activation is not partial.
 func (f *folder) UnknownAttributePatterns() []*AttributePattern {
-	if pv, ok := f.frame.Activation.(partialActivationConverter); ok {
+	if pv, ok := f.frame.parent.Activation.(partialActivationConverter); ok {
 		if partial, isPartial := pv.AsPartialActivation(); isPartial {
 			return partial.UnknownAttributePatterns()
 		}
@@ -1606,7 +1606,7 @@ func (f *folder) UnknownAttributePatterns() []*AttributePattern {
 }
 
 func (f *folder) AsPartialActivation() (PartialActivation, bool) {
-	if pv, ok := f.frame.Activation.(partialActivationConverter); ok {
+	if pv, ok := f.frame.parent.Activation.(partialActivationConverter); ok {
 		if _, isPartial := pv.AsPartialActivation(); isPartial {
 			return f, true
 		}
@@ -1620,7 +1620,7 @@ func (f *folder) evalResult() ref.Val {
 	if f.interrupted {
 		return types.WrapErr(InterruptError{})
 	}
-	res := f.result.Eval(f)
+	res := f.result.Exec(f.frame)
 	// Convert a mutable list or map to an immutable one if the comprehension has generated a list or
 	// map as a result.
 	if !types.IsUnknownOrError(res) && f.mutableValue {
@@ -1637,6 +1637,7 @@ func (f *folder) evalResult() ref.Val {
 // reset clears any state associated with folder evaluation.
 func (f *folder) reset() {
 	f.evalFold = nil
+	f.frame.Pop()
 	f.frame = nil
 	f.accuVal = nil
 	f.iterVar1Val = nil
