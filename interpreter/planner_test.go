@@ -88,3 +88,41 @@ func TestPlanCallAsync(t *testing.T) {
 		t.Errorf("Eval() returned %v, wanted 1", res2)
 	}
 }
+
+func TestPlanCallAsync_Error(t *testing.T) {
+	disp := NewDispatcher()
+	reg, _ := types.NewRegistry()
+	cont := containers.DefaultContainer
+	attrs := NewAttributeFactory(cont, reg, reg)
+	p := newPlanner(disp, reg, reg, attrs, cont, nil)
+
+	fac := ast.NewExprFactory()
+	// Create a call expression: missing_async()
+	call := fac.NewCall(1, "missing_async")
+
+	// Plan the expression - should fail because the function is missing
+	_, err := p.Plan(call)
+	if err == nil {
+		t.Fatal("Plan() succeeded for missing function, wanted error")
+	}
+
+	// Add an overload without Async implementation
+	disp.Add(&functions.Overload{
+		Operator: "not_async",
+		Unary: func(val ref.Val) ref.Val {
+			return val
+		},
+	})
+	call2 := fac.NewCall(2, "not_async", fac.NewLiteral(3, types.Int(1)))
+	
+	// Plan the expression - should NOT fail as it's not async, but let's check planCallAsync specifically
+	// Actually, planCall only calls planCallAsync if fnDef.Async != nil.
+	
+	// Manually call planCallAsync to test the error path
+	pb := &planBuilder{planner: p}
+	_, err = pb.planCallAsync(call2, "not_async", "not_async", &functions.Overload{Operator: "not_async"}, nil)
+	if err == nil {
+		t.Fatal("planCallAsync() succeeded for non-async overload, wanted error")
+	}
+}
+

@@ -18,6 +18,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/google/cel-go/common/containers"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
 )
@@ -29,7 +30,7 @@ func TestFolderHierarchy(t *testing.T) {
 		t.Fatalf("NewActivation() failed: %v", err)
 	}
 	parentFrame := NewExecutionFrame(parentActivation)
-	
+
 	// Create a folder (internal to comprehensions)
 	// We need to simulate the state where a folder is active.
 	accuActivation, err := NewActivation(map[string]any{"accu": 0})
@@ -57,9 +58,9 @@ func TestEvalWatchConstructor(t *testing.T) {
 	list := &evalList{
 		elems: []InterpretableV2{NewConstValue(1, types.Int(1))},
 	}
-	
+
 	observer := func(vars Activation, id int64, progStep any, val ref.Val) {}
-	
+
 	watcher := &evalWatchConstructor{
 		constructor: list,
 		observer:    observer,
@@ -81,5 +82,45 @@ func TestInterruptError(t *testing.T) {
 	}
 	if ie.Is(errors.New("other")) {
 		t.Error("InterruptError.Is() returned true for different error message")
+	}
+}
+
+func TestTestOnlyQualifier(t *testing.T) {
+	reg, _ := types.NewRegistry()
+	fac := NewAttributeFactory(containers.DefaultContainer, reg, reg)
+	activation, _ := NewActivation(map[string]any{"a": map[string]any{"b": 1}})
+
+	attr := fac.AbsoluteAttribute(1, "a")
+	qual, _ := fac.NewQualifier(nil, 2, "b", false)
+	attr.AddQualifier(qual)
+
+	testOnly := &evalTestOnly{
+		id: 3,
+		InterpretableAttribute: &evalAttr{
+			adapter: reg,
+			attr:    attr,
+		},
+	}
+
+	q, _ := fac.NewQualifier(nil, 4, "b", false)
+	toqAttr, err := testOnly.AddQualifier(q)
+	if err != nil {
+		t.Fatalf("AddQualifier() failed: %v", err)
+	}
+
+	// toqAttr is a new attribute with testOnlyQualifier
+	quals := toqAttr.(NamespacedAttribute).Qualifiers()
+	toq := quals[len(quals)-1]
+	res, found, err := toq.QualifyIfPresent(activation, map[string]any{"b": 1}, true)
+	if err != nil {
+		t.Fatalf("QualifyIfPresent() failed: %v", err)
+	}
+	if !found || res != 1 {
+		t.Errorf("QualifyIfPresent() returned (%v, %v), wanted (1, true)", res, found)
+	}
+
+	// QualifierValueEquals
+	if !toq.(qualifierValueEquator).QualifierValueEquals("b") {
+		t.Error("QualifierValueEquals() returned false, wanted true")
 	}
 }

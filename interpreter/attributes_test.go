@@ -1360,3 +1360,74 @@ func TestConditionalAttributeQualify(t *testing.T) {
 	}
 }
 
+func TestQualifyIfPresent(t *testing.T) {
+	reg := newTestRegistry(t)
+	cont := containers.DefaultContainer
+	fac := NewAttributeFactory(cont, reg, reg)
+	activation, _ := NewActivation(map[string]any{
+		"a": "b",
+		"c": int64(1),
+	})
+
+	tests := []struct {
+		name string
+		qual Qualifier
+		obj  any
+		out  any
+	}{
+		{
+			name: "absolute_attribute",
+			qual: fac.AbsoluteAttribute(1, "a"),
+			obj:  map[string]any{"b": 100},
+			out:  100,
+		},
+		{
+			name: "maybe_attribute",
+			qual: fac.MaybeAttribute(1, "a"),
+			obj:  map[string]any{"b": 100},
+			out:  100,
+		},
+		{
+			name: "relative_attribute",
+			qual: fac.RelativeAttribute(2, NewConstValue(1, types.String("b"))),
+			obj:  map[string]any{"b": 200},
+			out:  200,
+		},
+		{
+			name: "string_qualifier",
+			qual: makeOptQualifier(t, fac, nil, 1, "b"),
+			obj:  map[string]any{"b": 300},
+			out:  300,
+		},
+		{
+			name: "int_qualifier",
+			qual: makeOptQualifier(t, fac, nil, 1, int64(1)),
+			obj:  map[int64]any{int64(1): "value"},
+			out:  "value",
+		},
+		{
+			name: "uint_qualifier",
+			qual: makeOptQualifier(t, fac, nil, 1, uint64(1)),
+			obj:  map[uint64]any{uint64(1): "uvalue"},
+			out:  "uvalue",
+		},
+		{
+			name: "bool_qualifier",
+			qual: makeOptQualifier(t, fac, nil, 1, true),
+			obj:  map[bool]any{true: "bvalue"},
+			out:  "bvalue",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			res, found, err := tc.qual.QualifyIfPresent(activation, tc.obj, false)
+			if err != nil {
+				t.Fatalf("QualifyIfPresent() failed: %v", err)
+			}
+			if !found || !reflect.DeepEqual(res, tc.out) {
+				t.Errorf("QualifyIfPresent() returned (%v, %v), wanted (%v, true)", res, found, tc.out)
+			}
+		})
+	}
+}
