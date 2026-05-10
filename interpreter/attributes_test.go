@@ -1119,7 +1119,7 @@ func TestAttributeStateTracking(t *testing.T) {
 				},
 			),
 			// Error node 9 corresponds to the `i + 'b'` expression
-			out: types.LabelErrNode(9, types.NoSuchOverloadErr()),
+			out: types.ValOrLabeledErr(9, types.NoSuchOverloadErr()),
 		},
 	}
 	for _, test := range tests {
@@ -1174,9 +1174,6 @@ func TestAttributeStateTracking(t *testing.T) {
 					holder.st = NewEvalState()
 					return holder.st
 				})))
-			if err != nil {
-				t.Fatal(err)
-			}
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1324,3 +1321,42 @@ func testExprTypeToType(t testing.TB, fieldType *exprpb.Type) *types.Type {
 	}
 	return ft
 }
+
+func TestConditionalAttributeQualify(t *testing.T) {
+	reg, _ := types.NewRegistry()
+	cont := containers.DefaultContainer
+	fac := NewAttributeFactory(cont, reg, reg)
+
+	truthy := fac.AbsoluteAttribute(1, "a")
+	falsy := fac.AbsoluteAttribute(2, "b")
+	cond := &conditionalAttribute{
+		id:      3,
+		expr:    NewConstValue(4, types.True),
+		truthy:  truthy,
+		falsy:   falsy,
+		adapter: reg,
+		fac:     fac,
+	}
+
+	activation, _ := NewActivation(map[string]any{"a": "key", "b": "other"})
+	obj := map[string]any{"key": 100}
+
+	// Test Qualify
+	res, err := cond.Qualify(activation, obj)
+	if err != nil {
+		t.Fatalf("Qualify() failed: %v", err)
+	}
+	if res != 100 {
+		t.Errorf("Qualify() returned %v, wanted 100", res)
+	}
+
+	// Test QualifyIfPresent
+	res, found, err := cond.QualifyIfPresent(activation, obj, false)
+	if err != nil {
+		t.Fatalf("QualifyIfPresent() failed: %v", err)
+	}
+	if !found || res != 100 {
+		t.Errorf("QualifyIfPresent() returned (%v, %v), wanted (100, true)", res, found)
+	}
+}
+

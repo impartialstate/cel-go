@@ -1,4 +1,4 @@
-// Copyright 2024 Google LLC
+// Copyright 2026 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,41 +14,145 @@
 
 package interpreter
 
-import "sync"
+import (
+	"context"
+	"sync"
+	"sync/atomic"
 
-// ExecutionFrame provides the context for a single evaluation of an expression.
-type ExecutionFrame struct {
-	Activation
-	Interrupt               <-chan struct{}
-	InterruptCheckCount     uint
-	InterruptCheckFrequency uint
+	"github.com/google/cel-go/common/functions"
+	"github.com/google/cel-go/common/types"
+	"github.com/google/cel-go/common/types/ref"
+)
 
-	state  EvalState
-	costs  *CostTracker
-	parent *ExecutionFrame
+// evalContext contains the stateful information needed for a single evaluation.
+//
+// This state is shared across all frames within a single evaluation, including
+// child frames created for comprehension blocks.
+type evalContext struct {
+	// interrupt exposes a callback channel for cancellation.
+	interrupt <-chan struct{}
+
+	// interruptCheckCount is the number of times the interrupt channel has been checked.
+	interruptCheckCount atomic.Uint64
+
+	// interruptCheckFrequency is the frequency at which the interrupt channel is checked.
+	interruptCheckFrequency uint
+
+	// interrupted indicates whether the evaluation has been interrupted.
+	interrupted atomic.Bool
+
+	// state provides the context for tracking the evaluation state.
+	state EvalState
+
+	// costs provides the context for tracking the evaluation costs.
+	costs *CostTracker
+
+	// asyncCalls provides the context for tracking async call states.
+	asyncCalls *asyncCallStateTracker
+
+	// ctx is the context for async call implementations to use.
+	ctx context.Context
+
+	// cancel cancels the context when the evaluation is finished.
+	cancel context.CancelFunc
+
+	// completions channel for asynchronous function calls to send their call ID to when completed.
+	completions chan<- int64
 }
 
-func (f *ExecutionFrame) Push(activation Activation) *ExecutionFrame {
-	child := frameStack.create(f)
+// ExecutionFrame provides the context for a single evaluation of an expression.
+//
+// The execution frame must not be stored in any fashion as its lifecycle is completely
+// controlled by the CEL evaluation process.
+type ExecutionFrame struct {
+	// Activation provides the context for resolving variables by name.
+	Activation
+
+	// parent provides the context for parent scopes (used for comprehension iterators).
+	parent *ExecutionFrame
+
+	// ctx provides the shared evaluation state across frames.
+	ctx *evalContext
+}
+
+// NewExecutionFrame creates a new execution frame from the pool.
+func NewExecutionFrame(vars Activation) *ExecutionFrame {
+	f := frameStack.Get().(*ExecutionFrame)
+	f.Activation = vars
+	return f
+}
+
+// SetContext sets the context for the execution frame.
+func (f *ExecutionFrame) SetContext(ctx context.Context, interruptCheckFrequency uint) {
+	if f.ctx == nil {
+		f.ctx = evalContextPool.Get().(*evalContext)
+	}
+	f.ctx.ctx, f.ctx.cancel = context.WithCancel(ctx)
+	f.ctx.asyncCalls = asyncCallStateTrackerPool.create()
+	f.ctx.interrupt = ctx.Done()
+	f.ctx.interruptCheckFrequency = interruptCheckFrequency
+	f.ctx.interruptCheckCount.Store(0)
+	f.ctx.interrupted.Store(false)
+}
+
+// Close releases the resources held by the execution frame and returns it to the pool.
+func (f *ExecutionFrame) Close() {
+	if f.ctx != nil {
+		if f.ctx.cancel != nil {
+			f.ctx.cancel()
+			f.ctx.cancel = nil
+		}
+		f.ctx.ctx = nil
+		f.ctx.completions = nil
+		asyncCallStateTrackerPool.release(f.ctx.asyncCalls)
+		f.ctx.asyncCalls = nil
+		f.ctx.interrupt = nil
+		f.ctx.state = nil
+		f.ctx.costs = nil
+		f.ctx.interrupted.Store(false)
+		f.ctx.interruptCheckCount.Store(0)
+		f.ctx.interruptCheckFrequency = 0
+		evalContextPool.Put(f.ctx)
+		f.ctx = nil
+	}
+	f.parent = nil
+	activationStack.release(f.Activation)
+	f.Activation = nil
+	frameStack.Put(f)
+}
+
+// SetCompletions configures a channel to receive completions when asynchronous evaluations finish.
+func (f *ExecutionFrame) SetCompletions(ch chan<- int64) {
+	if f.ctx != nil {
+		f.ctx.completions = ch
+	}
+}
+
+// push pushes the given activation onto the activation stack and returns the new frame.
+//
+// This operation is internal to the interpreter and is used to handle comprehension
+// scoping. The child frame inherits the shared evalContext from the parent.
+func (f *ExecutionFrame) push(activation Activation) *ExecutionFrame {
+	child := frameStack.Get().(*ExecutionFrame)
+	child.parent = f
+	child.ctx = f.ctx
 	child.Activation = activationStack.create(f.Activation, activation)
 	return child
 }
 
-func (f *ExecutionFrame) Pop() *ExecutionFrame {
-	return frameStack.release(f)
+// pop returns the parent frame, releasing the current frame back to the pool.
+func (f *ExecutionFrame) pop() *ExecutionFrame {
+	parent := f.parent
+	activationStack.release(f.Activation)
+	f.Activation = nil
+	f.parent = nil
+	f.ctx = nil
+	frameStack.Put(f)
+	return parent
 }
 
 // ResolveName implements the Activation interface by proxying to the internal activation.
-//
-// If the name is "#interrupted", the ExecutionFrame handles the interrupt check count and rate
-// limit logic internally.
 func (f *ExecutionFrame) ResolveName(name string) (any, bool) {
-	if name == "#interrupted" {
-		if f.CheckInterrupt() {
-			return true, true
-		}
-		return nil, false
-	}
 	return f.Activation.ResolveName(name)
 }
 
@@ -69,10 +173,17 @@ func (f *ExecutionFrame) Unwrap() Activation {
 
 // CheckInterrupt returns whether the evaluation has been interrupted.
 func (f *ExecutionFrame) CheckInterrupt() bool {
-	f.InterruptCheckCount++
-	if f.InterruptCheckFrequency > 0 && f.InterruptCheckCount%f.InterruptCheckFrequency == 0 {
+	if f.ctx == nil {
+		return false
+	}
+	if f.ctx.interrupted.Load() {
+		return true
+	}
+	count := f.ctx.interruptCheckCount.Add(1)
+	if f.ctx.interruptCheckFrequency > 0 && count%uint64(f.ctx.interruptCheckFrequency) == 0 {
 		select {
-		case <-f.Interrupt:
+		case <-f.ctx.interrupt:
+			f.ctx.interrupted.Store(true)
 			return true
 		default:
 			return false
@@ -81,47 +192,136 @@ func (f *ExecutionFrame) CheckInterrupt() bool {
 	return false
 }
 
-type framePool struct {
-	sync.Pool
+// asyncCallStateTracker manages async call states across frames
+type asyncCallStateTracker struct {
+	mu         sync.RWMutex
+	calls      map[int64]*asyncCallState
+	nextCallID atomic.Int64
 }
 
-func (pool *framePool) create(parent *ExecutionFrame) *ExecutionFrame {
-	child := pool.Get().(*ExecutionFrame)
-	child.parent = parent
-	child.costs = parent.costs
-	child.state = parent.state
-	child.Interrupt = parent.Interrupt
-	child.InterruptCheckCount = parent.InterruptCheckCount
-	child.InterruptCheckFrequency = parent.InterruptCheckFrequency
-	return child
+func newAsyncCallStateTracker() *asyncCallStateTracker {
+	return &asyncCallStateTracker{
+		calls: make(map[int64]*asyncCallState),
+	}
 }
 
-func (pool *framePool) release(frame *ExecutionFrame) *ExecutionFrame {
-	parent := frame.parent
-	if parent.InterruptCheckCount != frame.InterruptCheckCount {
-		parent.InterruptCheckCount = frame.InterruptCheckCount
+func (t *asyncCallStateTracker) getOrCreate(id int64, function, overload string, argVals []ref.Val, impl functions.AsyncOp, completions chan<- int64) *asyncCallState {
+	t.mu.RLock()
+	acs, ok := t.calls[id]
+	t.mu.RUnlock()
+
+	potentialState := newAsyncCallState(id, function, overload, argVals, impl)
+	if ok && acs.equals(potentialState) {
+		return acs
 	}
 
-	activationStack.release(frame.Activation)
-	frame.Activation = nil
-	frame.state = nil
-	frame.costs = nil
-	frame.parent = nil
-	frame.Interrupt = nil
-	frame.InterruptCheckCount = 0
-	frame.InterruptCheckFrequency = 0
-	pool.Pool.Put(frame)
-	return parent
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	// Check again in case it was created while waiting for the lock
+	if acs, ok := t.calls[id]; ok && acs.equals(potentialState) {
+		return acs
+	}
+
+	// Set a new call ID for this async call.
+	callID := t.nextCallID.Add(1)
+	potentialState.callID = callID
+	potentialState.completions = completions
+	t.calls[potentialState.id] = potentialState
+	return potentialState
 }
 
-func newFramePool() *framePool {
-	return &framePool{
-		Pool: sync.Pool{
-			New: func() any {
-				return &ExecutionFrame{}
-			},
-		},
+// ComputeResult tracks and computes the result of the given asynchronous function.
+func (f *ExecutionFrame) ComputeResult(id int64, function, overload string, impl functions.AsyncOp, argVals []ref.Val) ref.Val {
+	if f.ctx == nil || f.ctx.asyncCalls == nil {
+		return types.NewLabeledErr(id, "async call tracking is not initialized")
 	}
+	acs := f.ctx.asyncCalls.getOrCreate(id, function, overload, argVals, impl, f.ctx.completions)
+	return acs.call(f.ctx.ctx)
+}
+
+func newAsyncCallState(id int64, function, overload string, argVals []ref.Val, impl functions.AsyncOp) *asyncCallState {
+	return &asyncCallState{
+		id:       id,
+		function: function,
+		overload: overload,
+		argVals:  argVals,
+		impl:     impl,
+	}
+}
+
+// asyncCallState is used to track the results of function calls across multiple iterations.
+type asyncCallState struct {
+	id       int64
+	callID   int64
+	function string
+	overload string
+	argVals  []ref.Val
+	impl     functions.AsyncOp
+
+	once   sync.Once
+	mu     sync.RWMutex
+	result ref.Val
+
+	completions chan<- int64
+}
+
+func (acs *asyncCallState) call(ctx context.Context) ref.Val {
+	acs.once.Do(func() {
+		ch := acs.impl(ctx, acs.argVals...)
+		go func() {
+			select {
+			case res := <-ch:
+				acs.mu.Lock()
+				acs.result = res
+				acs.mu.Unlock()
+				if acs.completions != nil {
+					select {
+					case acs.completions <- acs.callID:
+					case <-ctx.Done():
+					}
+				}
+			case <-ctx.Done():
+			}
+		}()
+	})
+
+	acs.mu.RLock()
+	res := acs.result
+	acs.mu.RUnlock()
+
+	if res != nil {
+		return res
+	}
+	return types.NewUnknown(acs.callID, nil)
+}
+
+func (acs *asyncCallState) equals(other *asyncCallState) bool {
+	if acs == nil || other == nil {
+		return false
+	}
+	if acs.function != other.function || acs.overload != other.overload {
+		return false
+	}
+	for i, v := range acs.argVals {
+		if types.Equal(v, other.argVals[i]) != types.True {
+			return false
+		}
+	}
+	return true
+}
+
+// frameStack provides a synchronized pool of ExecutionFrames.
+var frameStack = &sync.Pool{
+	New: func() any {
+		return &ExecutionFrame{}
+	},
+}
+
+// evalContextPool provides a synchronized pool of evalContexts.
+var evalContextPool = &sync.Pool{
+	New: func() any {
+		return &evalContext{}
+	},
 }
 
 type activationStackPool struct {
@@ -155,7 +355,37 @@ func newActivationPool() *activationStackPool {
 	}
 }
 
+type asyncCallStateTrackerPoolStruct struct {
+	sync.Pool
+}
+
+func (pool *asyncCallStateTrackerPoolStruct) create() *asyncCallStateTracker {
+	return pool.Get().(*asyncCallStateTracker)
+}
+
+func (pool *asyncCallStateTrackerPoolStruct) release(tracker *asyncCallStateTracker) {
+	if tracker == nil {
+		return
+	}
+	tracker.mu.Lock()
+	for k := range tracker.calls {
+		delete(tracker.calls, k)
+	}
+	tracker.mu.Unlock()
+	pool.Pool.Put(tracker)
+}
+
+func newAsyncCallTrackerPool() *asyncCallStateTrackerPoolStruct {
+	return &asyncCallStateTrackerPoolStruct{
+		Pool: sync.Pool{
+			New: func() any {
+				return newAsyncCallStateTracker()
+			},
+		},
+	}
+}
+
 var (
-	activationStack = newActivationPool()
-	frameStack      = newFramePool()
+	activationStack           = newActivationPool()
+	asyncCallStateTrackerPool = newAsyncCallTrackerPool()
 )

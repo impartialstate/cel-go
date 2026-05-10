@@ -53,6 +53,10 @@ type Program interface {
 	//
 	// The output contract for `ContextEval` is otherwise identical to the `Eval` method.
 	ContextEval(context.Context, any) (ref.Val, *EvalDetails, error)
+
+	// ConcurrentEval evaluates the program concurrently, returning a channel that will receive
+	// the final EvalResult when all asynchronous operations complete, or the context expires.
+	ConcurrentEval(context.Context, any) <-chan EvalResult
 }
 
 // Activation used to resolve identifiers by name and references by id.
@@ -143,6 +147,13 @@ func (ed *EvalDetails) ActualCost() *uint64 {
 	}
 	cost := ed.costTracker.ActualCost()
 	return &cost
+}
+
+// EvalResult encapsulates the response from a ConcurrentEval call.
+type EvalResult struct {
+	Val         ref.Val
+	EvalDetails *EvalDetails
+	Err         error
 }
 
 // prog is the internal implementation of the Program interface.
@@ -314,26 +325,12 @@ func (p *prog) Eval(input any) (out ref.Val, det *EvalDetails, err error) {
 	}()
 	// Build a hierarchical activation if there are default vars set.
 	var frame *interpreter.ExecutionFrame
-	switch v := input.(type) {
-	case *interpreter.ExecutionFrame:
-		frame = v
-	case Activation:
-		frame = framePool.Setup(v, nil, p.interruptCheckFrequency)
-		defer framePool.Put(frame)
-	case map[string]any:
-		vars := activationPool.Setup(v)
-		defer activationPool.Put(vars)
-		frame = framePool.Setup(vars, nil, p.interruptCheckFrequency)
-		defer framePool.Put(frame)
-	default:
-		return nil, nil, fmt.Errorf("invalid input, wanted Activation or map[string]any, got: (%T)%v", input, input)
+	var cleanup func()
+	frame, cleanup, err = p.buildFrame(input)
+	if err != nil {
+		return nil, nil, err
 	}
-	if p.defaultVars != nil {
-		vars := interpreter.NewHierarchicalActivation(p.defaultVars, frame.Activation)
-		framePool.Put(frame)
-		frame = framePool.Setup(vars, nil, p.interruptCheckFrequency)
-		defer framePool.Put(frame)
-	}
+	defer cleanup()
 	if p.observable != nil {
 		det = &EvalDetails{}
 		out = p.observable.ObserveExec(frame, func(observed any) {
@@ -361,50 +358,141 @@ func (p *prog) ContextEval(ctx context.Context, input any) (ref.Val, *EvalDetail
 	if ctx == nil {
 		return nil, nil, fmt.Errorf("context can not be nil")
 	}
-	// Configure the input, making sure to wrap Activation inputs in the special ctxActivation which
-	// exposes the #interrupted variable and manages rate-limited checks of the ctx.Done() state.
+	frame, cleanup, err := p.buildWithContext(ctx, input)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer cleanup()
+
+	out, det, errEval := p.Eval(frame)
+	if errEval != nil && errors.Is(errEval, interpreter.InterruptError{}) {
+		return out, det, fmt.Errorf("%w: %w", errEval, context.Cause(ctx))
+	}
+	return out, det, errEval
+}
+
+// ConcurrentEval implements the Program interface.
+func (p *prog) ConcurrentEval(ctx context.Context, input any) <-chan EvalResult {
+	resCh := make(chan EvalResult, 1)
+	if ctx == nil {
+		resCh <- EvalResult{Err: fmt.Errorf("context can not be nil")}
+		close(resCh)
+		return resCh
+	}
+
+	go func() {
+		defer close(resCh)
+
+		frame, cleanup, err := p.buildWithContext(ctx, input)
+		if err != nil {
+			resCh <- EvalResult{Err: err}
+			return
+		}
+		defer cleanup()
+
+		// We use an unbuffered channel to communicate completions.
+		// Since the asyncCallState fan-in selects on ctx.Done(), this will not leak
+		// if the evaluation returns early or errors out.
+		completions := make(chan int64)
+		frame.SetCompletions(completions)
+
+		for {
+			var out ref.Val
+			var det *EvalDetails
+			var err error
+
+			if p.observable != nil {
+				det = &EvalDetails{}
+				out = p.observable.ObserveExec(frame, func(observed any) {
+					switch o := observed.(type) {
+					case interpreter.EvalState:
+						det.state = o
+					case *interpreter.CostTracker:
+						det.costTracker = o
+					}
+				})
+			} else {
+				out = p.interpretable.Exec(frame)
+			}
+
+			// Communicate errors quickly.
+			if types.IsError(out) {
+				err = out.(*types.Err)
+			}
+			if err != nil {
+				if errors.Is(err, interpreter.InterruptError{}) {
+					err = fmt.Errorf("%w: %w", err, context.Cause(ctx))
+				}
+				resCh <- EvalResult{Val: out, EvalDetails: det, Err: err}
+				return
+			}
+
+			// Check which attributes or calls are necessary to complete the call.
+			if !types.IsUnknown(out) {
+				resCh <- EvalResult{Val: out, EvalDetails: det, Err: nil}
+				return
+			}
+
+			unk := out.(*types.Unknown)
+			if unk.HasUnknownFunction() {
+				select {
+				case <-completions:
+					continue
+				case <-ctx.Done():
+					resCh <- EvalResult{Val: out, EvalDetails: det, Err: ctx.Err()}
+					return
+				}
+			}
+
+			resCh <- EvalResult{Val: out, EvalDetails: det, Err: nil}
+			return
+		}
+	}()
+
+	return resCh
+}
+
+// buildFrame creates an ExecutionFrame for the given input without a timeout context.
+func (p *prog) buildFrame(input any) (*interpreter.ExecutionFrame, func(), error) {
 	var frame *interpreter.ExecutionFrame
+	var cleanup func()
+
 	switch v := input.(type) {
+	case *interpreter.ExecutionFrame:
+		frame = v
+		cleanup = func() {}
 	case Activation:
-		frame = framePool.Setup(v, ctx.Done(), p.interruptCheckFrequency)
-		defer framePool.Put(frame)
+		frame = interpreter.NewExecutionFrame(v)
+		cleanup = func() {
+			frame.Close()
+		}
 	case map[string]any:
 		rawVars := activationPool.Setup(v)
-		defer activationPool.Put(rawVars)
-		frame = framePool.Setup(rawVars, ctx.Done(), p.interruptCheckFrequency)
-		defer framePool.Put(frame)
+		frame = interpreter.NewExecutionFrame(rawVars)
+		cleanup = func() {
+			frame.Close()
+			activationPool.Put(rawVars)
+		}
 	default:
 		return nil, nil, fmt.Errorf("invalid input, wanted Activation or map[string]any, got: (%T)%v", input, input)
 	}
-	out, det, err := p.Eval(frame)
-	if err != nil && errors.Is(err, interpreter.InterruptError{}) {
-		return out, det, fmt.Errorf("%w: %w", err, context.Cause(ctx))
+
+	if p.defaultVars != nil {
+		// Update the frame's activation in place.
+		frame.Activation = interpreter.NewHierarchicalActivation(p.defaultVars, frame.Activation)
 	}
-	return out, det, err
+
+	return frame, cleanup, nil
 }
 
-func newExecFramePool() *ctxEvalActivationPool {
-	return &ctxEvalActivationPool{
-		Pool: sync.Pool{
-			New: func() any {
-				return &interpreter.ExecutionFrame{}
-			},
-		},
+// buildWithContext creates an ExecutionFrame for the given input and context.
+func (p *prog) buildWithContext(ctx context.Context, input any) (*interpreter.ExecutionFrame, func(), error) {
+	frame, cleanup, err := p.buildFrame(input)
+	if err != nil {
+		return nil, nil, err
 	}
-}
-
-type ctxEvalActivationPool struct {
-	sync.Pool
-}
-
-// Setup initializes a pooled Activation with the ability check for context.Context cancellation
-func (p *ctxEvalActivationPool) Setup(vars Activation, done <-chan struct{}, interruptCheckRate uint) *interpreter.ExecutionFrame {
-	a := p.Pool.Get().(*interpreter.ExecutionFrame)
-	a.Activation = vars
-	a.Interrupt = done
-	a.InterruptCheckCount = 0
-	a.InterruptCheckFrequency = interruptCheckRate
-	return a
+	frame.SetContext(ctx, p.interruptCheckFrequency)
+	return frame, cleanup, nil
 }
 
 type evalActivation struct {
@@ -484,7 +572,4 @@ func (p *evalActivationPool) Put(value any) {
 var (
 	// activationPool is an internally managed pool of Activation values that wrap map[string]any inputs
 	activationPool = newEvalActivationPool()
-
-	// framePool is an internally managed pool of Activation values that expose a special #interrupted variable
-	framePool = newExecFramePool()
 )

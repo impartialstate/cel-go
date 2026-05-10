@@ -605,6 +605,7 @@ type OverloadDecl struct {
 	argTypes         []*types.Type
 	resultType       *types.Type
 	isMemberFunction bool
+
 	// hasLateBinding indicates that the function has a binding which is not known at compile time.
 	// This is useful for functions which have side-effects or are not deterministically computable.
 	hasLateBinding bool
@@ -1105,7 +1106,7 @@ func formatOperator(opName string, o *OverloadDecl) string {
 		return fmt.Sprintf("%s %s %s -> %s", argTypes[0], opName, argTypes[1], ret)
 	default:
 		if opName == operators.Conditional {
-			return fmt.Sprint("bool ? <T> : <T> -> <T>")
+			return "bool ? <T> : <T> -> <T>"
 		}
 		return formatCall(opName, o)
 	}

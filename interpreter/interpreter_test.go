@@ -1892,11 +1892,13 @@ func TestInterpreter_WrappedActivationEvalState(t *testing.T) {
 		"d": types.False,
 	})
 	state := NewEvalState()
-	esa := &ExecutionFrame{Activation: vars, state: state}
+	esa := NewExecutionFrame(vars)
+	esa.SetContext(context.Background(), 0)
+	esa.ctx.state = state
 	wrappedVars := &testActivationWrapper{esa, "test_activation_wrapper"}
 	ac, _ := NewActivation(wrappedVars)
 	frame := AsFrame(ac)
-	es, found := frame.state, frame.state != nil
+	es, found := frame.ctx.state, frame.ctx != nil && frame.ctx.state != nil
 	if !found {
 		t.Errorf("asEvalState(%v) failed to find EvalState", ac)
 	}
@@ -1929,12 +1931,10 @@ func TestInterpreter_InterruptableEval(t *testing.T) {
 	evalCtx, cancel := context.WithTimeout(ctx, 10*time.Microsecond)
 	defer cancel()
 
-	ctxVars := &ExecutionFrame{
-		Activation:              vars,
-		Interrupt:               evalCtx.Done(),
-		InterruptCheckFrequency: 100,
-	}
+	ctxVars := &ExecutionFrame{Activation: vars}
+	ctxVars.SetContext(evalCtx, 100)
 	out := prg.Eval(ctxVars)
+	ctxVars.Close()
 	if !types.IsError(out) || out.(*types.Err).String() != "operation interrupted" {
 		t.Errorf("Got %v, wanted operation interrupted error", out)
 	}
@@ -2484,3 +2484,65 @@ type testActivationWrapper struct {
 func (tw *testActivationWrapper) Unwrap() Activation {
 	return tw.Activation
 }
+
+func TestLegacyCustomDecorator(t *testing.T) {
+	// A legacy V1 decorator that wraps an Interpretable and increments the result.
+	legacyDec := func(i Interpretable) (Interpretable, error) {
+		return &legacyInterpretable{i}, nil
+	}
+
+	disp := NewDispatcher()
+	reg, _ := types.NewRegistry()
+	cont := containers.DefaultContainer
+	attrs := NewAttributeFactory(cont, reg, reg)
+
+	p := NewInterpreter(disp, cont, reg, reg, attrs)
+
+
+	// Create a simple expression: 10
+	fac := ast.NewExprFactory()
+	constExpr := fac.NewLiteral(1, types.Int(10))
+
+	// Plan with legacy decorator
+	inter, err := p.NewInterpretable(ast.NewAST(constExpr, ast.NewSourceInfo(nil)), CustomDecorator(legacyDec))
+	if err != nil {
+		t.Fatalf("NewInterpretable() failed: %v", err)
+	}
+
+	// Evaluate using a frame (the new architecture)
+	frame := NewExecutionFrame(EmptyActivation())
+	defer frame.Close()
+
+	res := inter.Eval(frame)
+	if res.Equal(types.Int(11)) != types.True {
+		t.Errorf("Eval() returned %v, wanted 11", res)
+	}
+
+	// Verify that it was adapted to InterpretableV2
+	if _, ok := inter.(InterpretableV2); !ok {
+		t.Error("Interpretable should have been adapted to InterpretableV2")
+	}
+}
+
+type legacyInterpretable struct {
+	Interpretable
+}
+
+func (l *legacyInterpretable) Eval(vars Activation) ref.Val {
+	val := l.Interpretable.Eval(vars)
+	if i, ok := val.(types.Int); ok {
+		return types.Int(i + 1)
+	}
+	return val
+}
+
+func TestEvalStateFactoryGetState(t *testing.T) {
+
+	fac := &evalStateFactory{}
+	frame := NewExecutionFrame(EmptyActivation())
+	defer frame.Close()
+	if fac.GetState(frame) != nil {
+		t.Error("GetState() with nil context should return nil")
+	}
+}
+

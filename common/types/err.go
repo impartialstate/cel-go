@@ -68,16 +68,16 @@ func NewErrFromString(message string) ref.Val {
 	return &Err{error: errors.New(message)}
 }
 
-// NewErrWithNodeID creates a new Err described by the format string and args.
+// NewLabeledErr creates a new Err described by the format string and args.
 // TODO: Audit the use of this function and standardize the error messages and codes.
-func NewErrWithNodeID(id int64, format string, args ...any) ref.Val {
+func NewLabeledErr(id int64, format string, args ...any) ref.Val {
 	return &Err{error: fmt.Errorf(format, args...), id: id}
 }
 
-// LabelErrNode returns val unaltered it is not an Err or if the error has a non-zero
+// ValOrLabeledErr returns val unaltered it is not an Err or if the error has a non-zero
 // AST node ID already present. Otherwise the id is added to the error for
 // recovery with the Err.NodeID method.
-func LabelErrNode(id int64, val ref.Val) ref.Val {
+func ValOrLabeledErr(id int64, val ref.Val) ref.Val {
 	if err, ok := val.(*Err); ok && err.id == 0 {
 		err.id = id
 		return err

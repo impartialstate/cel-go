@@ -118,26 +118,32 @@ type evalStateFactory struct {
 	factory func() EvalState
 }
 
-// InitState produces an EvalState instance and bundles it into the Activation in a way which is
+// InitState produces an EvalState instance and bundles it into the ExecutionFrame in a way which is
 // not visible to expression evaluation.
 func (et *evalStateFactory) InitState(frame *ExecutionFrame) (any, error) {
 	state := et.factory()
-	frame.state = state
+	if frame.ctx == nil {
+		frame.ctx = evalContextPool.Get().(*evalContext)
+	}
+	frame.ctx.state = state
 	return state, nil
 }
 
 // GetState extracts the EvalState from the Activation.
 func (et *evalStateFactory) GetState(frame *ExecutionFrame) any {
-	return frame.state
+	if frame.ctx == nil {
+		return nil
+	}
+	return frame.ctx.state
 }
 
 // Observe records the evaluation state for a given expression node and program step.
 func (et *evalStateFactory) Observe(vars Activation, id int64, programStep any, val ref.Val) {
 	frame := AsFrame(vars)
-	state := frame.state
-	if state == nil {
+	if frame.ctx == nil || frame.ctx.state == nil {
 		return
 	}
+	state := frame.ctx.state
 	state.SetValue(id, val)
 }
 
@@ -173,7 +179,7 @@ func ExhaustiveEval() PlannerOption {
 }
 
 // InterruptableEval annotates comprehension loops with information that indicates they
-// should check the `#interrupted` state within the ExecutionFrame.
+// should check for evaluation interruption via the ExecutionFrame.CheckInterrupt method.
 func InterruptableEval() PlannerOption {
 	return CustomDecoratorV2(decInterruptFolds())
 }

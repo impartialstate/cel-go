@@ -67,21 +67,24 @@ type costTrackerFactory struct {
 	factory func() (*CostTracker, error)
 }
 
-// InitState produces a CostTracker and bundles it into an Activation in a way which is not visible
+// InitState produces a CostTracker and bundles it into an ExecutionFrame in a way which is not visible
 // to expression evaluation.
 func (ct *costTrackerFactory) InitState(frame *ExecutionFrame) (any, error) {
 	tracker, err := ct.factory()
 	if err != nil {
 		return nil, err
 	}
-	frame.costs = tracker
+	if frame.ctx == nil {
+		frame.ctx = evalContextPool.Get().(*evalContext)
+	}
+	frame.ctx.costs = tracker
 	return tracker, nil
 }
 
 // GetState extracts the CostTracker from the Activation.
 func (ct *costTrackerFactory) GetState(frame *ExecutionFrame) any {
-	if frame != nil && frame.costs != nil {
-		return frame.costs
+	if frame != nil && frame.ctx != nil && frame.ctx.costs != nil {
+		return frame.ctx.costs
 	}
 	return nil
 }
@@ -90,10 +93,10 @@ func (ct *costTrackerFactory) GetState(frame *ExecutionFrame) any {
 // with the evaluation.
 func (ct *costTrackerFactory) Observe(vars Activation, id int64, programStep any, val ref.Val) {
 	frame := AsFrame(vars)
-	tracker := frame.costs
-	if tracker == nil {
+	if frame.ctx == nil || frame.ctx.costs == nil {
 		return
 	}
+	tracker := frame.ctx.costs
 	switch t := programStep.(type) {
 	case ConstantQualifier:
 		// TODO: Push identifiers on to the stack before observing constant qualifiers that apply to them
