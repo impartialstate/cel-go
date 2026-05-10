@@ -44,14 +44,9 @@ func TestConcurrentEval(t *testing.T) {
 			envOpts: []EnvOption{
 				Function("async_func",
 					Overload("async_func_int", []*Type{IntType}, IntType,
-						AsyncBinding(func(ctx context.Context, args ...ref.Val) <-chan ref.Val {
-							ch := make(chan ref.Val, 1)
-							go func() {
-								time.Sleep(10 * time.Millisecond)
-								ch <- args[0]
-								close(ch)
-							}()
-							return ch
+						AsyncBinding(func(ctx context.Context, args ...ref.Val) ref.Val {
+							time.Sleep(10 * time.Millisecond)
+							return args[0]
 						}),
 					),
 				),
@@ -148,14 +143,9 @@ func TestConcurrentEval_Cancel(t *testing.T) {
 	env, err := NewEnv(
 		Function("long_func",
 			Overload("long_func", []*Type{}, IntType,
-				AsyncBinding(func(ctx context.Context, args ...ref.Val) <-chan ref.Val {
-					ch := make(chan ref.Val, 1)
-					go func() {
-						// Wait for context cancellation
-						<-ctx.Done()
-						ch <- types.NewErr("cancelled")
-					}()
-					return ch
+				AsyncBinding(func(ctx context.Context, args ...ref.Val) ref.Val {
+					<-ctx.Done()
+					return types.NewErr("cancelled")
 				}),
 			),
 		),
@@ -203,24 +193,14 @@ func TestConcurrentEval_NilContext(t *testing.T) {
 }
 
 func TestConcurrentEval_Observable(t *testing.T) {
-	asyncIdentityBinding := AsyncBinding(func(ctx context.Context, args ...ref.Val) <-chan ref.Val {
-		ch := make(chan ref.Val, 1)
-		go func() {
-			time.Sleep(10 * time.Millisecond)
-			ch <- args[0]
-			close(ch)
-		}()
-		return ch
+	asyncIdentityBinding := AsyncBinding(func(ctx context.Context, args ...ref.Val) ref.Val {
+		time.Sleep(10 * time.Millisecond)
+		return args[0]
 	})
-	asyncDoubleBinding := AsyncBinding(func(ctx context.Context, args ...ref.Val) <-chan ref.Val {
-		ch := make(chan ref.Val, 1)
-		go func() {
-			time.Sleep(10 * time.Millisecond)
-			v := args[0].(types.Int)
-			ch <- v * 2
-			close(ch)
-		}()
-		return ch
+	asyncDoubleBinding := AsyncBinding(func(ctx context.Context, args ...ref.Val) ref.Val {
+		time.Sleep(10 * time.Millisecond)
+		v := args[0].(types.Int)
+		return v * 2
 	})
 
 	tests := []struct {
@@ -354,8 +334,13 @@ func TestConcurrentEval_Observable(t *testing.T) {
 func TestConcurrentEval_ObservableUnknowns(t *testing.T) {
 	ch := make(chan ref.Val, 1)
 	defer close(ch)
-	asyncIdentityBinding := AsyncBinding(func(ctx context.Context, args ...ref.Val) <-chan ref.Val {
-		return ch
+	asyncIdentityBinding := AsyncBinding(func(ctx context.Context, args ...ref.Val) ref.Val {
+		select {
+		case v := <-ch:
+			return v
+		case <-ctx.Done():
+			return types.NewErr(ctx.Err().Error())
+		}
 	})
 
 	env, err := NewEnv(

@@ -18,27 +18,20 @@ import (
 	"context"
 	"time"
 
-	"github.com/google/cel-go/common/functions"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
 )
 
-func FakeRPC(timeout time.Duration) functions.AsyncOp {
-	return func(ctx context.Context, args ...ref.Val) <-chan ref.Val {
-		ch := make(chan ref.Val, 1)
-		go func() {
-			rpcCtx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
-			
-			select {
-			case <-time.After(20 * time.Millisecond):
-				in := args[0].(types.String)
-				ch <- in.Add(types.String(" success!"))
-			case <-rpcCtx.Done():
-				ch <- types.NewErr(rpcCtx.Err().Error())
-			}
-			close(ch)
-		}()
-		return ch
+func FakeRPC(timeout time.Duration) func(context.Context, ...ref.Val) ref.Val {
+	return func(ctx context.Context, args ...ref.Val) ref.Val {
+		rpcCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		select {
+		case <-time.After(20 * time.Millisecond):
+			in := args[0].(types.String)
+			return in.Add(types.String(" success!"))
+		case <-rpcCtx.Done():
+			return types.NewErr(rpcCtx.Err().Error())
+		}
 	}
 }

@@ -543,10 +543,12 @@ func SingletonFunctionBinding(fn functions.FunctionOp, traits ...int) FunctionOp
 }
 
 // SingletonAsyncBinding creates a singleton async function definition to be used with all function overloads.
+// The provided function is called in its own goroutine with the provided context. The function should
+// block until the result is available, and the framework manages goroutine and channel lifecycle.
 //
 // Note, this approach works well if operand is expected to have a specific trait which it implements,
 // e.g. traits.ContainerType. Otherwise, prefer per-overload async bindings.
-func SingletonAsyncBinding(fn functions.AsyncOp, traits ...int) FunctionOpt {
+func SingletonAsyncBinding(fn functions.BlockingAsyncOp, traits ...int) FunctionOpt {
 	trait := 0
 	for _, t := range traits {
 		trait = trait | t
@@ -557,7 +559,7 @@ func SingletonAsyncBinding(fn functions.AsyncOp, traits ...int) FunctionOpt {
 		}
 		f.singleton = &functions.Overload{
 			Operator:     f.Name(),
-			Async:        fn,
+			Async:        wrapAsyncOp(fn),
 			OperandTrait: trait,
 		}
 		return f, nil
@@ -943,8 +945,12 @@ func FunctionBinding(binding functions.FunctionOp) OverloadOpt {
 }
 
 // AsyncBinding provides the implementation of an asynchronous overload. The provided function
-// returns a channel that will receive the result value when the async operation completes.
-func AsyncBinding(binding functions.AsyncOp) OverloadOpt {
+// is called in its own goroutine with the provided context. The function should block until
+// the result is available, and the framework manages goroutine and channel lifecycle.
+//
+// This follows the same pattern used by gRPC-Go and other major Go frameworks where user
+// code is synchronous and the framework manages concurrency.
+func AsyncBinding(fn functions.BlockingAsyncOp) OverloadOpt {
 	return func(o *OverloadDecl) (*OverloadDecl, error) {
 		if o.HasBinding() {
 			return nil, fmt.Errorf("overload already has a binding: %s", o.ID())
@@ -952,8 +958,20 @@ func AsyncBinding(binding functions.AsyncOp) OverloadOpt {
 		if o.hasLateBinding {
 			return nil, fmt.Errorf("overload already has a late binding: %s", o.ID())
 		}
-		o.asyncOp = binding
+		o.asyncOp = wrapAsyncOp(fn)
 		return o, nil
+	}
+}
+
+// wrapAsyncOp adapts a blocking function into the channel-based AsyncOp used internally.
+func wrapAsyncOp(fn functions.BlockingAsyncOp) functions.AsyncOp {
+	return func(ctx context.Context, args ...ref.Val) <-chan ref.Val {
+		ch := make(chan ref.Val, 1)
+		go func() {
+			ch <- fn(ctx, args...)
+			close(ch)
+		}()
+		return ch
 	}
 }
 

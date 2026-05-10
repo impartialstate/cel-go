@@ -69,3 +69,8 @@ type FunctionOp func(...ref.Val) ref.Val
 // AsyncOp is a function that accepts zero or more arguments and produces
 // a value or error asynchronously via a channel.
 type AsyncOp func(context.Context, ...ref.Val) <-chan ref.Val
+
+// BlockingAsyncOp is a function that accepts zero or more arguments and blocks until
+// the result is available. When used with AsyncBinding, the framework runs the function
+// in its own goroutine and manages channel lifecycle internally.
+type BlockingAsyncOp func(context.Context, ...ref.Val) ref.Val
