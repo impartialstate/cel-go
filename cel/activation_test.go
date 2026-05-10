@@ -1,4 +1,4 @@
-// Copyright 2024 Google LLC
+// Copyright 2026 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -89,7 +89,7 @@ func TestEvalActivation_Pool(t *testing.T) {
 		"lazy": func() any { return 1 },
 	}
 	a1 := activationPool.Setup(vars1)
-	
+
 	// Evaluate to cache
 	a1.ResolveName("lazy")
 	if len(a1.lazyVars) != 1 {
@@ -116,48 +116,49 @@ func TestEvalActivation_Pool(t *testing.T) {
 	}
 }
 
-func TestBuildFrame_InputTypes(t *testing.T) {
+func TestBuildFrame_ValidInputs(t *testing.T) {
 	env, _ := NewEnv(Variable("x", IntType))
 	ast, _ := env.Compile(`x`)
 	prg, _ := env.Program(ast)
 	p := prg.(*prog)
 
-	// 1. Test map[string]any
-	f1, c1, err := p.buildFrame(map[string]any{"x": 1})
-	if err != nil || f1 == nil {
-		t.Errorf("buildFrame(map) failed: %v", err)
-	}
-	val, found := f1.ResolveName("x")
-	if !found || val != 1 {
-		t.Errorf("f1.ResolveName(x) got %v, want 1", val)
-	}
-	c1()
-
-	// 2. Test Activation
 	act, _ := interpreter.NewActivation(map[string]any{"x": 2})
-	f2, c2, err := p.buildFrame(act)
-	if err != nil || f2 == nil {
-		t.Errorf("buildFrame(Activation) failed: %v", err)
-	}
-	val, found = f2.ResolveName("x")
-	if !found || val != 2 {
-		t.Errorf("f2.ResolveName(x) got %v, want 2", val)
-	}
-	c2()
+	frame := interpreter.NewExecutionFrame(act)
 
-	// 3. Test *interpreter.ExecutionFrame
-	f3, c3, err := p.buildFrame(f2)
-	if err != nil || f3 == nil {
-		t.Errorf("buildFrame(ExecutionFrame) failed: %v", err)
+	tests := []struct {
+		name  string
+		input any
+		want  any
+	}{
+		{name: "map_input", input: map[string]any{"x": 1}, want: 1},
+		{name: "activation", input: act, want: 2},
+		{name: "execution_frame", input: frame, want: 2},
 	}
-	if f3 != f2 {
-		t.Errorf("buildFrame(ExecutionFrame) returned different frame")
-	}
-	c3()
 
-	// 4. Test Invalid
-	_, _, err = p.buildFrame("invalid")
+	for _, tst := range tests {
+		tc := tst
+		t.Run(tc.name, func(t *testing.T) {
+			f, cleanup, err := p.buildFrame(tc.input)
+			if err != nil {
+				t.Fatalf("buildFrame() failed: %v", err)
+			}
+			defer cleanup()
+			val, found := f.ResolveName("x")
+			if !found || val != tc.want {
+				t.Errorf("ResolveName(x) = %v, want %v", val, tc.want)
+			}
+		})
+	}
+}
+
+func TestBuildFrame_InvalidInput(t *testing.T) {
+	env, _ := NewEnv(Variable("x", IntType))
+	ast, _ := env.Compile(`x`)
+	prg, _ := env.Program(ast)
+	p := prg.(*prog)
+
+	_, _, err := p.buildFrame("invalid")
 	if err == nil {
-		t.Errorf("buildFrame(invalid) expected error, got nil")
+		t.Error("buildFrame(invalid) expected error, got nil")
 	}
 }
