@@ -346,6 +346,20 @@ func LateFunctionBinding() OverloadOpt {
 	return decls.LateFunctionBinding()
 }
 
+// AsyncBinding provides the implementation of an asynchronous overload. The provided function
+// returns a channel that will receive the result value when the async operation completes.
+func AsyncBinding(binding functions.AsyncOp) OverloadOpt {
+	return decls.AsyncBinding(binding)
+}
+
+// SingletonAsyncBinding creates a singleton async function definition to be used with all function overloads.
+//
+// Note, this approach works well if operand is expected to have a specific trait which it implements,
+// e.g. traits.ContainerType. Otherwise, prefer per-overload async bindings.
+func SingletonAsyncBinding(fn functions.AsyncOp, traits ...int) FunctionOpt {
+	return decls.SingletonAsyncBinding(fn, traits...)
+}
+
 // OverloadIsNonStrict enables the function to be called with error and unknown argument values.
 //
 // Note: do not use this option unless absoluately necessary as it should be an uncommon feature.

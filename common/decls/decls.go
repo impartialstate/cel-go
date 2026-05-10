@@ -16,6 +16,7 @@
 package decls
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -342,6 +343,7 @@ func (f *FunctionDecl) Bindings() ([]*functions.Overload, error) {
 				Unary:        o.guardedUnaryOp(f.Name(), f.disableTypeGuards),
 				Binary:       o.guardedBinaryOp(f.Name(), f.disableTypeGuards),
 				Function:     o.guardedFunctionOp(f.Name(), f.disableTypeGuards),
+				Async:        o.guardedAsyncOp(f.Name(), f.disableTypeGuards),
 				OperandTrait: o.OperandTrait(),
 				NonStrict:    o.IsNonStrict(),
 			}
@@ -362,6 +364,7 @@ func (f *FunctionDecl) Bindings() ([]*functions.Overload, error) {
 				Unary:        f.singleton.Unary,
 				Binary:       f.singleton.Binary,
 				Function:     f.singleton.Function,
+				Async:        f.singleton.Async,
 				OperandTrait: f.singleton.OperandTrait,
 			},
 		}
@@ -380,6 +383,7 @@ func (f *FunctionDecl) Bindings() ([]*functions.Overload, error) {
 			Unary:        overloads[0].Unary,
 			Binary:       overloads[0].Binary,
 			Function:     overloads[0].Function,
+			Async:        overloads[0].Async,
 			NonStrict:    overloads[0].NonStrict,
 			OperandTrait: overloads[0].OperandTrait,
 		}), nil
@@ -538,6 +542,28 @@ func SingletonFunctionBinding(fn functions.FunctionOp, traits ...int) FunctionOp
 	}
 }
 
+// SingletonAsyncBinding creates a singleton async function definition to be used with all function overloads.
+//
+// Note, this approach works well if operand is expected to have a specific trait which it implements,
+// e.g. traits.ContainerType. Otherwise, prefer per-overload async bindings.
+func SingletonAsyncBinding(fn functions.AsyncOp, traits ...int) FunctionOpt {
+	trait := 0
+	for _, t := range traits {
+		trait = trait | t
+	}
+	return func(f *FunctionDecl) (*FunctionDecl, error) {
+		if f.singleton != nil {
+			return nil, fmt.Errorf("function already has a singleton binding: %s", f.Name())
+		}
+		f.singleton = &functions.Overload{
+			Operator:     f.Name(),
+			Async:        fn,
+			OperandTrait: trait,
+		}
+		return f, nil
+	}
+}
+
 // Overload defines a new global overload with an overload id, argument types, and result type. Through the
 // use of OverloadOpt options, the overload may also be configured with a binding, an operand trait, and to
 // be non-strict.
@@ -623,6 +649,8 @@ type OverloadDecl struct {
 	binaryOp functions.BinaryOp
 	// functionOp is a catch-all for zero-arity and three-plus arity functions.
 	functionOp functions.FunctionOp
+	// asyncOp is an asynchronous function binding that returns a channel.
+	asyncOp functions.AsyncOp
 }
 
 // Examples returns a list of string examples for the overload.
@@ -751,7 +779,7 @@ func (o *OverloadDecl) SignatureOverlaps(other *OverloadDecl) bool {
 
 // HasBinding indicates whether the overload already has a definition.
 func (o *OverloadDecl) HasBinding() bool {
-	return o != nil && (o.unaryOp != nil || o.binaryOp != nil || o.functionOp != nil)
+	return o != nil && (o.unaryOp != nil || o.binaryOp != nil || o.functionOp != nil || o.asyncOp != nil)
 }
 
 // guardedUnaryOp creates an invocation guard around the provided unary operator, if one is defined.
@@ -790,6 +818,22 @@ func (o *OverloadDecl) guardedFunctionOp(funcName string, disableTypeGuards bool
 			return MaybeNoSuchOverload(funcName, args...)
 		}
 		return o.functionOp(args...)
+	}
+}
+
+// guardedAsyncOp creates an invocation guard around the provided async function binding, if one is provided.
+func (o *OverloadDecl) guardedAsyncOp(funcName string, disableTypeGuards bool) functions.AsyncOp {
+	if o.asyncOp == nil {
+		return nil
+	}
+	return func(ctx context.Context, args ...ref.Val) <-chan ref.Val {
+		if !o.matchesRuntimeSignature(disableTypeGuards, args...) {
+			ch := make(chan ref.Val, 1)
+			ch <- MaybeNoSuchOverload(funcName, args...)
+			close(ch)
+			return ch
+		}
+		return o.asyncOp(ctx, args...)
 	}
 }
 
@@ -894,6 +938,21 @@ func FunctionBinding(binding functions.FunctionOp) OverloadOpt {
 			return nil, fmt.Errorf("overload already has a late binding: %s", o.ID())
 		}
 		o.functionOp = binding
+		return o, nil
+	}
+}
+
+// AsyncBinding provides the implementation of an asynchronous overload. The provided function
+// returns a channel that will receive the result value when the async operation completes.
+func AsyncBinding(binding functions.AsyncOp) OverloadOpt {
+	return func(o *OverloadDecl) (*OverloadDecl, error) {
+		if o.HasBinding() {
+			return nil, fmt.Errorf("overload already has a binding: %s", o.ID())
+		}
+		if o.hasLateBinding {
+			return nil, fmt.Errorf("overload already has a late binding: %s", o.ID())
+		}
+		o.asyncOp = binding
 		return o, nil
 	}
 }

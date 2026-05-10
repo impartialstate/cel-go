@@ -19,7 +19,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/cel-go/common/functions"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
 )
@@ -61,7 +60,18 @@ func TestConcurrentEval_Basic(t *testing.T) {
 func TestConcurrentEval_Async(t *testing.T) {
 	env, err := NewEnv(
 		Function("async_func",
-			Overload("async_func_int", []*Type{IntType}, IntType),
+			Overload("async_func_int", []*Type{IntType}, IntType,
+				AsyncBinding(func(ctx context.Context, args ...ref.Val) <-chan ref.Val {
+					ch := make(chan ref.Val, 1)
+					go func() {
+						// Simulate async work
+						time.Sleep(10 * time.Millisecond)
+						ch <- args[0]
+						close(ch)
+					}()
+					return ch
+				}),
+			),
 		),
 	)
 	if err != nil {
@@ -73,23 +83,7 @@ func TestConcurrentEval_Async(t *testing.T) {
 		t.Fatalf("env.Compile() failed: %v", iss.Err())
 	}
 
-	// Use cel.Functions ProgramOption to add async overloads
-	prgOpts := []ProgramOption{
-		Functions(&functions.Overload{
-			Operator: "async_func_int",
-			Async: func(ctx context.Context, args ...ref.Val) <-chan ref.Val {
-				ch := make(chan ref.Val, 1)
-				go func() {
-					// Simulate async work
-					time.Sleep(10 * time.Millisecond)
-					ch <- args[0]
-					close(ch)
-				}()
-				return ch
-			},
-		}),
-	}
-	prg, err := env.Program(ast, prgOpts...)
+	prg, err := env.Program(ast)
 	if err != nil {
 		t.Fatalf("env.Program() failed: %v", err)
 	}
@@ -113,7 +107,17 @@ func TestConcurrentEval_Async(t *testing.T) {
 func TestConcurrentEval_Cancel(t *testing.T) {
 	env, err := NewEnv(
 		Function("long_func",
-			Overload("long_func", []*Type{}, IntType),
+			Overload("long_func", []*Type{}, IntType,
+				AsyncBinding(func(ctx context.Context, args ...ref.Val) <-chan ref.Val {
+					ch := make(chan ref.Val, 1)
+					go func() {
+						// Wait for context cancellation
+						<-ctx.Done()
+						ch <- types.NewErr("cancelled")
+					}()
+					return ch
+				}),
+			),
 		),
 	)
 	if err != nil {
@@ -125,21 +129,7 @@ func TestConcurrentEval_Cancel(t *testing.T) {
 		t.Fatalf("env.Compile() failed: %v", iss.Err())
 	}
 
-	prgOpts := []ProgramOption{
-		Functions(&functions.Overload{
-			Operator: "long_func",
-			Async: func(ctx context.Context, args ...ref.Val) <-chan ref.Val {
-				ch := make(chan ref.Val, 1)
-				go func() {
-					// Wait for context cancellation
-					<-ctx.Done()
-					ch <- types.NewErr("cancelled")
-				}()
-				return ch
-			},
-		}),
-	}
-	prg, err := env.Program(ast, prgOpts...)
+	prg, err := env.Program(ast)
 	if err != nil {
 		t.Fatalf("env.Program() failed: %v", err)
 	}
@@ -212,12 +202,35 @@ func TestConcurrentEval_NilContext(t *testing.T) {
 }
 
 func TestConcurrentEval_Observable(t *testing.T) {
+	asyncIdentityBinding := AsyncBinding(func(ctx context.Context, args ...ref.Val) <-chan ref.Val {
+		ch := make(chan ref.Val, 1)
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			ch <- args[0]
+			close(ch)
+		}()
+		return ch
+	})
+	asyncDoubleBinding := AsyncBinding(func(ctx context.Context, args ...ref.Val) <-chan ref.Val {
+		ch := make(chan ref.Val, 1)
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			v := args[0].(types.Int)
+			ch <- v * 2
+			close(ch)
+		}()
+		return ch
+	})
+
 	tests := []struct {
-		name string
-		expr string
-		vars []EnvOption
-		in   map[string]any
-		out  ref.Val
+		name    string
+		expr    string
+		vars    []EnvOption
+		funcs   []EnvOption
+		prgOpts []ProgramOption
+		in      any
+		out     ref.Val
+		isUnk   bool
 	}{
 		{
 			name: "logical_or",
@@ -248,7 +261,7 @@ func TestConcurrentEval_Observable(t *testing.T) {
 			out: types.True,
 		},
 		{
-			name: "exhaustive_eval_unknowns",
+			name: "exhaustive_eval",
 			expr: `{k: true}[k] || v != false`,
 			vars: []EnvOption{
 				Variable("k", StringType),
@@ -260,12 +273,71 @@ func TestConcurrentEval_Observable(t *testing.T) {
 			},
 			out: types.True,
 		},
+		{
+			name: "exhaustive_async_only",
+			expr: `async_id(1) + async_dbl(3) == 7`,
+			funcs: []EnvOption{
+				Function("async_id",
+					Overload("async_identity_int", []*Type{IntType}, IntType, asyncIdentityBinding),
+				),
+				Function("async_dbl",
+					Overload("async_double_int", []*Type{IntType}, IntType, asyncDoubleBinding),
+				),
+			},
+			in:  map[string]any{},
+			out: types.True,
+		},
+		{
+			name: "exhaustive_mixed_sync_async",
+			expr: `async_id(5) + negate(3) == 2`,
+			funcs: []EnvOption{
+				Function("async_id",
+					Overload("async_identity_int", []*Type{IntType}, IntType, asyncIdentityBinding),
+				),
+				Function("negate",
+					Overload("sync_negate_int", []*Type{IntType}, IntType,
+						UnaryBinding(func(v ref.Val) ref.Val {
+							return -(v.(types.Int))
+						}),
+					),
+				),
+			},
+			in:  map[string]any{},
+			out: types.True,
+		},
+		{
+			name: "exhaustive_async_partial_vars",
+			expr: `async_id(x) + y == 11`,
+			funcs: []EnvOption{
+				Function("async_id",
+					Overload("async_identity_int", []*Type{IntType}, IntType, asyncIdentityBinding),
+				),
+			},
+			prgOpts: []ProgramOption{
+				EvalOptions(OptPartialEval),
+			},
+			vars: []EnvOption{
+				Variable("x", IntType),
+				Variable("y", IntType),
+			},
+			in: func() any {
+				pvars, _ := PartialVars(
+					map[string]any{"x": 1},
+					AttributePattern("y"),
+				)
+				return pvars
+			}(),
+			isUnk: true,
+		},
 	}
 
 	for _, tst := range tests {
 		tc := tst
 		t.Run(tc.name, func(t *testing.T) {
-			env, err := NewEnv(tc.vars...)
+			envOpts := make([]EnvOption, 0, len(tc.vars)+len(tc.funcs))
+			envOpts = append(envOpts, tc.vars...)
+			envOpts = append(envOpts, tc.funcs...)
+			env, err := NewEnv(envOpts...)
 			if err != nil {
 				t.Fatalf("NewEnv() failed: %v", err)
 			}
@@ -274,7 +346,8 @@ func TestConcurrentEval_Observable(t *testing.T) {
 				t.Fatalf("env.Compile() failed: %v", iss.Err())
 			}
 
-			prg, err := env.Program(ast, EvalOptions(OptExhaustiveEval))
+			prgOpts := append([]ProgramOption{EvalOptions(OptExhaustiveEval)}, tc.prgOpts...)
+			prg, err := env.Program(ast, prgOpts...)
 			if err != nil {
 				t.Fatalf("env.Program() failed: %v", err)
 			}
@@ -287,7 +360,11 @@ func TestConcurrentEval_Observable(t *testing.T) {
 				if res.Err != nil {
 					t.Errorf("ConcurrentEval() returned error: %v", res.Err)
 				}
-				if res.Val.Equal(tc.out) != types.True {
+				if tc.isUnk {
+					if !types.IsUnknown(res.Val) {
+						t.Errorf("ConcurrentEval() returned %v, wanted Unknown", res.Val)
+					}
+				} else if res.Val.Equal(tc.out) != types.True {
 					t.Errorf("ConcurrentEval() returned %v, wanted %v", res.Val, tc.out)
 				}
 				if res.EvalDetails == nil {
