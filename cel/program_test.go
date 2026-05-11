@@ -16,11 +16,13 @@ package cel
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
+	"github.com/google/cel-go/interpreter"
 )
 
 func TestConcurrentEval(t *testing.T) {
@@ -189,6 +191,15 @@ func TestConcurrentEval_NilContext(t *testing.T) {
 	res := <-resCh
 	if res.Err == nil || res.Err.Error() != "context can not be nil" {
 		t.Errorf("ConcurrentEval(nil) expected error, got %v", res.Err)
+	}
+
+	// Test PendingAsyncCalls and AsyncCall on a nil/empty frame
+	emptyFrame := interpreter.NewExecutionFrame(NoVars())
+	if emptyFrame.PendingAsyncCalls() != 0 {
+		t.Errorf("PendingAsyncCalls() on empty frame = %d, want 0", emptyFrame.PendingAsyncCalls())
+	}
+	if emptyFrame.AsyncCall(1) != nil {
+		t.Errorf("AsyncCall() on empty frame != nil")
 	}
 }
 
@@ -405,5 +416,205 @@ func TestConcurrentEval_ObservableUnknowns(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("ConcurrentEval() timed out")
+	}
+}
+
+func TestConcurrentEval_DrainStrategies(t *testing.T) {
+	// Create channels to precisely control when the async functions return
+	f1Ch := make(chan struct{})
+	f2Ch := make(chan struct{})
+	f3Ch := make(chan struct{})
+
+	env, err := NewEnv(
+		Function("async_f1", Overload("async_f1_int", []*Type{}, IntType, AsyncBinding(func(ctx context.Context, args ...ref.Val) ref.Val {
+			<-f1Ch
+			return types.Int(1)
+		}))),
+		Function("async_f2", Overload("async_f2_int", []*Type{}, IntType, AsyncBinding(func(ctx context.Context, args ...ref.Val) ref.Val {
+			<-f2Ch
+			return types.Int(2)
+		}))),
+		Function("async_f3", Overload("async_f3_int", []*Type{}, IntType, AsyncBinding(func(ctx context.Context, args ...ref.Val) ref.Val {
+			<-f3Ch
+			return types.Int(3)
+		}))),
+	)
+	if err != nil {
+		t.Fatalf("NewEnv() failed: %v", err)
+	}
+
+	ast, iss := env.Compile(`async_f1() + async_f2() + async_f3() == 6`)
+	if iss.Err() != nil {
+		t.Fatalf("env.Compile() failed: %v", iss.Err())
+	}
+
+	tests := []struct {
+		name         string
+		strategy     DrainStrategy
+		trigger      func()
+	}{
+		{
+			// DrainNone re-evaluates after every single completion
+			name:     "DrainNone",
+			strategy: DrainNone(),
+			trigger: func() {
+				// Trigger them sequentially
+				f1Ch <- struct{}{}
+				time.Sleep(10 * time.Millisecond)
+				f2Ch <- struct{}{}
+				time.Sleep(10 * time.Millisecond)
+				f3Ch <- struct{}{}
+			},
+		},
+		{
+			// DrainAll waits for all 3 to finish before re-evaluating
+			name:     "DrainAll",
+			strategy: DrainAll(),
+			trigger: func() {
+				// Trigger them at any pace, it shouldn't matter
+				f1Ch <- struct{}{}
+				time.Sleep(10 * time.Millisecond)
+				f2Ch <- struct{}{}
+				time.Sleep(10 * time.Millisecond)
+				f3Ch <- struct{}{}
+			},
+		},
+		{
+			// DrainReady batches functions that complete within the debounce window
+			name:     "DrainReady",
+			strategy: DrainReady(50 * time.Millisecond),
+			trigger: func() {
+				// Fire f1, wait for it to be processed
+				f1Ch <- struct{}{}
+				// Fire f2 and f3 immediately after each other
+				f2Ch <- struct{}{}
+				f3Ch <- struct{}{}
+			},
+		},
+		{
+			// Custom strategy that re-evaluates immediately if a specific function completes
+			name: "CustomPriority",
+			strategy: customPriorityDrain{priorityFunc: "async_f2"},
+			trigger: func() {
+				// Fire f1.
+				f1Ch <- struct{}{}
+				time.Sleep(10 * time.Millisecond)
+				// Fire f2. Strategy should trigger re-eval immediately even if f3 is pending.
+				f2Ch <- struct{}{}
+				time.Sleep(10 * time.Millisecond)
+				f3Ch <- struct{}{}
+			},
+		},
+	}
+
+	for _, tst := range tests {
+		tc := tst
+		t.Run(tc.name, func(t *testing.T) {
+			prg, err := env.Program(ast, ConcurrentDrainStrategy(tc.strategy))
+			if err != nil {
+				t.Fatalf("env.Program() failed: %v", err)
+			}
+
+			// Start evaluation
+			resCh := prg.ConcurrentEval(context.Background(), NoVars())
+
+			// Trigger completions
+			go tc.trigger()
+
+			// Wait for result
+			select {
+			case res := <-resCh:
+				if res.Err != nil {
+					t.Fatalf("ConcurrentEval() returned error: %v", res.Err)
+				}
+				if res.Val.Equal(types.True) != types.True {
+					t.Errorf("ConcurrentEval() = %v, want true", res.Val)
+				}
+			case <-time.After(1 * time.Second):
+				t.Fatal("ConcurrentEval() timed out")
+			}
+		})
+	}
+}
+
+type customPriorityDrain struct {
+	priorityFunc string
+}
+
+func (d customPriorityDrain) NextAction(completed []AsyncCall, pending int) DrainAction {
+	for _, c := range completed {
+		// Exercise all methods for coverage
+		_ = c.CallID()
+		_ = c.Overload()
+		if c.Function() == d.priorityFunc {
+			return DrainAction{Reevaluate: true}
+		}
+	}
+	return DrainAction{Reevaluate: pending == 0}
+}
+
+func TestConcurrentEval_DrainStrategies_Timeout(t *testing.T) {
+	ch := make(chan struct{})
+	env, _ := NewEnv(
+		Function("async", Overload("async_int", []*Type{}, IntType, AsyncBinding(func(ctx context.Context, args ...ref.Val) ref.Val {
+			<-ch
+			return types.Int(1)
+		}))),
+	)
+	ast, _ := env.Compile(`async() == 1`)
+	// Strategy that waits 10ms
+	prg, _ := env.Program(ast, ConcurrentDrainStrategy(DrainReady(10*time.Millisecond)))
+
+	resCh := prg.ConcurrentEval(context.Background(), NoVars())
+	// Fire completion
+	ch <- struct{}{}
+
+	// The evaluator should wait 10ms and then re-evaluate.
+	select {
+	case res := <-resCh:
+		if res.Err != nil {
+			t.Fatalf("ConcurrentEval() failed: %v", res.Err)
+		}
+		if res.Val != types.True {
+			t.Errorf("got %v, want true", res.Val)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out")
+	}
+}
+
+func TestConcurrentEval_DrainStrategies_Cancel(t *testing.T) {
+	ch1 := make(chan struct{})
+	ch2 := make(chan struct{})
+	env, _ := NewEnv(
+		Function("async1", Overload("async1_int", []*Type{}, IntType, AsyncBinding(func(ctx context.Context, args ...ref.Val) ref.Val {
+			<-ch1
+			return types.Int(1)
+		}))),
+		Function("async2", Overload("async2_int", []*Type{}, IntType, AsyncBinding(func(ctx context.Context, args ...ref.Val) ref.Val {
+			<-ch2
+			return types.Int(2)
+		}))),
+	)
+	ast, _ := env.Compile(`async1() + async2() == 3`)
+	prg, _ := env.Program(ast, ConcurrentDrainStrategy(DrainAll()))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	resCh := prg.ConcurrentEval(ctx, NoVars())
+
+	// Trigger first completion
+	ch1 <- struct{}{}
+	// Give it a tiny bit of time to reach the second select
+	time.Sleep(10 * time.Millisecond)
+	// Cancel while loop is waiting for async2
+	cancel()
+
+	select {
+	case res := <-resCh:
+		if res.Err == nil || !errors.Is(res.Err, context.Canceled) {
+			t.Errorf("got %v, want context.Canceled", res.Err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out")
 	}
 }

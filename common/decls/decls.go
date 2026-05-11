@@ -968,8 +968,8 @@ func wrapAsyncOp(fn functions.BlockingAsyncOp) functions.AsyncOp {
 	return func(ctx context.Context, args ...ref.Val) <-chan ref.Val {
 		ch := make(chan ref.Val, 1)
 		go func() {
+			defer close(ch)
 			ch <- fn(ctx, args...)
-			close(ch)
 		}()
 		return ch
 	}

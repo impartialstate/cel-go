@@ -194,14 +194,17 @@ func (f *ExecutionFrame) CheckInterrupt() bool {
 
 // asyncCallStateTracker manages async call states across frames
 type asyncCallStateTracker struct {
-	mu         sync.RWMutex
-	calls      map[int64]*asyncCallState
-	nextCallID atomic.Int64
+	mu           sync.RWMutex
+	calls        map[int64]*asyncCallState
+	callsByID    map[int64]*asyncCallState
+	nextCallID   atomic.Int64
+	pendingCalls atomic.Int32
 }
 
 func newAsyncCallStateTracker() *asyncCallStateTracker {
 	return &asyncCallStateTracker{
-		calls: make(map[int64]*asyncCallState),
+		calls:     make(map[int64]*asyncCallState),
+		callsByID: make(map[int64]*asyncCallState),
 	}
 }
 
@@ -227,7 +230,23 @@ func (t *asyncCallStateTracker) getOrCreate(id int64, function, overload string,
 	potentialState.callID = callID
 	potentialState.completions = completions
 	t.calls[potentialState.id] = potentialState
+	t.callsByID[callID] = potentialState
+	t.pendingCalls.Add(1)
 	return potentialState
+}
+
+func (t *asyncCallStateTracker) getByID(callID int64) *asyncCallState {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.callsByID[callID]
+}
+
+func (t *asyncCallStateTracker) pendingCount() int {
+	return int(t.pendingCalls.Load())
+}
+
+func (t *asyncCallStateTracker) NotifyCompletion(callID int64) {
+	t.pendingCalls.Add(-1)
 }
 
 // ComputeResult tracks and computes the result of the given asynchronous function.
@@ -237,6 +256,40 @@ func (f *ExecutionFrame) ComputeResult(id int64, function, overload string, impl
 	}
 	acs := f.ctx.asyncCalls.getOrCreate(id, function, overload, argVals, impl, f.ctx.completions)
 	return acs.call(f.ctx.ctx)
+}
+
+// AsyncCall describes a pending or completed asynchronous function call.
+type AsyncCall interface {
+	// CallID returns the unique identifier for this async call invocation.
+	CallID() int64
+	// Function returns the name of the function being called.
+	Function() string
+	// Overload returns the specific overload ID being invoked.
+	Overload() string
+}
+
+// PendingAsyncCalls returns the number of async function calls that have been launched
+// but have not yet returned a result.
+func (f *ExecutionFrame) PendingAsyncCalls() int {
+	if f.ctx == nil || f.ctx.asyncCalls == nil {
+		return 0
+	}
+	return f.ctx.asyncCalls.pendingCount()
+}
+
+// AsyncCall returns the state of an async call by its callID, or nil if not found.
+func (f *ExecutionFrame) AsyncCall(callID int64) AsyncCall {
+	if f.ctx == nil || f.ctx.asyncCalls == nil {
+		return nil
+	}
+	return f.ctx.asyncCalls.getByID(callID)
+}
+
+// NotifyCompletion notifies the execution frame that an async call has completed.
+func (f *ExecutionFrame) NotifyCompletion(callID int64) {
+	if f.ctx != nil && f.ctx.asyncCalls != nil {
+		f.ctx.asyncCalls.NotifyCompletion(callID)
+	}
 }
 
 func newAsyncCallState(id int64, function, overload string, argVals []ref.Val, impl functions.AsyncOp) *asyncCallState {
@@ -263,6 +316,21 @@ type asyncCallState struct {
 	result ref.Val
 
 	completions chan<- int64
+}
+
+// CallID returns the unique identifier for this async call invocation.
+func (acs *asyncCallState) CallID() int64 {
+	return acs.callID
+}
+
+// Function returns the name of the function being called.
+func (acs *asyncCallState) Function() string {
+	return acs.function
+}
+
+// Overload returns the specific overload ID being invoked.
+func (acs *asyncCallState) Overload() string {
+	return acs.overload
 }
 
 func (acs *asyncCallState) call(ctx context.Context) ref.Val {
@@ -371,6 +439,11 @@ func (pool *asyncCallStateTrackerPoolStruct) release(tracker *asyncCallStateTrac
 	for k := range tracker.calls {
 		delete(tracker.calls, k)
 	}
+	for k := range tracker.callsByID {
+		delete(tracker.callsByID, k)
+	}
+	tracker.pendingCalls.Store(0)
+	tracker.nextCallID.Store(0)
 	tracker.mu.Unlock()
 	pool.Pool.Put(tracker)
 }

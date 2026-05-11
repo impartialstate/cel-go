@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/google/cel-go/common/ast"
 	"github.com/google/cel-go/common/functions"
@@ -176,6 +177,7 @@ type prog struct {
 	callCostEstimator interpreter.ActualCostEstimator
 	costOptions       []interpreter.CostTrackerOption
 	costLimit         *uint64
+	drainStrategy     DrainStrategy
 }
 
 // newProgram creates a program instance with an environment, an ast, and an optional list of
@@ -193,6 +195,7 @@ func newProgram(e *Env, a *ast.AST, opts []ProgramOption) (Program, error) {
 		plannerOptions: []interpreter.PlannerOption{},
 		dispatcher:     disp,
 		costOptions:    []interpreter.CostTrackerOption{},
+		drainStrategy:  DrainNone(),
 	}
 
 	// Configure the program via the ProgramOption values.
@@ -435,13 +438,69 @@ func (p *prog) ConcurrentEval(ctx context.Context, input any) <-chan EvalResult 
 
 			unk := out.(*types.Unknown)
 			if unk.HasUnknownFunction() {
+				var batch []AsyncCall
+
+				// 1. Wait for at least one completion (or cancellation)
 				select {
-				case <-completions:
-					continue
+				case id := <-completions:
+					frame.NotifyCompletion(id)
+					if call := frame.AsyncCall(id); call != nil {
+						batch = append(batch, call)
+					}
 				case <-ctx.Done():
 					resCh <- EvalResult{Val: out, EvalDetails: det, Err: ctx.Err()}
 					return
 				}
+
+				// 2. Accumulate and consult strategy
+				var timer *time.Timer
+				for {
+					pending := frame.PendingAsyncCalls()
+					action := p.drainStrategy.NextAction(batch, pending)
+
+					if action.Reevaluate {
+						goto reevaluate
+					}
+
+					// Wait for next completion, guided by the strategy's wait duration
+					var timeoutCh <-chan time.Time
+					if action.WaitDuration > 0 {
+						if timer == nil {
+							timer = time.NewTimer(action.WaitDuration)
+						} else {
+							if !timer.Stop() {
+								select {
+								case <-timer.C:
+								default:
+								}
+							}
+							timer.Reset(action.WaitDuration)
+						}
+						timeoutCh = timer.C
+					}
+
+					select {
+					case id := <-completions:
+						frame.NotifyCompletion(id)
+						if call := frame.AsyncCall(id); call != nil {
+							batch = append(batch, call)
+						}
+					case <-timeoutCh:
+						// Timeout fired, re-evaluate with current batch
+						goto reevaluate
+					case <-ctx.Done():
+						if timer != nil {
+							timer.Stop()
+						}
+						resCh <- EvalResult{Val: out, EvalDetails: det, Err: ctx.Err()}
+						return
+					}
+				}
+			reevaluate:
+				if timer != nil {
+					timer.Stop()
+				}
+				continue
 			}
 
 			resCh <- EvalResult{Val: out, EvalDetails: det, Err: nil}

@@ -734,6 +734,16 @@ func InterruptCheckFrequency(checkFrequency uint) ProgramOption {
 	}
 }
 
+// ConcurrentDrainStrategy configures the strategy for when to re-evaluate the program
+// during a ConcurrentEval call after receiving asynchronous completion signals.
+// By default, the program re-evaluates immediately after every completion.
+func ConcurrentDrainStrategy(strategy DrainStrategy) ProgramOption {
+	return func(p *prog) (*prog, error) {
+		p.drainStrategy = strategy
+		return p, nil
+	}
+}
+
 // CostEstimatorOptions configure type-check time options for estimating expression cost.
 func CostEstimatorOptions(costOpts ...checker.CostOption) EnvOption {
 	return func(e *Env) (*Env, error) {
