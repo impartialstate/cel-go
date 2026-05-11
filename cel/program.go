@@ -26,6 +26,7 @@ import (
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
 	"github.com/google/cel-go/interpreter"
+	"github.com/google/cel-go/cel/async"
 )
 
 // Program is an evaluable view of an Ast.
@@ -177,8 +178,8 @@ type prog struct {
 	callCostEstimator interpreter.ActualCostEstimator
 	costOptions       []interpreter.CostTrackerOption
 	costLimit         *uint64
-	drainStrategy     DrainStrategy
-	asyncObserver             AsyncObserver
+	drainStrategy     async.DrainStrategy
+	asyncObserver             async.Observer
 	asyncCompletionBufferSize int
 	asyncMaxConcurrency       int
 }
@@ -198,7 +199,7 @@ func newProgram(e *Env, a *ast.AST, opts []ProgramOption) (Program, error) {
 		plannerOptions: []interpreter.PlannerOption{},
 		dispatcher:     disp,
 		costOptions:    []interpreter.CostTrackerOption{},
-		drainStrategy:  DrainNone(),
+		drainStrategy:  async.DrainNone(),
 	}
 
 	// Configure the program via the ProgramOption values.
@@ -441,7 +442,7 @@ func (p *prog) ConcurrentEval(ctx context.Context, input any) <-chan EvalResult 
 
 			unk := out.(*types.Unknown)
 			if unk.HasUnknownFunction() {
-				var batch []AsyncCall
+				var batch []async.Call
 
 				// 1. Wait for at least one completion (or cancellation)
 				select {

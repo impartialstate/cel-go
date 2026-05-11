@@ -7,7 +7,6 @@ package(
 go_library(
     name = "go_default_library",
     srcs = [
-        "async.go",
         "cel.go",
         "decls.go",
         "env.go",
@@ -27,6 +26,7 @@ go_library(
     importpath = "github.com/google/cel-go/cel",
     visibility = ["//visibility:public"],
     deps = [
+        "//cel/async:go_default_library",
         "//checker:go_default_library",
         "//checker/decls:go_default_library",
         "//common:go_default_library",
@@ -63,7 +63,6 @@ go_test(
     name = "go_default_test",
     srcs = [
         "activation_test.go",
-        "async_test.go",
         "cel_example_test.go",
         "cel_test.go",
         "decls_test.go",

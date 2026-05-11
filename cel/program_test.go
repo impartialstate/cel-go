@@ -23,6 +23,7 @@ import (
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
 	"github.com/google/cel-go/interpreter"
+	"github.com/google/cel-go/cel/async"
 )
 
 func TestConcurrentEval(t *testing.T) {
@@ -450,13 +451,13 @@ func TestConcurrentEval_DrainStrategies(t *testing.T) {
 
 	tests := []struct {
 		name         string
-		strategy     DrainStrategy
+		strategy     async.DrainStrategy
 		trigger      func()
 	}{
 		{
 			// DrainNone re-evaluates after every single completion
 			name:     "DrainNone",
-			strategy: DrainNone(),
+			strategy: async.DrainNone(),
 			trigger: func() {
 				// Trigger them sequentially
 				f1Ch <- struct{}{}
@@ -469,7 +470,7 @@ func TestConcurrentEval_DrainStrategies(t *testing.T) {
 		{
 			// DrainAll waits for all 3 to finish before re-evaluating
 			name:     "DrainAll",
-			strategy: DrainAll(),
+			strategy: async.DrainAll(),
 			trigger: func() {
 				// Trigger them at any pace, it shouldn't matter
 				f1Ch <- struct{}{}
@@ -482,7 +483,7 @@ func TestConcurrentEval_DrainStrategies(t *testing.T) {
 		{
 			// DrainReady batches functions that complete within the debounce window
 			name:     "DrainReady",
-			strategy: DrainReady(50 * time.Millisecond),
+			strategy: async.DrainReady(50 * time.Millisecond),
 			trigger: func() {
 				// Fire f1, wait for it to be processed
 				f1Ch <- struct{}{}
@@ -541,16 +542,16 @@ type customPriorityDrain struct {
 	priorityFunc string
 }
 
-func (d customPriorityDrain) NextAction(completed []AsyncCall, pending int) DrainAction {
+func (d customPriorityDrain) NextAction(completed []async.Call, pending int) async.DrainAction {
 	for _, c := range completed {
 		// Exercise all methods for coverage
 		_ = c.CallID()
 		_ = c.Overload()
 		if c.Function() == d.priorityFunc {
-			return DrainAction{Reevaluate: true}
+			return async.DrainAction{Reevaluate: true}
 		}
 	}
-	return DrainAction{Reevaluate: pending == 0}
+	return async.DrainAction{Reevaluate: pending == 0}
 }
 
 func TestConcurrentEval_DrainStrategies_Timeout(t *testing.T) {
@@ -563,7 +564,7 @@ func TestConcurrentEval_DrainStrategies_Timeout(t *testing.T) {
 	)
 	ast, _ := env.Compile(`async() == 1`)
 	// Strategy that waits 10ms
-	prg, _ := env.Program(ast, ConcurrentDrainStrategy(DrainReady(10*time.Millisecond)))
+	prg, _ := env.Program(ast, ConcurrentDrainStrategy(async.DrainReady(10*time.Millisecond)))
 
 	resCh := prg.ConcurrentEval(context.Background(), NoVars())
 	// Fire completion
@@ -597,7 +598,7 @@ func TestConcurrentEval_DrainStrategies_Cancel(t *testing.T) {
 		}))),
 	)
 	ast, _ := env.Compile(`async1() + async2() == 3`)
-	prg, _ := env.Program(ast, ConcurrentDrainStrategy(DrainAll()))
+	prg, _ := env.Program(ast, ConcurrentDrainStrategy(async.DrainAll()))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	resCh := prg.ConcurrentEval(ctx, NoVars())

@@ -33,6 +33,7 @@ import (
 	"github.com/google/cel-go/common/types/pb"
 	"github.com/google/cel-go/common/types/ref"
 	"github.com/google/cel-go/interpreter"
+	"github.com/google/cel-go/cel/async"
 	"github.com/google/cel-go/parser"
 
 	exprpb "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
@@ -735,7 +736,7 @@ func InterruptCheckFrequency(checkFrequency uint) ProgramOption {
 }
 
 // AsyncCallObserver sets the observer for monitoring asynchronous function calls.
-func AsyncCallObserver(observer AsyncObserver) ProgramOption {
+func AsyncCallObserver(observer async.Observer) ProgramOption {
 	return func(p *prog) (*prog, error) {
 		p.asyncObserver = observer
 		return p, nil
@@ -763,7 +764,7 @@ func AsyncMaxConcurrency(maxConcurrency int) ProgramOption {
 // ConcurrentDrainStrategy configures the strategy for when to re-evaluate the program
 // during a ConcurrentEval call after receiving asynchronous completion signals.
 // By default, the program re-evaluates immediately after every completion.
-func ConcurrentDrainStrategy(strategy DrainStrategy) ProgramOption {
+func ConcurrentDrainStrategy(strategy async.DrainStrategy) ProgramOption {
 	return func(p *prog) (*prog, error) {
 		p.drainStrategy = strategy
 		return p, nil
