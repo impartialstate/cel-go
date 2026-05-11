@@ -20,10 +20,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/cel-go/cel/async"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
 	"github.com/google/cel-go/interpreter"
-	"github.com/google/cel-go/cel/async"
 )
 
 func TestConcurrentEval(t *testing.T) {
@@ -450,9 +450,9 @@ func TestConcurrentEval_DrainStrategies(t *testing.T) {
 	}
 
 	tests := []struct {
-		name         string
-		strategy     async.DrainStrategy
-		trigger      func()
+		name     string
+		strategy async.DrainStrategy
+		trigger  func()
 	}{
 		{
 			// DrainNone re-evaluates after every single completion
@@ -494,7 +494,7 @@ func TestConcurrentEval_DrainStrategies(t *testing.T) {
 		},
 		{
 			// Custom strategy that re-evaluates immediately if a specific function completes
-			name: "CustomPriority",
+			name:     "CustomPriority",
 			strategy: customPriorityDrain{priorityFunc: "async_f2"},
 			trigger: func() {
 				// Fire f1.
@@ -614,6 +614,142 @@ func TestConcurrentEval_DrainStrategies_Cancel(t *testing.T) {
 	case res := <-resCh:
 		if res.Err == nil || !errors.Is(res.Err, context.Canceled) {
 			t.Errorf("got %v, want context.Canceled", res.Err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out")
+	}
+}
+
+func TestEvalActivation_Parent(t *testing.T) {
+	vars := map[string]any{"x": 1}
+	act := activationPool.Setup(vars)
+	defer activationPool.Put(act)
+	if act.Parent() != nil {
+		t.Errorf("evalActivation.Parent() should return nil")
+	}
+}
+
+func TestAsyncProgramOptions(t *testing.T) {
+	env, err := NewEnv()
+	if err != nil {
+		t.Fatalf("NewEnv() failed: %v", err)
+	}
+	ast, _ := env.Compile(`1 + 1`)
+	prg, err := env.Program(ast,
+		AsyncCallObserver(nil),
+		AsyncCompletionBufferSize(10),
+		AsyncMaxConcurrency(5),
+	)
+	if err != nil {
+		t.Fatalf("Program() failed: %v", err)
+	}
+	p := prg.(*prog)
+	if p.asyncCompletionBufferSize != 10 {
+		t.Errorf("asyncCompletionBufferSize = %d, want 10", p.asyncCompletionBufferSize)
+	}
+	if p.asyncMaxConcurrency != 5 {
+		t.Errorf("asyncMaxConcurrency = %d, want 5", p.asyncMaxConcurrency)
+	}
+}
+
+func TestConcurrentEval_Interrupt(t *testing.T) {
+	env, err := NewEnv(Variable("items", ListType(IntType)))
+	if err != nil {
+		t.Fatalf("NewEnv() failed: %v", err)
+	}
+	// Use a comprehension with many iterations so interrupt checking fires
+	ast, iss := env.Compile(`items.exists(i, i > 9999)`)
+	if iss.Err() != nil {
+		t.Fatalf("env.Compile() failed: %v", iss.Err())
+	}
+	prg, err := env.Program(ast, InterruptCheckFrequency(1))
+	if err != nil {
+		t.Fatalf("env.Program() failed: %v", err)
+	}
+	// Build a large input list so the comprehension runs long enough to be interrupted
+	items := make([]int64, 10000)
+	for i := range items {
+		items[i] = int64(i)
+	}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(errors.New("test interrupt"))
+
+	_, _, err = prg.ContextEval(ctx, map[string]any{"items": items})
+	if err == nil {
+		t.Fatal("ContextEval() should return an interrupt error")
+	}
+	if !errors.Is(err, interpreter.InterruptError{}) {
+		t.Errorf("expected InterruptError, got: %v", err)
+	}
+}
+
+func TestConcurrentEval_Accumulate(t *testing.T) {
+	ch := make(chan int, 2)
+	env, err := NewEnv(
+		Function("async_fn", Overload("async_fn_int", []*Type{}, IntType,
+			AsyncBinding(func(ctx context.Context, args ...ref.Val) ref.Val {
+				v := <-ch
+				return types.Int(v)
+			}))),
+	)
+	if err != nil {
+		t.Fatalf("NewEnv() failed: %v", err)
+	}
+	ast, iss := env.Compile(`async_fn() + async_fn() == 3`)
+	if iss.Err() != nil {
+		t.Fatalf("env.Compile() failed: %v", iss.Err())
+	}
+	prg, err := env.Program(ast, ConcurrentDrainStrategy(async.DrainAll()))
+	if err != nil {
+		t.Fatalf("env.Program() failed: %v", err)
+	}
+
+	resCh := prg.ConcurrentEval(context.Background(), NoVars())
+	ch <- 1
+	ch <- 2
+
+	select {
+	case res := <-resCh:
+		if res.Err != nil {
+			t.Fatalf("ConcurrentEval() failed: %v", res.Err)
+		}
+		if res.Val != types.True {
+			t.Errorf("got %v, want true", res.Val)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ConcurrentEval() timed out")
+	}
+}
+
+func TestConcurrentEval_DrainReady_TimerReset(t *testing.T) {
+	ch := make(chan struct{})
+	env, err := NewEnv(
+		Function("async_fn", Overload("async_fn_int", []*Type{}, IntType,
+			AsyncBinding(func(ctx context.Context, args ...ref.Val) ref.Val {
+				<-ch
+				return types.Int(1)
+			}))),
+	)
+	if err != nil {
+		t.Fatalf("NewEnv() failed: %v", err)
+	}
+	ast, iss := env.Compile(`async_fn() == 1`)
+	if iss.Err() != nil {
+		t.Fatalf("env.Compile() failed: %v", iss.Err())
+	}
+	// Use DrainReady with a non-zero duration to exercise the timer paths
+	prg, err := env.Program(ast, ConcurrentDrainStrategy(async.DrainReady(50*time.Millisecond)))
+	if err != nil {
+		t.Fatalf("env.Program() failed: %v", err)
+	}
+
+	resCh := prg.ConcurrentEval(context.Background(), NoVars())
+	ch <- struct{}{}
+
+	select {
+	case res := <-resCh:
+		if res.Err != nil {
+			t.Fatalf("ConcurrentEval() failed: %v", res.Err)
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("timed out")

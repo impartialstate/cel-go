@@ -316,3 +316,32 @@ func TestCheckedExprToAstMissingInfo(t *testing.T) {
 		t.Fatalf("ast2.ResultType() got %v, wanted 'int'", ast.ResultType())
 	}
 }
+
+func TestRefValueToValue_Error(t *testing.T) {
+	_, err := RefValueToValue(types.NewErr("test error"))
+	if err == nil {
+		t.Error("RefValueToValue(err) should return error")
+	}
+}
+
+func TestExprValueAsAlphaProto(t *testing.T) {
+	// Exercise the ExprValueAsAlphaProto wrapper (0% coverage)
+	res, err := ExprValueAsAlphaProto(types.Int(42))
+	if err != nil {
+		t.Fatalf("ExprValueAsAlphaProto() failed: %v", err)
+	}
+	if res.GetValue() == nil {
+		t.Error("ExprValueAsAlphaProto() returned nil value")
+	}
+}
+
+func TestRefValToExprValue_Wrappers(t *testing.T) {
+	// Exercise the RefValToExprValue wrapper (0% coverage)
+	res, err := RefValToExprValue(types.String("hello"))
+	if err != nil {
+		t.Fatalf("RefValToExprValue() failed: %v", err)
+	}
+	if res.GetValue() == nil {
+		t.Error("RefValToExprValue() returned nil value")
+	}
+}
