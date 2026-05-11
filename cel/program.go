@@ -178,6 +178,9 @@ type prog struct {
 	costOptions       []interpreter.CostTrackerOption
 	costLimit         *uint64
 	drainStrategy     DrainStrategy
+	asyncObserver             AsyncObserver
+	asyncCompletionBufferSize int
+	asyncMaxConcurrency       int
 }
 
 // newProgram creates a program instance with an environment, an ast, and an optional list of
@@ -396,7 +399,7 @@ func (p *prog) ConcurrentEval(ctx context.Context, input any) <-chan EvalResult 
 		// We use an unbuffered channel to communicate completions.
 		// Since the asyncCallState fan-in selects on ctx.Done(), this will not leak
 		// if the evaluation returns early or errors out.
-		completions := make(chan int64)
+		completions := make(chan int64, p.asyncCompletionBufferSize)
 		frame.SetCompletions(completions)
 
 		for {
@@ -551,6 +554,8 @@ func (p *prog) buildWithContext(ctx context.Context, input any) (*interpreter.Ex
 		return nil, nil, err
 	}
 	frame.SetContext(ctx, p.interruptCheckFrequency)
+	frame.SetAsyncObserver(p.asyncObserver)
+	frame.SetAsyncMaxConcurrency(p.asyncMaxConcurrency)
 	return frame, cleanup, nil
 }
 

@@ -24,6 +24,14 @@ import (
 	"github.com/google/cel-go/common/types/ref"
 )
 
+// AsyncObserver provides callbacks for monitoring the lifecycle of asynchronous function calls.
+type AsyncObserver interface {
+	// OnCallStarted is called when an asynchronous function is first launched.
+	OnCallStarted(callID int64, function, overload string, args []ref.Val)
+	// OnCallFinished is called when an asynchronous function completes.
+	OnCallFinished(callID int64, function, overload string, res ref.Val)
+}
+
 // evalContext contains the stateful information needed for a single evaluation.
 //
 // This state is shared across all frames within a single evaluation, including
@@ -58,6 +66,12 @@ type evalContext struct {
 
 	// completions channel for asynchronous function calls to send their call ID to when completed.
 	completions chan<- int64
+
+	// observer for monitoring async calls.
+	observer AsyncObserver
+
+	// semaphore for limiting concurrency.
+	semaphore chan struct{}
 }
 
 // ExecutionFrame provides the context for a single evaluation of an expression.
@@ -112,6 +126,7 @@ func (f *ExecutionFrame) Close() {
 		f.ctx.interrupted.Store(false)
 		f.ctx.interruptCheckCount.Store(0)
 		f.ctx.interruptCheckFrequency = 0
+		f.ctx.observer = nil
 		evalContextPool.Put(f.ctx)
 		f.ctx = nil
 	}
@@ -255,7 +270,7 @@ func (f *ExecutionFrame) ComputeResult(id int64, function, overload string, impl
 		return types.NewLabeledErr(id, "async call tracking is not initialized")
 	}
 	acs := f.ctx.asyncCalls.getOrCreate(id, function, overload, argVals, impl, f.ctx.completions)
-	return acs.call(f.ctx.ctx)
+	return acs.call(f.ctx.ctx, f.ctx.observer, f.ctx.semaphore)
 }
 
 // AsyncCall describes a pending or completed asynchronous function call.
@@ -289,6 +304,24 @@ func (f *ExecutionFrame) AsyncCall(callID int64) AsyncCall {
 func (f *ExecutionFrame) NotifyCompletion(callID int64) {
 	if f.ctx != nil && f.ctx.asyncCalls != nil {
 		f.ctx.asyncCalls.NotifyCompletion(callID)
+	}
+}
+
+// SetAsyncObserver sets the observer for monitoring asynchronous function calls.
+func (f *ExecutionFrame) SetAsyncObserver(observer AsyncObserver) {
+	if f.ctx != nil {
+		f.ctx.observer = observer
+	}
+}
+
+// SetAsyncMaxConcurrency sets the maximum concurrency for asynchronous function calls.
+func (f *ExecutionFrame) SetAsyncMaxConcurrency(n int) {
+	if f.ctx != nil {
+		if n > 0 {
+			f.ctx.semaphore = make(chan struct{}, n)
+		} else {
+			f.ctx.semaphore = nil
+		}
 	}
 }
 
@@ -333,15 +366,29 @@ func (acs *asyncCallState) Overload() string {
 	return acs.overload
 }
 
-func (acs *asyncCallState) call(ctx context.Context) ref.Val {
+func (acs *asyncCallState) call(ctx context.Context, observer AsyncObserver, semaphore chan struct{}) ref.Val {
 	acs.once.Do(func() {
-		ch := acs.impl(ctx, acs.argVals...)
+		if observer != nil {
+			observer.OnCallStarted(acs.callID, acs.function, acs.overload, acs.argVals)
+		}
 		go func() {
+			if semaphore != nil {
+				select {
+				case semaphore <- struct{}{}:
+					defer func() { <-semaphore }()
+				case <-ctx.Done():
+					return
+				}
+			}
+			ch := acs.impl(ctx, acs.argVals...)
 			select {
 			case res := <-ch:
 				acs.mu.Lock()
 				acs.result = res
 				acs.mu.Unlock()
+				if observer != nil {
+					observer.OnCallFinished(acs.callID, acs.function, acs.overload, res)
+				}
 				if acs.completions != nil {
 					select {
 					case acs.completions <- acs.callID:
@@ -354,11 +401,9 @@ func (acs *asyncCallState) call(ctx context.Context) ref.Val {
 	})
 
 	acs.mu.RLock()
-	res := acs.result
-	acs.mu.RUnlock()
-
-	if res != nil {
-		return res
+	defer acs.mu.RUnlock()
+	if acs.result != nil {
+		return acs.result
 	}
 	return types.NewUnknown(acs.callID, nil)
 }

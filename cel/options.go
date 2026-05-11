@@ -734,6 +734,32 @@ func InterruptCheckFrequency(checkFrequency uint) ProgramOption {
 	}
 }
 
+// AsyncCallObserver sets the observer for monitoring asynchronous function calls.
+func AsyncCallObserver(observer AsyncObserver) ProgramOption {
+	return func(p *prog) (*prog, error) {
+		p.asyncObserver = observer
+		return p, nil
+	}
+}
+
+// AsyncCompletionBufferSize sets the size of the buffer for the async completion channel.
+// By default, the channel is unbuffered.
+func AsyncCompletionBufferSize(size int) ProgramOption {
+	return func(p *prog) (*prog, error) {
+		p.asyncCompletionBufferSize = size
+		return p, nil
+	}
+}
+
+// AsyncMaxConcurrency sets the maximum number of concurrent async calls.
+// By default, concurrency is unlimited.
+func AsyncMaxConcurrency(maxConcurrency int) ProgramOption {
+	return func(p *prog) (*prog, error) {
+		p.asyncMaxConcurrency = maxConcurrency
+		return p, nil
+	}
+}
+
 // ConcurrentDrainStrategy configures the strategy for when to re-evaluate the program
 // during a ConcurrentEval call after receiving asynchronous completion signals.
 // By default, the program re-evaluates immediately after every completion.

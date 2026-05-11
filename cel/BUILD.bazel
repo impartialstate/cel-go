@@ -7,6 +7,7 @@ package(
 go_library(
     name = "go_default_library",
     srcs = [
+        "async.go",
         "cel.go",
         "decls.go",
         "env.go",
@@ -62,6 +63,7 @@ go_test(
     name = "go_default_test",
     srcs = [
         "activation_test.go",
+        "async_test.go",
         "cel_example_test.go",
         "cel_test.go",
         "decls_test.go",
