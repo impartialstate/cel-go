@@ -16,7 +16,6 @@ package interpreter
 
 import (
 	"fmt"
-	"math"
 	"math/rand"
 	"reflect"
 	"strings"
@@ -26,6 +25,7 @@ import (
 	"github.com/google/cel-go/checker"
 	"github.com/google/cel-go/common"
 	"github.com/google/cel-go/common/containers"
+	"github.com/google/cel-go/common/cost"
 	"github.com/google/cel-go/common/decls"
 	"github.com/google/cel-go/common/overloads"
 	"github.com/google/cel-go/common/types"
@@ -109,7 +109,7 @@ func TestTrackCostAdvanced(t *testing.T) {
 	}
 }
 
-func computeCost(t *testing.T, expr string, vars []*decls.VariableDecl, ctx Activation, options []CostTrackerOption) (cost uint64, est checker.CostEstimate, err error) {
+func computeCost(t *testing.T, expr string, vars []*decls.VariableDecl, ctx Activation, options []CostTrackerOption) (actual uint64, est checker.CostEstimate, err error) {
 	t.Helper()
 
 	s := common.NewTextSource(expr)
@@ -138,7 +138,7 @@ func computeCost(t *testing.T, expr string, vars []*decls.VariableDecl, ctx Acti
 	if len(errs.GetErrors()) != 0 {
 		t.Fatalf(`Failed to check expression "%s", error: %v`, expr, errs.GetErrors())
 	}
-	est, err = checker.Cost(checked, testCostEstimator{}, checker.PresenceTestHasCost(costTracker.presenceTestHasCost))
+	est, err = checker.Cost(checked, testCostEstimator{}, checker.PresenceTestHasCost(costTracker.PresenceTestHasCost()))
 	if err != nil {
 		t.Fatalf("checker.Cost() failed: %v", err)
 	}
@@ -162,11 +162,7 @@ func computeCost(t *testing.T, expr string, vars []*decls.VariableDecl, ctx Acti
 		}
 	}()
 	prg.Eval(ctx)
-	// TODO: enable this once all attributes are properly pushed and popped from stack.
-	//if len(costTracker.stack) != 1 {
-	//	t.Fatalf(`Expected resulting stack size to be 1 but got %d: %#+v`, len(costTracker.stack), costTracker.stack)
-	//}
-	return costTracker.cost, est, err
+	return costTracker.ActualCost(), est, err
 }
 
 func constructActivation(t *testing.T, in any) Activation {
@@ -229,10 +225,10 @@ func (tc testCostEstimator) EstimateSize(element checker.AstNode) *checker.SizeE
 	return nil
 }
 
-func (tc testCostEstimator) EstimateCallCost(function, overloadID string, target *checker.AstNode, args []checker.AstNode) *checker.CallEstimate {
+func (tc testCostEstimator) EstimateCall(function, overloadID string, operands []checker.AstNode) *checker.CallEstimate {
 	switch overloadID {
 	case overloads.TimestampToYear:
-		return &checker.CallEstimate{CostEstimate: checker.FixedCostEstimate(7)}
+		return &checker.CallEstimate{Cost: checker.FixedCostEstimate(7)}
 	}
 	return nil
 }
@@ -741,8 +737,8 @@ func TestRuntimeCost(t *testing.T) {
 			options: []CostTrackerOption{
 				OverloadCostTracker(overloads.ContainsString,
 					func(args []ref.Val, result ref.Val) *uint64 {
-						strCost := uint64(math.Ceil(float64(actualSize(args[0])) * 0.2))
-						substrCost := uint64(math.Ceil(float64(actualSize(args[1])) * 0.2))
+						strCost := cost.Scale(cost.AggregateSize(args[0]), 0.2)
+						substrCost := cost.Scale(cost.AggregateSize(args[1]), 0.2)
 						cost := strCost * substrCost
 						return &cost
 					}),
@@ -888,5 +884,38 @@ func TestRuntimeCost(t *testing.T) {
 					est.Min, est.Max, actualCost)
 			}
 		})
+	}
+}
+
+func TestRuntimeCostComprehensionTracking(t *testing.T) {
+	var observed []cost.Comprehension
+	perIteration := func(comp cost.Comprehension) *uint64 {
+		observed = append(observed, comp)
+		c := comp.Iterations() * 2
+		return &c
+	}
+	baseline, _, err := computeCost(t, `[1, 2, 3].exists(i, i > 2)`, nil, EmptyActivation(), nil)
+	if err != nil {
+		t.Fatalf("computeCost() failed: %v", err)
+	}
+	tracked, _, err := computeCost(t, `[1, 2, 3].exists(i, i > 2)`, nil, EmptyActivation(),
+		[]CostTrackerOption{cost.TrackComprehensions(perIteration)})
+	if err != nil {
+		t.Fatalf("computeCost() failed: %v", err)
+	}
+	if len(observed) != 1 {
+		t.Fatalf("comprehension tracker called %d times, wanted once", len(observed))
+	}
+	if got := observed[0].Iterations(); got != 3 {
+		t.Errorf("Comprehension.Iterations() got %d, wanted 3", got)
+	}
+	if got := cost.AggregateSize(observed[0].IterRange()); got != 3 {
+		t.Errorf("Comprehension.IterRange() had size %d, wanted 3", got)
+	}
+	if observed[0].Accu() != types.True {
+		t.Errorf("Comprehension.Accu() got %v, wanted true", observed[0].Accu())
+	}
+	if tracked != baseline+6 {
+		t.Errorf("comprehension tracking charged %d, wanted %d", tracked, baseline+6)
 	}
 }

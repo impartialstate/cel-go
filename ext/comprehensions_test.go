@@ -338,8 +338,8 @@ func TestTwoVarComprehensionsCost(t *testing.T) {
 				"m.@values":        10,
 				"m.@values.@items": 2,
 			},
-			estimatedCost: checker.CostEstimate{Min: 73, Max: 173},
-			actualCost:    100,
+			estimatedCost: checker.CostEstimate{Min: 72, Max: 173},
+			actualCost:    98,
 		},
 		{
 			name:          "transformMapEntry literal input",
@@ -364,7 +364,7 @@ func TestTwoVarComprehensionsCost(t *testing.T) {
 				"m.@keys":   16,
 				"m.@values": 10,
 			},
-			estimatedCost: checker.CostEstimate{Min: 65, Max: 405},
+			estimatedCost: checker.CostEstimate{Min: 64, Max: 405},
 			actualCost:    201,
 		},
 	}

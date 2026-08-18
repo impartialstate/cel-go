@@ -15,12 +15,12 @@
 package checker
 
 import (
-	"math"
 	"strings"
 	"testing"
 
 	"github.com/google/cel-go/common"
 	"github.com/google/cel-go/common/containers"
+	"github.com/google/cel-go/common/cost"
 	"github.com/google/cel-go/common/decls"
 	"github.com/google/cel-go/common/overloads"
 	"github.com/google/cel-go/common/stdlib"
@@ -273,7 +273,7 @@ func TestCost(t *testing.T) {
 			hints: map[string]uint64{"input": 500},
 			// equality check ensures that the resultSize calculation is included in cost
 			expr:   `string(input) == string(input)`,
-			wanted: CostEstimate{Min: 3, Max: 152},
+			wanted: CostEstimate{Min: 2, Max: 152},
 		},
 		{
 			name:   "string to bytes conversion",
@@ -288,7 +288,7 @@ func TestCost(t *testing.T) {
 			hints: map[string]uint64{"input": 500},
 			// equality check ensures that the resultSize calculation is included in cost
 			expr:   `bytes(input) == bytes(input)`,
-			wanted: CostEstimate{Min: 3, Max: 302},
+			wanted: CostEstimate{Min: 2, Max: 302},
 		},
 		{
 			name:   "int to string conversion",
@@ -436,13 +436,13 @@ func TestCost(t *testing.T) {
 			hints: map[string]uint64{"str1": 10, "str2": 10},
 			options: []CostOption{
 				OverloadCostEstimate(overloads.ContainsString,
-					func(estimator CostEstimator, target *AstNode, args []AstNode) *CallEstimate {
-						if target != nil && len(args) == 1 {
-							strSize := estimateSize(estimator, *target).MultiplyByCostFactor(0.2)
-							subSize := estimateSize(estimator, args[0]).MultiplyByCostFactor(0.2)
-							return &CallEstimate{CostEstimate: strSize.Multiply(subSize)}
+					func(operands []AstNode) *CallEstimate {
+						if len(operands) != 2 {
+							return nil
 						}
-						return nil
+						strSize := operands[0].Size().Scale(0.2)
+						subSize := operands[1].Size().Scale(0.2)
+						return &CallEstimate{Cost: strSize.Multiply(subSize)}
 					}),
 			},
 			wanted: CostEstimate{Min: 2, Max: 12},
@@ -504,7 +504,7 @@ func TestCost(t *testing.T) {
 				decls.NewVariable("str1", types.StringType),
 				decls.NewVariable("str2", types.StringType),
 			},
-			wanted: CostEstimate{Min: 9, Max: 9},
+			wanted: CostEstimate{Min: 3, Max: 9},
 		},
 		{
 			name:   "nested subexpression operators",
@@ -518,7 +518,7 @@ func TestCost(t *testing.T) {
 				decls.NewVariable("timestamp1", types.TimestampType),
 				decls.NewVariable("timestamp2", types.TimestampType),
 			},
-			wanted: CostEstimate{Min: 5, Max: 1844674407370955268},
+			wanted: CostEstimate{Min: 4, Max: 1844674407370955268},
 		},
 		{
 			name: "timestamp equality check",
@@ -647,17 +647,17 @@ func TestCost(t *testing.T) {
 			vars: []*decls.VariableDecl{
 				decls.NewVariable("self", types.NewMapType(types.StringType, types.IntType)),
 			},
-			wanted: CostEstimate{Min: 5, Max: 1844674407370955268},
+			wanted: CostEstimate{Min: 4, Max: 1844674407370955268},
 		},
 		{
 			name:   "type literal equality cost",
 			expr:   `type(1) == int`,
-			wanted: CostEstimate{Min: 3, Max: 1844674407370955266},
+			wanted: CostEstimate{Min: 2, Max: 1844674407370955266},
 		},
 		{
 			name:   "type variable equality cost",
 			expr:   `type(1) == int`,
-			wanted: CostEstimate{Min: 3, Max: 1844674407370955266},
+			wanted: CostEstimate{Min: 2, Max: 1844674407370955266},
 		},
 		{
 			name: "namespace variable equality",
@@ -720,25 +720,26 @@ func TestCost(t *testing.T) {
 			expr: "[bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901')].max()",
 			options: []CostOption{
 				OverloadCostEstimate("list_bytes_max",
-					func(estimator CostEstimator, target *AstNode, args []AstNode) *CallEstimate {
-						if target != nil {
-							// Charge 1 cost for comparing each element in the list
-							elCost := CostEstimate{Min: 1, Max: 1}
-							// If the list contains strings or bytes, add the cost of traversing all the strings/bytes as a way
-							// of estimating the additional comparison cost.
-							if elNode := listElementNode(*target); elNode != nil {
-								k := elNode.Type().Kind()
-								if k == types.StringKind || k == types.BytesKind {
-									sz := sizeEstimate(estimator, elNode)
-									elCost = elCost.Add(sz.MultiplyByCostFactor(common.StringTraversalCostFactor))
-								}
-								return &CallEstimate{CostEstimate: sizeEstimate(estimator, *target).MultiplyByCost(elCost)}
-							}
+					func(operands []AstNode) *CallEstimate {
+						if len(operands) != 1 {
+							return nil
 						}
-						return nil
+						// Charge 1 cost for comparing each element in the list
+						elCost := CostEstimate{Min: 1, Max: 1}
+						// If the list contains strings or bytes, add the cost of traversing all the strings/bytes as a way
+						// of estimating the additional comparison cost.
+						elType := operands[0].ElementType()
+						if elType == nil {
+							return nil
+						}
+						switch elType.Kind() {
+						case types.StringKind, types.BytesKind:
+							elCost = elCost.Add(operands[0].ElementSize().Scale(cost.StringTraversalCostFactor))
+						}
+						return &CallEstimate{Cost: operands[0].Size().Multiply(elCost)}
 					}),
 			},
-			wanted: CostEstimate{Min: 25, Max: 35},
+			wanted: CostEstimate{Min: 35, Max: 50},
 		},
 	}
 
@@ -812,49 +813,10 @@ func (tc testCostEstimator) EstimateSize(element AstNode) *SizeEstimate {
 	return nil
 }
 
-func (tc testCostEstimator) EstimateCallCost(function, overloadID string, target *AstNode, args []AstNode) *CallEstimate {
+func (tc testCostEstimator) EstimateCall(function, overloadID string, operands []AstNode) *CallEstimate {
 	switch overloadID {
 	case overloads.TimestampToYear:
-		return &CallEstimate{CostEstimate: CostEstimate{Min: 7, Max: 7}}
+		return &CallEstimate{Cost: CostEstimate{Min: 7, Max: 7}}
 	}
 	return nil
-}
-
-func estimateSize(estimator CostEstimator, node AstNode) SizeEstimate {
-	if l := node.ComputedSize(); l != nil {
-		return *l
-	}
-	if l := estimator.EstimateSize(node); l != nil {
-		return *l
-	}
-	return SizeEstimate{Min: 0, Max: math.MaxUint64}
-}
-
-func listElementNode(list AstNode) AstNode {
-	if params := list.Type().Parameters(); len(params) > 0 {
-		lt := params[0]
-		nodePath := list.Path()
-		if nodePath != nil {
-			// Provide path if we have it so that a OpenAPIv3 maxLength validation can be looked up, if it exists
-			// for this node.
-			path := make([]string, len(nodePath)+1)
-			copy(path, nodePath)
-			path[len(nodePath)] = "@items"
-			return &astNode{path: path, t: lt, expr: nil}
-		} else {
-			// Provide just the type if no path is available so that worst case size can be looked up based on type.
-			return &astNode{t: lt, expr: nil}
-		}
-	}
-	return nil
-}
-
-func sizeEstimate(estimator CostEstimator, t AstNode) SizeEstimate {
-	if sz := t.ComputedSize(); sz != nil {
-		return *sz
-	}
-	if sz := estimator.EstimateSize(t); sz != nil {
-		return *sz
-	}
-	return SizeEstimate{Min: 0, Max: math.MaxUint64}
 }

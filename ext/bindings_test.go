@@ -40,7 +40,7 @@ var bindingTests = []struct {
 		name: "single bind",
 		expr: `cel.bind(a, 'hell' + 'o' + '!', "%s, %s, %s".format([a, a, a])) ==
 	                       'hello!, hello!, hello' + '!'`,
-		estimatedCost: checker.CostEstimate{Min: 30, Max: 32},
+		estimatedCost: checker.CostEstimate{Min: 29, Max: 32},
 		actualCost:    32,
 	},
 	{
@@ -48,7 +48,7 @@ var bindingTests = []struct {
 		expr: `cel.bind(a, 'hello!',
 		       cel.bind(b, 'goodbye',
 				a + ' and, ' + b)) == 'hello! and, goodbye'`,
-		estimatedCost: checker.CostEstimate{Min: 27, Max: 28},
+		estimatedCost: checker.CostEstimate{Min: 28, Max: 28},
 		actualCost:    28,
 	},
 	{
@@ -56,7 +56,7 @@ var bindingTests = []struct {
 		expr: `cel.bind(a,
 		       cel.bind(a, 'world', a + '!'),
 		   	    'hello ' + a) == 'hello ' + 'world' + '!'`,
-		estimatedCost: checker.CostEstimate{Min: 30, Max: 31},
+		estimatedCost: checker.CostEstimate{Min: 31, Max: 31},
 		actualCost:    31,
 	},
 	{
@@ -87,7 +87,7 @@ var bindingTests = []struct {
 			"x":        3,
 			"x.@items": 10,
 		},
-		estimatedCost: checker.CostEstimate{Min: 38, Max: 40},
+		estimatedCost: checker.CostEstimate{Min: 37, Max: 40},
 		actualCost:    39,
 	},
 	{

@@ -17,11 +17,11 @@ package ext
 import (
 	"math"
 	"reflect"
-	"strings"
 	"testing"
 
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/checker"
+	"github.com/google/cel-go/common/cost"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
 
@@ -490,7 +490,7 @@ func testCheckCost(t *testing.T, env *cel.Env, ast *cel.Ast, hints map[string]ui
 	if len(hints) == 0 {
 		hints = map[string]uint64{}
 	}
-	est, err := env.EstimateCost(ast, testCostHintEstimator{hints: hints})
+	est, err := env.EstimateCost(ast, testCostHints(hints))
 	if err != nil {
 		t.Fatalf("env.EstimateCost() failed: %v", err)
 	}
@@ -524,17 +524,12 @@ func testEvalWithCost(t *testing.T, env *cel.Env, ast *cel.Ast, in any, wantCost
 	}
 }
 
-type testCostHintEstimator struct {
-	hints map[string]uint64
-}
-
-func (tc testCostHintEstimator) EstimateSize(element checker.AstNode) *checker.SizeEstimate {
-	if l, ok := tc.hints[strings.Join(element.Path(), ".")]; ok {
-		return &checker.SizeEstimate{Min: 0, Max: l}
+// testCostHints resolves the declared size hints for a test case, exercising the size hint
+// estimator provided by the cost package.
+func testCostHints(hints map[string]uint64) checker.CostEstimator {
+	opts := make([]cost.Hint, 0, len(hints))
+	for path, size := range hints {
+		opts = append(opts, cost.SizeHint(path, size))
 	}
-	return nil
-}
-
-func (testCostHintEstimator) EstimateCallCost(function, overloadID string, target *checker.AstNode, args []checker.AstNode) *checker.CallEstimate {
-	return nil
+	return cost.NewHints(opts...)
 }

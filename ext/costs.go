@@ -15,108 +15,70 @@
 package ext
 
 import (
-	"math"
-
-	"github.com/google/cel-go/checker"
-	"github.com/google/cel-go/common"
-	"github.com/google/cel-go/common/ast"
-	"github.com/google/cel-go/common/types"
-	"github.com/google/cel-go/common/types/ref"
-	"github.com/google/cel-go/common/types/traits"
+	"github.com/google/cel-go/common/cost"
 )
 
-var (
-	callCostEstimate = checker.FixedCostEstimate(1)
-	callCost         = uint64(1)
-	listAllocCost    = checker.FixedCostEstimate(common.ListCreateBaseCost)
-	stringCostFactor = common.StringTraversalCostFactor
-)
+// Cost models for the extension libraries.
+//
+// Every extension overload whose cost depends on the size of its inputs is described by a single
+// cost.Model. The model is registered with both the compile-time estimator and the runtime
+// tracker, which is what keeps an extension from reporting one cost when an expression is
+// checked and a different cost when the same expression is evaluated.
+//
+// Operands are receiver-first, so `s.replace(old, new)` and `regex.replace(s, old, new)` address
+// their target as operand 0 and their arguments from 1 onward.
 
-func estimateStringScan(sz checker.SizeEstimate) (checker.CostEstimate, *checker.SizeEstimate) {
-	return estimateTraversal(sz, stringCostFactor, nil)
+// scanString describes a call which walks its target string once and allocates a result whose
+// size is described by the result function.
+func scanString(result cost.SizeFn) cost.Model {
+	return cost.Model{
+		Base:         cost.CallCost,
+		Traversed:    cost.Operand(0).Scale(cost.StringTraversalCostFactor),
+		Result:       result,
+		ChargeResult: true,
+	}
 }
 
-func estimateListAlloc(sz checker.SizeEstimate, costFactor float64) (checker.CostEstimate, *checker.SizeEstimate) {
-	return estimateTraversal(sz, costFactor, &listAllocCost)
+// searchString describes a call which scans its target once for every character of the value it
+// is searching for, and which produces a scalar.
+func searchString(target, needle int) cost.Model {
+	return cost.Model{
+		Base:      cost.CallCost,
+		Traversed: cost.Product(cost.Operand(target), cost.Operand(needle)).Scale(cost.StringTraversalCostFactor),
+	}
 }
 
-// estimateTraversal computes cost as a function of the size of the target object and whether the call allocates memory.
-func estimateTraversal(nodeSize checker.SizeEstimate, costFactor float64, allocationCost *checker.CostEstimate) (checker.CostEstimate, *checker.SizeEstimate) {
-	cost := nodeSize.MultiplyByCostFactor(costFactor)
-	if allocationCost != nil {
-		cost = cost.Add(*allocationCost)
-	}
-	return cost, &nodeSize
+// matchRegex describes the search performed by applying a regex pattern to a target string.
+//
+// Both sizes are offset by one so that an empty target, or an empty pattern, cannot reduce the
+// cost of the search to zero. The two cost factors are applied together rather than one at a
+// time so that a short target and a short pattern are not each rounded up to a full unit.
+func matchRegex(target, pattern int) cost.SizeFn {
+	return cost.Product(
+		cost.Operand(target).Offset(1),
+		cost.Operand(pattern).Offset(1),
+	).Scale(cost.StringTraversalCostFactor * cost.RegexStringLengthCostFactor)
 }
 
-func estimateSize(estimator checker.CostEstimator, node checker.AstNode) checker.SizeEstimate {
-	if l := node.ComputedSize(); l != nil {
-		return *l
+// buildList describes a call which allocates a new list, where the cost of traversal and the
+// size of the resulting list are one and the same.
+func buildList(size cost.SizeFn) cost.Model {
+	return cost.Model{
+		Base:      cost.CallCost,
+		Alloc:     cost.ListCreateBaseCost,
+		Traversed: size,
+		Result:    size,
 	}
-	if l := estimator.EstimateSize(node); l != nil {
-		return *l
-	}
-	return checker.SizeEstimate{Min: 0, Max: math.MaxUint64}
 }
 
-func actualSize(value ref.Val) uint64 {
-	if sz, ok := value.(traits.Sizer); ok {
-		return uint64(sz.Size().(types.Int))
+// compareElements describes a call which compares every element of a list operand against every
+// other element, such as a sort or a duplicate check. Comparing variable-width elements costs
+// more per comparison than comparing scalars.
+func compareElements(operand int, result cost.SizeFn) cost.Model {
+	return cost.Model{
+		Base:      cost.CallCost,
+		Alloc:     cost.ListCreateBaseCost,
+		Traversed: cost.Square(cost.Operand(operand)).ScaleBy(cost.ElementFactor(operand, 2.0)),
+		Result:    result,
 	}
-	return 1
-}
-
-func nodeAsUintValue(node checker.AstNode, defaultVal uint64) uint64 {
-	if node.Expr().Kind() != ast.LiteralKind {
-		return defaultVal
-	}
-	lit := node.Expr().AsLiteral()
-	if lit.Type() != types.IntType {
-		return defaultVal
-	}
-	val := lit.(types.Int)
-	if val < types.IntZero {
-		return 0
-	}
-	return uint64(lit.(types.Int))
-}
-
-func callEstimate(cost checker.CostEstimate, sz *checker.SizeEstimate) *checker.CallEstimate {
-	return &checker.CallEstimate{CostEstimate: cost, ResultSize: sz}
-}
-
-func rangedSizeEstimate(min, max uint64) checker.SizeEstimate {
-	return checker.SizeEstimate{Min: min, Max: max}
-}
-
-func fixedSizeEstimate(val uint64) checker.SizeEstimate {
-	return checker.FixedSizeEstimate(val)
-}
-
-func atLeastOne(size checker.SizeEstimate) checker.SizeEstimate {
-	if size.Min == 0 {
-		size.Min = 1
-	}
-	if size.Max == 0 {
-		size.Max = 1
-	}
-	return size
-}
-
-func safeAdd(x, y uint64, rest ...uint64) uint64 {
-	if y > 0 && x > math.MaxUint64-y {
-		return math.MaxUint64
-	}
-	next := x + y
-	if len(rest) == 0 {
-		return next
-	}
-	return safeAdd(next, rest[0], rest[1:]...)
-}
-
-func safeMul(x, y uint64) uint64 {
-	if y != 0 && x > math.MaxUint64/y {
-		return math.MaxUint64
-	}
-	return x * y
 }

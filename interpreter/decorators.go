@@ -25,32 +25,48 @@ import (
 // Interpretable expression nodes at construction time.
 type InterpretableDecorator func(Interpretable) (Interpretable, error)
 
-// decObserveEval records evaluation state into an EvalState object.
+// decObserveEval reports each evaluation step to an observer.
+//
+// A step which is already being watched has the observer added to the set it reports to, so that
+// enabling more than one observer - state tracking alongside cost tracking, for instance - does
+// not leave the later observers without any observations.
 func decObserveEval(observer EvalObserver) InterpretableDecorator {
+	// The decorator identifies itself so that decorating a step twice, which happens as
+	// attributes acquire qualifiers during planning, does not report it twice.
+	key := new(int)
 	return func(i Interpretable) (Interpretable, error) {
 		switch inst := i.(type) {
-		case *evalWatch, *evalWatchAttr, *evalWatchConst, *evalWatchConstructor:
-			// these instruction are already watching, return straight-away.
+		case *evalWatch:
+			inst.observers.add(key, observer)
+			return i, nil
+		case *evalWatchAttr:
+			inst.observers.add(key, observer)
+			return i, nil
+		case *evalWatchConst:
+			inst.observers.add(key, observer)
+			return i, nil
+		case *evalWatchConstructor:
+			inst.observers.add(key, observer)
 			return i, nil
 		case InterpretableAttribute:
 			return &evalWatchAttr{
 				InterpretableAttribute: inst,
-				observer:               observer,
+				observers:              newObserverSet(key, observer),
 			}, nil
 		case InterpretableConst:
 			return &evalWatchConst{
 				InterpretableConst: inst,
-				observer:           observer,
+				observers:          newObserverSet(key, observer),
 			}, nil
 		case InterpretableConstructor:
 			return &evalWatchConstructor{
 				constructor: inst,
-				observer:    observer,
+				observers:   newObserverSet(key, observer),
 			}, nil
 		default:
 			return &evalWatch{
 				Interpretable: i,
-				observer:      observer,
+				observers:     newObserverSet(key, observer),
 			}, nil
 		}
 	}
