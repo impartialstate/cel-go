@@ -15,6 +15,7 @@
 package cost
 
 import (
+	"github.com/google/cel-go/common/ast"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
 	"github.com/google/cel-go/common/types/traits"
@@ -264,8 +265,8 @@ func (m Model) Cost(ops Operands, resultSize Estimate) Estimate {
 }
 
 // Estimate computes the compile-time cost of a call over the estimated sizes of its operands.
-func (m Model) Estimate(args []Node) *CallEstimate {
-	ops := NodeOperands(args)
+func (m Model) Estimate(ctx EstimationContext, args []ast.Expr) *CallEstimate {
+	ops := ExprOperands(ctx, args)
 	size, known := m.ResultSize(ops)
 	est := &CallEstimate{Cost: m.Cost(ops, size)}
 	if known {
@@ -310,43 +311,58 @@ func Trackers(overloads ...Overload) []TrackerOption {
 	return opts
 }
 
-// NodeOperands adapts the estimation-time view of a call's arguments to the Operands interface.
-func NodeOperands(args []Node) Operands {
-	return nodeOperands(args)
+// ExprOperands adapts the expressions passed to a call, and the context which describes them, to
+// the Operands interface.
+func ExprOperands(ctx EstimationContext, args []ast.Expr) Operands {
+	return &exprOperands{ctx: ctx, args: args}
 }
 
-type nodeOperands []Node
-
-func (ops nodeOperands) Len() int {
-	return len(ops)
+type exprOperands struct {
+	ctx  EstimationContext
+	args []ast.Expr
 }
 
-func (ops nodeOperands) Size(i int) Estimate {
-	if i < 0 || i >= len(ops) {
+func (ops *exprOperands) Len() int {
+	return len(ops.args)
+}
+
+func (ops *exprOperands) expr(i int) ast.Expr {
+	if i < 0 || i >= len(ops.args) {
+		return nil
+	}
+	return ops.args[i]
+}
+
+func (ops *exprOperands) Size(i int) Estimate {
+	expr := ops.expr(i)
+	if expr == nil {
 		return Unknown()
 	}
-	return ops[i].Size()
+	return ops.ctx.Size(expr)
 }
 
-func (ops nodeOperands) Value(i int) (ref.Val, bool) {
-	if i < 0 || i >= len(ops) {
+func (ops *exprOperands) Value(i int) (ref.Val, bool) {
+	expr := ops.expr(i)
+	if expr == nil {
 		return nil, false
 	}
-	return ops[i].Value()
+	return ops.ctx.Constant(expr)
 }
 
-func (ops nodeOperands) Type(i int) *types.Type {
-	if i < 0 || i >= len(ops) {
+func (ops *exprOperands) Type(i int) *types.Type {
+	expr := ops.expr(i)
+	if expr == nil {
 		return nil
 	}
-	return ops[i].Type()
+	return ops.ctx.Type(expr)
 }
 
-func (ops nodeOperands) ElemType(i int) *types.Type {
-	if i < 0 || i >= len(ops) {
+func (ops *exprOperands) ElemType(i int) *types.Type {
+	expr := ops.expr(i)
+	if expr == nil {
 		return nil
 	}
-	return ops[i].ElementType()
+	return ops.ctx.ElementType(expr)
 }
 
 // ValOperands adapts the runtime view of a call's arguments to the Operands interface.

@@ -26,8 +26,11 @@ import (
 // CostEstimator estimates the sizes of variable length input data and the costs of functions.
 type CostEstimator = cost.Estimator
 
-// AstNode represents an AST node for the purpose of cost estimations.
+// AstNode describes a value a cost estimator is being asked about.
 type AstNode = cost.Node
+
+// EstimationContext answers questions about the expression being estimated.
+type EstimationContext = cost.EstimationContext
 
 // CallEstimate includes a cost estimate for a call, and an optional estimate of the result size.
 type CallEstimate = cost.CallEstimate

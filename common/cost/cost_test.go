@@ -18,9 +18,54 @@ import (
 	"math"
 	"testing"
 
+	"github.com/google/cel-go/common/ast"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
 )
+
+// testContext is an EstimationContext over a fixed set of expressions, which lets a cost model
+// be exercised without running the checker.
+type testContext struct {
+	sizes    map[int64]Estimate
+	types    map[int64]*types.Type
+	elemSize map[int64]Estimate
+	elemType map[int64]*types.Type
+	paths    map[int64][]string
+}
+
+func (c *testContext) Type(e ast.Expr) *types.Type { return c.types[e.ID()] }
+
+func (c *testContext) Path(e ast.Expr) []string { return c.paths[e.ID()] }
+
+func (c *testContext) Size(e ast.Expr) Estimate {
+	if size, found := c.sizes[e.ID()]; found {
+		return size
+	}
+	return Unknown()
+}
+
+func (c *testContext) SizeOf(n Node) Estimate {
+	if n.Expr != nil {
+		return c.Size(n.Expr)
+	}
+	return Unknown()
+}
+
+func (c *testContext) ElementType(e ast.Expr) *types.Type { return c.elemType[e.ID()] }
+
+func (c *testContext) ElementSize(e ast.Expr) Estimate {
+	if size, found := c.elemSize[e.ID()]; found {
+		return size
+	}
+	return Unknown()
+}
+
+func (c *testContext) Constant(e ast.Expr) (ref.Val, bool) {
+	if e == nil || e.Kind() != ast.LiteralKind {
+		return nil, false
+	}
+	return e.AsLiteral(), true
+}
 
 func TestEstimateArithmetic(t *testing.T) {
 	tests := []struct {
@@ -87,7 +132,13 @@ func TestModelEstimateAndTrackAgree(t *testing.T) {
 	// A model evaluated over exact sizes must produce the same cost as the same model evaluated
 	// over an estimate which knows those exact sizes.
 	target := types.String("hello world")
-	est := scanModel.Estimate([]Node{NewNode(nil, types.StringType, sizePtr(Fixed(11)))})
+	fac := ast.NewExprFactory()
+	expr := fac.NewIdent(1, "target")
+	ctx := &testContext{
+		sizes: map[int64]Estimate{1: Fixed(11)},
+		types: map[int64]*types.Type{1: types.StringType},
+	}
+	est := scanModel.Estimate(ctx, []ast.Expr{expr})
 	if est.Cost != Fixed(14) {
 		t.Errorf("Model.Estimate() got cost %v, wanted %v", est.Cost, Fixed(14))
 	}
@@ -101,7 +152,9 @@ func TestModelEstimateAndTrackAgree(t *testing.T) {
 }
 
 func TestModelUnknownOperandSize(t *testing.T) {
-	est := scanModel.Estimate([]Node{NewNode(nil, types.StringType, nil)})
+	fac := ast.NewExprFactory()
+	ctx := &testContext{types: map[int64]*types.Type{1: types.StringType}}
+	est := scanModel.Estimate(ctx, []ast.Expr{fac.NewIdent(1, "target")})
 	if !est.Cost.IsUnknown() && est.Cost.Max != math.MaxUint64 {
 		t.Errorf("Model.Estimate() got %v, wanted an unbounded cost", est.Cost)
 	}
@@ -149,8 +202,10 @@ func TestOperandElementType(t *testing.T) {
 	if got := ValOperands([]ref.Val{empty}).ElemType(0); got != nil {
 		t.Errorf("ElemType() got %v, wanted nil for an empty list", got)
 	}
-	node := NewNode([]string{"x"}, types.NewListType(types.IntType), nil)
-	if got := NodeOperands([]Node{node}).ElemType(0); got != types.IntType {
+	fac := ast.NewExprFactory()
+	expr := fac.NewIdent(1, "x")
+	ctx := &testContext{elemType: map[int64]*types.Type{1: types.IntType}}
+	if got := ExprOperands(ctx, []ast.Expr{expr}).ElemType(0); got != types.IntType {
 		t.Errorf("ElemType() got %v, wanted int", got)
 	}
 }
@@ -166,16 +221,16 @@ func TestHints(t *testing.T) {
 		node Node
 		want *Estimate
 	}{
-		{"path hint", NewNode([]string{"user", "emails"}, types.NewListType(types.StringType), nil), sizePtr(Ranged(0, 10))},
-		{"exact path hint", NewNode([]string{"user", "id"}, types.StringType, nil), sizePtr(Fixed(36))},
-		{"type hint", NewNode([]string{"user", "avatar"}, types.BytesType, nil), sizePtr(Ranged(0, 1024))},
-		{"path wins over type", NewNode([]string{"user", "id"}, types.BytesType, nil), sizePtr(Fixed(36))},
-		{"no hint", NewNode([]string{"user", "name"}, types.StringType, nil), nil},
+		{"path hint", Node{Path: []string{"user", "emails"}, Type: types.NewListType(types.StringType)}, sizePtr(Ranged(0, 10))},
+		{"exact path hint", Node{Path: []string{"user", "id"}, Type: types.StringType}, sizePtr(Fixed(36))},
+		{"type hint", Node{Path: []string{"user", "avatar"}, Type: types.BytesType}, sizePtr(Ranged(0, 1024))},
+		{"path wins over type", Node{Path: []string{"user", "id"}, Type: types.BytesType}, sizePtr(Fixed(36))},
+		{"no hint", Node{Path: []string{"user", "name"}, Type: types.StringType}, nil},
 	}
 	for _, tst := range tests {
 		tc := tst
 		t.Run(tc.name, func(t *testing.T) {
-			got := hints.EstimateSize(tc.node)
+			got := hints.EstimateSize(nil, tc.node)
 			if (got == nil) != (tc.want == nil) || (got != nil && *got != *tc.want) {
 				t.Errorf("EstimateSize() got %v, wanted %v", got, tc.want)
 			}

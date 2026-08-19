@@ -23,6 +23,7 @@ import (
 
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/checker"
+	"github.com/google/cel-go/common/ast"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
 )
@@ -675,11 +676,11 @@ func (e *noopCostEstimator) CallCost(function, overloadID string, args []ref.Val
 	return nil
 }
 
-func (e *noopCostEstimator) EstimateCall(function, overloadID string, operands []checker.AstNode) *checker.CallEstimate {
+func (e *noopCostEstimator) EstimateCall(ctx checker.EstimationContext, function, overloadID string, operands []ast.Expr) *checker.CallEstimate {
 	return nil
 }
 
-func (e *noopCostEstimator) EstimateSize(element checker.AstNode) *checker.SizeEstimate {
+func (e *noopCostEstimator) EstimateSize(ctx checker.EstimationContext, node checker.AstNode) *checker.SizeEstimate {
 	return nil
 }
 

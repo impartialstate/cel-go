@@ -3864,18 +3864,18 @@ type testCostEstimator struct {
 	hints map[string]uint64
 }
 
-func (tc testCostEstimator) EstimateSize(element checker.AstNode) *checker.SizeEstimate {
-	if l, ok := tc.hints[strings.Join(element.Path(), ".")]; ok {
+func (tc testCostEstimator) EstimateSize(ctx checker.EstimationContext, node checker.AstNode) *checker.SizeEstimate {
+	if l, ok := tc.hints[strings.Join(node.Path, ".")]; ok {
 		return &checker.SizeEstimate{Min: 0, Max: l}
 	}
 	return nil
 }
 
-func (tc testCostEstimator) EstimateCall(function, overloadID string, operands []checker.AstNode) *checker.CallEstimate {
+func (tc testCostEstimator) EstimateCall(ctx checker.EstimationContext, function, overloadID string, operands []celast.Expr) *checker.CallEstimate {
 	return nil
 }
 
-func estimateTimestampToYear(operands []checker.AstNode) *checker.CallEstimate {
+func estimateTimestampToYear(ctx checker.EstimationContext, operands []celast.Expr) *checker.CallEstimate {
 	return &checker.CallEstimate{Cost: checker.CostEstimate{Min: 7, Max: 7}}
 }
 

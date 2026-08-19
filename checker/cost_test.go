@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/google/cel-go/common"
+	"github.com/google/cel-go/common/ast"
 	"github.com/google/cel-go/common/containers"
 	"github.com/google/cel-go/common/cost"
 	"github.com/google/cel-go/common/decls"
@@ -436,12 +437,12 @@ func TestCost(t *testing.T) {
 			hints: map[string]uint64{"str1": 10, "str2": 10},
 			options: []CostOption{
 				OverloadCostEstimate(overloads.ContainsString,
-					func(operands []AstNode) *CallEstimate {
+					func(ctx EstimationContext, operands []ast.Expr) *CallEstimate {
 						if len(operands) != 2 {
 							return nil
 						}
-						strSize := operands[0].Size().Scale(0.2)
-						subSize := operands[1].Size().Scale(0.2)
+						strSize := ctx.Size(operands[0]).Scale(0.2)
+						subSize := ctx.Size(operands[1]).Scale(0.2)
 						return &CallEstimate{Cost: strSize.Multiply(subSize)}
 					}),
 			},
@@ -720,7 +721,7 @@ func TestCost(t *testing.T) {
 			expr: "[bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901')].max()",
 			options: []CostOption{
 				OverloadCostEstimate("list_bytes_max",
-					func(operands []AstNode) *CallEstimate {
+					func(ctx EstimationContext, operands []ast.Expr) *CallEstimate {
 						if len(operands) != 1 {
 							return nil
 						}
@@ -728,15 +729,15 @@ func TestCost(t *testing.T) {
 						elCost := CostEstimate{Min: 1, Max: 1}
 						// If the list contains strings or bytes, add the cost of traversing all the strings/bytes as a way
 						// of estimating the additional comparison cost.
-						elType := operands[0].ElementType()
+						elType := ctx.ElementType(operands[0])
 						if elType == nil {
 							return nil
 						}
 						switch elType.Kind() {
 						case types.StringKind, types.BytesKind:
-							elCost = elCost.Add(operands[0].ElementSize().Scale(cost.StringTraversalCostFactor))
+							elCost = elCost.Add(ctx.ElementSize(operands[0]).Scale(cost.StringTraversalCostFactor))
 						}
-						return &CallEstimate{Cost: operands[0].Size().Multiply(elCost)}
+						return &CallEstimate{Cost: ctx.Size(operands[0]).Multiply(elCost)}
 					}),
 			},
 			wanted: CostEstimate{Min: 35, Max: 50},
@@ -799,21 +800,86 @@ func TestCost(t *testing.T) {
 	}
 }
 
+// recursiveEstimator asks the context about the very expression whose size it is being asked
+// for, which the coster must answer without recursing back into the estimator.
+type recursiveEstimator struct {
+	calls int
+}
+
+func (e *recursiveEstimator) EstimateSize(ctx EstimationContext, node AstNode) *SizeEstimate {
+	e.calls++
+	if node.Expr == nil {
+		return nil
+	}
+	size := ctx.Size(node.Expr)
+	if size.IsUnknown() {
+		return nil
+	}
+	return &size
+}
+
+func (e *recursiveEstimator) EstimateCall(ctx EstimationContext, function, overloadID string, operands []ast.Expr) *CallEstimate {
+	return nil
+}
+
+func TestCostEstimatorReentrancy(t *testing.T) {
+	p, err := parser.NewParser(parser.Macros(parser.AllMacros...))
+	if err != nil {
+		t.Fatalf("parser.NewParser() failed: %v", err)
+	}
+	src := common.NewStringSource(`input.startsWith("hello")`, "<input>")
+	pe, errs := p.Parse(src)
+	if len(errs.GetErrors()) != 0 {
+		t.Fatalf("parser.Parse() failed: %v", errs.ToDisplayString())
+	}
+	reg, err := types.NewRegistry()
+	if err != nil {
+		t.Fatalf("types.NewRegistry() failed: %v", err)
+	}
+	e, err := NewEnv(containers.DefaultContainer, reg)
+	if err != nil {
+		t.Fatalf("NewEnv() failed: %v", err)
+	}
+	if err := e.AddFunctions(stdlib.Functions()...); err != nil {
+		t.Fatalf("environment creation error: %v", err)
+	}
+	if err := e.AddIdents(decls.NewVariable("input", types.StringType)); err != nil {
+		t.Fatalf("environment creation error: %v", err)
+	}
+	checked, errs := Check(pe, src, e)
+	if len(errs.GetErrors()) != 0 {
+		t.Fatalf("Check() failed: %v", errs.ToDisplayString())
+	}
+	estimator := &recursiveEstimator{}
+	est, err := Cost(checked, estimator)
+	if err != nil {
+		t.Fatalf("Cost() failed: %v", err)
+	}
+	if estimator.calls == 0 {
+		t.Error("Cost() never consulted the estimator")
+	}
+	// The estimator has nothing of its own to add, so the cost is the same as it would be
+	// without one: an ident and a comparison bounded by the shorter operand.
+	if want := (CostEstimate{Min: 1, Max: 2}); est != want {
+		t.Errorf("Cost() got %v, wanted %v", est, want)
+	}
+}
+
 type testCostEstimator struct {
 	hints map[string]uint64
 }
 
-func (tc testCostEstimator) EstimateSize(element AstNode) *SizeEstimate {
-	if l, ok := tc.hints[strings.Join(element.Path(), ".")]; ok {
+func (tc testCostEstimator) EstimateSize(ctx EstimationContext, node AstNode) *SizeEstimate {
+	if l, ok := tc.hints[strings.Join(node.Path, ".")]; ok {
 		return &SizeEstimate{Min: 0, Max: l}
 	}
-	if element.Type() == types.BytesType {
+	if node.Type == types.BytesType {
 		return &SizeEstimate{Min: 0, Max: 12}
 	}
 	return nil
 }
 
-func (tc testCostEstimator) EstimateCall(function, overloadID string, operands []AstNode) *CallEstimate {
+func (tc testCostEstimator) EstimateCall(ctx EstimationContext, function, overloadID string, operands []ast.Expr) *CallEstimate {
 	switch overloadID {
 	case overloads.TimestampToYear:
 		return &CallEstimate{Cost: CostEstimate{Min: 7, Max: 7}}
