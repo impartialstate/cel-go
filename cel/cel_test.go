@@ -1808,6 +1808,46 @@ func TestEstimateCostAndRuntimeCost(t *testing.T) {
 	}
 }
 
+func TestCostTrackingWithStateTracking(t *testing.T) {
+	// Cost tracking and state tracking each observe every step of an evaluation, and enabling
+	// one must not leave the other without any observations.
+	env, err := NewEnv()
+	if err != nil {
+		t.Fatalf("NewEnv() failed: %v", err)
+	}
+	ast, iss := env.Compile(`"hello".size() + 1`)
+	if iss.Err() != nil {
+		t.Fatalf("env.Compile() failed: %v", iss.Err())
+	}
+	tests := []struct {
+		name string
+		opts []ProgramOption
+	}{
+		{name: "cost tracking", opts: []ProgramOption{CostTracking(nil)}},
+		{name: "with state tracking", opts: []ProgramOption{CostTracking(nil), EvalOptions(OptTrackState)}},
+		{name: "with exhaustive eval", opts: []ProgramOption{CostTracking(nil), EvalOptions(OptExhaustiveEval)}},
+	}
+	for _, tst := range tests {
+		tc := tst
+		t.Run(tc.name, func(t *testing.T) {
+			prg, err := env.Program(ast, tc.opts...)
+			if err != nil {
+				t.Fatalf("env.Program() failed: %v", err)
+			}
+			_, det, err := prg.Eval(NoVars())
+			if err != nil {
+				t.Fatalf("prg.Eval() failed: %v", err)
+			}
+			if det.ActualCost() == nil {
+				t.Fatal("prg.Eval() did not report an actual cost")
+			}
+			if *det.ActualCost() != 2 {
+				t.Errorf("prg.Eval() had cost %d, wanted 2", *det.ActualCost())
+			}
+		})
+	}
+}
+
 func TestCostLimit(t *testing.T) {
 	cases := []struct {
 		name      string
