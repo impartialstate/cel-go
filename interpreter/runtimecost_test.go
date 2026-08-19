@@ -26,6 +26,7 @@ import (
 	"github.com/google/cel-go/checker"
 	"github.com/google/cel-go/common"
 	"github.com/google/cel-go/common/containers"
+	"github.com/google/cel-go/common/cost"
 	"github.com/google/cel-go/common/decls"
 	"github.com/google/cel-go/common/overloads"
 	"github.com/google/cel-go/common/types"
@@ -109,7 +110,7 @@ func TestTrackCostAdvanced(t *testing.T) {
 	}
 }
 
-func computeCost(t *testing.T, expr string, vars []*decls.VariableDecl, ctx Activation, options []CostTrackerOption) (cost uint64, est checker.CostEstimate, err error) {
+func computeCost(t *testing.T, expr string, vars []*decls.VariableDecl, ctx Activation, options []CostTrackerOption) (actual uint64, est checker.CostEstimate, err error) {
 	t.Helper()
 
 	s := common.NewTextSource(expr)
@@ -138,7 +139,7 @@ func computeCost(t *testing.T, expr string, vars []*decls.VariableDecl, ctx Acti
 	if len(errs.GetErrors()) != 0 {
 		t.Fatalf(`Failed to check expression "%s", error: %v`, expr, errs.GetErrors())
 	}
-	est, err = checker.Cost(checked, testCostEstimator{}, checker.PresenceTestHasCost(costTracker.presenceTestHasCost))
+	est, err = checker.Cost(checked, testCostEstimator{}, checker.PresenceTestHasCost(costTracker.PresenceTestHasCost()))
 	if err != nil {
 		t.Fatalf("checker.Cost() failed: %v", err)
 	}
@@ -162,11 +163,7 @@ func computeCost(t *testing.T, expr string, vars []*decls.VariableDecl, ctx Acti
 		}
 	}()
 	prg.Eval(ctx)
-	// TODO: enable this once all attributes are properly pushed and popped from stack.
-	//if len(costTracker.stack) != 1 {
-	//	t.Fatalf(`Expected resulting stack size to be 1 but got %d: %#+v`, len(costTracker.stack), costTracker.stack)
-	//}
-	return costTracker.cost, est, err
+	return costTracker.ActualCost(), est, err
 }
 
 func constructActivation(t *testing.T, in any) Activation {
@@ -741,8 +738,8 @@ func TestRuntimeCost(t *testing.T) {
 			options: []CostTrackerOption{
 				OverloadCostTracker(overloads.ContainsString,
 					func(args []ref.Val, result ref.Val) *uint64 {
-						strCost := uint64(math.Ceil(float64(actualSize(args[0])) * 0.2))
-						substrCost := uint64(math.Ceil(float64(actualSize(args[1])) * 0.2))
+						strCost := uint64(math.Ceil(float64(cost.ActualSize(args[0])) * 0.2))
+						substrCost := uint64(math.Ceil(float64(cost.ActualSize(args[1])) * 0.2))
 						cost := strCost * substrCost
 						return &cost
 					}),
