@@ -24,55 +24,66 @@ import (
 	"github.com/google/cel-go/parser"
 )
 
-// Node is the estimation-time view of an expression.
+// Node describes a value the estimator is being asked about.
 //
-// A Node exposes everything a cost model may reason about before evaluation: the shape of the
-// expression, its deduced type, the path by which it was reached, and the size the estimator was
-// able to derive for it.
-type Node interface {
-	// Expr returns the expression the node describes.
-	Expr() ast.Expr
+// Expr is nil for a value which does not appear in the expression on its own, such as the
+// elements of a list, which are described by the path to them and their type.
+type Node struct {
+	// Expr is the expression which produces the value, or nil.
+	Expr ast.Expr
 
-	// Type returns the deduced type of the expression.
-	Type() *types.Type
+	// Type is the deduced type of the value.
+	Type *types.Type
 
-	// Path returns the field path from a variable to this expression, or nil if the expression
-	// is not reachable from a declared variable. The first element is the variable name and
-	// subsequent elements are either field names or one of '@items', '@keys', '@values'.
-	Path() []string
+	// Path is the field path from a variable to the value, or nil if the value is not reachable
+	// from a declared variable. The first element is the variable name and subsequent elements
+	// are either field names or one of '@items', '@keys', '@values'.
+	Path []string
+}
 
-	// Size returns the size of the value the expression produces, or an unknown estimate.
-	//
-	// The size accounts for literal values, the sizes CEL can derive from the expression and
-	// its type, and any hint supplied by the Estimator.
-	Size() Estimate
+// EstimationContext answers questions about the expression being estimated.
+//
+// Everything the estimator knows is reachable through the context: the deduced types, the paths
+// by which values are reached, the sizes CEL derived, and the hints the caller supplied. A cost
+// function is handed the context along with the expressions it is costing, so it can ask about
+// values other than the ones it was given - the elements of a list it received, for instance -
+// without the estimator having to anticipate the question.
+type EstimationContext interface {
+	// Type returns the deduced type of an expression.
+	Type(expr ast.Expr) *types.Type
 
-	// ElementType returns the type of the values held by an aggregate, or nil.
-	ElementType() *types.Type
+	// Path returns the field path from a variable to an expression, or nil.
+	Path(expr ast.Expr) []string
 
-	// ElementSize returns the size of the values held by an aggregate, or an unknown estimate.
-	//
-	// The size comes from the contents of the expression where CEL can see them, and otherwise
-	// from a hint supplied by the Estimator for the '@items' or '@values' path of the aggregate.
-	ElementSize() Estimate
+	// Size returns the size of the value an expression produces, or an unknown estimate.
+	Size(expr ast.Expr) Estimate
 
-	// Value returns the constant value of the expression when it is a literal.
-	Value() (ref.Val, bool)
+	// SizeOf returns the size of a value which the expression does not name on its own.
+	SizeOf(node Node) Estimate
+
+	// ElementType returns the type of the values held by an aggregate expression, or nil.
+	ElementType(expr ast.Expr) *types.Type
+
+	// ElementSize returns the size of the values held by an aggregate expression.
+	ElementSize(expr ast.Expr) Estimate
+
+	// Constant returns the value of an expression when it is a literal.
+	Constant(expr ast.Expr) (ref.Val, bool)
 }
 
 // Estimator supplies the information CEL cannot derive on its own: the size of variable-length
 // inputs, and the cost of functions CEL does not know how to cost.
 type Estimator interface {
-	// EstimateSize returns the size of the value the node produces, or nil when the estimator
+	// EstimateSize returns the size of the value the node describes, or nil when the estimator
 	// has no estimate to offer.
 	//
-	// EstimateSize is only consulted for nodes whose size CEL cannot determine from the
+	// EstimateSize is only consulted for values whose size CEL cannot determine from the
 	// expression itself.
-	EstimateSize(node Node) *Estimate
+	EstimateSize(ctx EstimationContext, node Node) *Estimate
 
 	// EstimateCall returns the cost of a call, or nil when the estimator has no estimate to
 	// offer. Operands are receiver-first for member functions.
-	EstimateCall(function, overloadID string, operands []Node) *CallEstimate
+	EstimateCall(ctx EstimationContext, function, overloadID string, operands []ast.Expr) *CallEstimate
 }
 
 // CallEstimate is the cost of a call and, when the call produces an aggregate value, the size of
@@ -87,7 +98,7 @@ type CallEstimate struct {
 
 // FunctionEstimator computes the cost of a single function overload from its operands, which are
 // receiver-first for member functions.
-type FunctionEstimator func(operands []Node) *CallEstimate
+type FunctionEstimator func(ctx EstimationContext, operands []ast.Expr) *CallEstimate
 
 // EstimatorOption configures how expression costs are estimated.
 type EstimatorOption func(*coster) error
@@ -126,6 +137,7 @@ func EstimateCost(checked *ast.AST, estimator Estimator, opts ...EstimatorOption
 		computedSizes:      map[int64]Estimate{},
 		computedEntrySizes: map[int64]entrySize{},
 		presenceTestCost:   Fixed(SelectAndIdentCost),
+		estimating:         map[int64]bool{},
 	}
 	for _, opt := range opts {
 		if err := opt(c); err != nil {
@@ -133,72 +145,6 @@ func EstimateCost(checked *ast.AST, estimator Estimator, opts ...EstimatorOption
 		}
 	}
 	return c.cost(checked.Expr()), nil
-}
-
-// node is the coster's implementation of the Node interface.
-type node struct {
-	path     []string
-	t        *types.Type
-	expr     ast.Expr
-	size     *Estimate
-	elemSize *Estimate
-}
-
-func (n node) Path() []string { return n.path }
-
-func (n node) Type() *types.Type { return n.t }
-
-func (n node) Expr() ast.Expr { return n.expr }
-
-func (n node) Size() Estimate {
-	if n.size == nil {
-		return Unknown()
-	}
-	return *n.size
-}
-
-func (n node) ElementType() *types.Type {
-	return elemType(n.t)
-}
-
-func (n node) ElementSize() Estimate {
-	if n.elemSize == nil {
-		return Unknown()
-	}
-	return *n.elemSize
-}
-
-func (n node) Value() (ref.Val, bool) {
-	if n.expr == nil || n.expr.Kind() != ast.LiteralKind {
-		return nil, false
-	}
-	return n.expr.AsLiteral(), true
-}
-
-// NewNode returns a Node describing a value of a given type reached by a field path.
-//
-// Estimators use it to ask about values which do not appear in the expression on their own, such
-// as the elements of a list which was passed to a function.
-func NewNode(path []string, t *types.Type, size *Estimate) Node {
-	return node{path: path, t: t, size: size}
-}
-
-// elementNode returns a Node describing the elements of a list or map node, or nil when the node
-// is not an aggregate whose element type is known.
-func elementNode(n Node) Node {
-	et := n.ElementType()
-	if et == nil {
-		return nil
-	}
-	var path []string
-	if p := n.Path(); len(p) != 0 {
-		subpath := "@items"
-		if n.Type().Kind() == types.MapKind {
-			subpath = "@values"
-		}
-		path = append(append(make([]string, 0, len(p)+1), p...), subpath)
-	}
-	return node{path: path, t: et}
 }
 
 type coster struct {
@@ -217,6 +163,8 @@ type coster struct {
 	// presenceTestCost will either be a zero or one based on whether has() macros count against
 	// cost computations.
 	presenceTestCost Estimate
+	// estimating tracks the expressions whose size the estimator is currently being asked for.
+	estimating map[int64]bool
 }
 
 // entrySize captures the container kind and associated key/index and value size estimates.
@@ -435,15 +383,15 @@ func (c *coster) costCall(e ast.Expr) Estimate {
 
 	// Operands are receiver-first, which lets a cost model address them by position without
 	// caring whether the function was called as a member or a global function.
-	operands := make([]Node, 0, len(args)+1)
+	operands := make([]ast.Expr, 0, len(args)+1)
 	operandCosts := make([]Estimate, 0, len(args)+1)
 	if call.IsMemberFunction() {
 		operandCosts = append(operandCosts, c.cost(call.Target()))
-		operands = append(operands, c.newNode(call.Target()))
+		operands = append(operands, call.Target())
 	}
 	for _, arg := range args {
 		operandCosts = append(operandCosts, c.cost(arg))
-		operands = append(operands, c.newNode(arg))
+		operands = append(operands, arg)
 	}
 
 	overloadIDs := c.checkedAST.GetOverloadIDs(e.ID())
@@ -618,7 +566,7 @@ func (c *coster) costBind(e ast.Expr) Estimate {
 
 // functionCost computes the cost of a single overload, including the cost of evaluating the
 // operands which were passed to it.
-func (c *coster) functionCost(e ast.Expr, function, overloadID string, operands []Node, operandCosts []Estimate) CallEstimate {
+func (c *coster) functionCost(e ast.Expr, function, overloadID string, operands []ast.Expr, operandCosts []Estimate) CallEstimate {
 	operandCostSum := func() Estimate {
 		var sum Estimate
 		for _, a := range operandCosts {
@@ -631,12 +579,12 @@ func (c *coster) functionCost(e ast.Expr, function, overloadID string, operands 
 	}
 	// A registered estimator for the overload takes precedence over everything else.
 	if estimator, found := c.overloadEstimators[overloadID]; found {
-		if est := estimator(operands); est != nil {
+		if est := estimator(c, operands); est != nil {
 			return withOperands(est)
 		}
 	}
 	if c.estimator != nil {
-		if est := c.estimator.EstimateCall(function, overloadID, operands); est != nil {
+		if est := c.estimator.EstimateCall(c, function, overloadID, operands); est != nil {
 			return withOperands(est)
 		}
 	}
@@ -649,13 +597,13 @@ func (c *coster) functionCost(e ast.Expr, function, overloadID string, operands 
 		// min cost is min of LHS for short circuited && or ||
 		return CallEstimate{Cost: Estimate{Min: lhs.Min, Max: lhs.Add(rhs).Max}}
 	case overloads.Conditional:
-		size := operands[1].Size().Union(operands[2].Size())
-		c.setEntrySize(e, c.computeEntrySize(operands[1].Expr()).union(c.computeEntrySize(operands[2].Expr())))
+		size := c.Size(operands[1]).Union(c.Size(operands[2]))
+		c.setEntrySize(e, c.computeEntrySize(operands[1]).union(c.computeEntrySize(operands[2])))
 		argCost := operandCosts[0].Add(operandCosts[1].Union(operandCosts[2]))
 		return CallEstimate{Cost: argCost, ResultSize: &size}
 	case overloads.AddString, overloads.AddBytes, overloads.AddList:
 		// Concatenation propagates the entry sizes of its operands to the result.
-		if entry := c.computeEntrySize(operands[0].Expr()).union(c.computeEntrySize(operands[1].Expr())); entry != nil {
+		if entry := c.computeEntrySize(operands[0]).union(c.computeEntrySize(operands[1])); entry != nil {
 			c.setEntrySize(e, entry)
 		}
 	}
@@ -665,7 +613,7 @@ func (c *coster) functionCost(e ast.Expr, function, overloadID string, operands 
 	if !found {
 		model = Model{Base: CallCost}
 	}
-	return withOperands(model.Estimate(operands))
+	return withOperands(model.Estimate(c, operands))
 }
 
 func (c *coster) getType(e ast.Expr) *types.Type {
@@ -689,30 +637,80 @@ func isAccumulatorVar(name string) bool {
 	return name == parser.AccumulatorName || name == parser.HiddenAccumulatorName
 }
 
-func (c *coster) newNode(e ast.Expr) node {
+// The coster answers the questions of the EstimationContext interface, since it is the only
+// thing which holds the checked expression, the paths, the size estimates, and the caller's
+// estimator all at once.
+
+// Type implements the EstimationContext interface method.
+func (c *coster) Type(e ast.Expr) *types.Type {
+	return c.getType(e)
+}
+
+// Path implements the EstimationContext interface method.
+func (c *coster) Path(e ast.Expr) []string {
 	path := c.getPath(e)
 	if len(path) > 0 && isAccumulatorVar(path[0]) {
 		// only provide paths to root vars; omit accumulator vars
-		path = nil
-	}
-	n := node{path: path, t: c.getType(e), expr: e, size: c.computeSize(e)}
-	n.elemSize = c.computeElementSize(n)
-	return n
-}
-
-// computeElementSize resolves the size of the values held by an aggregate, either from the
-// contents of the expression or from a hint for the path to its elements.
-func (c *coster) computeElementSize(n node) *Estimate {
-	if entry := c.computeEntrySize(n.expr); entry != nil {
-		return entry.valSize()
-	}
-	if c.estimator == nil {
 		return nil
 	}
-	if elem := elementNode(n); elem != nil {
-		return c.estimator.EstimateSize(elem)
+	return path
+}
+
+// Size implements the EstimationContext interface method.
+func (c *coster) Size(e ast.Expr) Estimate {
+	return c.sizeOrUnknown(e)
+}
+
+// SizeOf implements the EstimationContext interface method.
+func (c *coster) SizeOf(n Node) Estimate {
+	if n.Expr != nil {
+		return c.Size(n.Expr)
 	}
-	return nil
+	if c.estimator != nil {
+		if size := c.estimator.EstimateSize(c, n); size != nil {
+			return *size
+		}
+	}
+	if size := computeTypeSize(n.Type); size != nil {
+		return *size
+	}
+	return Unknown()
+}
+
+// ElementType implements the EstimationContext interface method.
+func (c *coster) ElementType(e ast.Expr) *types.Type {
+	return elemType(c.getType(e))
+}
+
+// ElementSize implements the EstimationContext interface method.
+//
+// The size comes from the contents of the expression where CEL can see them, and otherwise from
+// the caller's estimate for the path to the elements.
+func (c *coster) ElementSize(e ast.Expr) Estimate {
+	if entry := c.computeEntrySize(e); entry != nil {
+		return entry.val
+	}
+	elemType := c.ElementType(e)
+	if elemType == nil {
+		return Unknown()
+	}
+	var path []string
+	if p := c.Path(e); len(p) != 0 {
+		subpath := "@items"
+		if c.getType(e).Kind() == types.MapKind {
+			subpath = "@values"
+		}
+		path = append(append(make([]string, 0, len(p)+1), p...), subpath)
+	}
+	return c.SizeOf(Node{Type: elemType, Path: path})
+}
+
+// Constant implements the EstimationContext interface method.
+func (c *coster) Constant(e ast.Expr) (ref.Val, bool) {
+	if e == nil || e.Kind() != ast.LiteralKind {
+		return nil, false
+	}
+	return e.AsLiteral(), true
 }
 
 func (c *coster) setSize(e ast.Expr, size *Estimate) {
@@ -744,9 +742,13 @@ func (c *coster) computeSize(e ast.Expr) *Estimate {
 	}
 	// Ensure size estimates are computed first as users may choose to override the costs that
 	// CEL would otherwise ascribe to the type.
-	if c.estimator != nil {
-		n := node{expr: e, path: c.getPath(e), t: c.getType(e)}
-		if size := c.estimator.EstimateSize(n); size != nil {
+	if c.estimator != nil && !c.estimating[e.ID()] {
+		// An estimator is handed the context, and may ask it about the very expression it is
+		// being asked to size, so the question is only asked once.
+		c.estimating[e.ID()] = true
+		size := c.estimator.EstimateSize(c, Node{Expr: e, Path: c.Path(e), Type: c.getType(e)})
+		delete(c.estimating, e.ID())
+		if size != nil {
 			// storing the computed size should reduce calls to EstimateSize()
 			c.computedSizes[e.ID()] = *size
 			return size

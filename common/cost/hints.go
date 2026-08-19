@@ -17,6 +17,7 @@ package cost
 import (
 	"strings"
 
+	"github.com/google/cel-go/common/ast"
 	"github.com/google/cel-go/common/types"
 )
 
@@ -65,14 +66,14 @@ type Hints struct {
 
 // EstimateSize implements the Estimator interface, resolving the most specific hint available
 // for the node: first its field path, then its type.
-func (h *Hints) EstimateSize(node Node) *Estimate {
-	if path := node.Path(); len(path) != 0 {
-		if size, found := h.paths[strings.Join(path, ".")]; found {
+func (h *Hints) EstimateSize(ctx EstimationContext, node Node) *Estimate {
+	if len(node.Path) != 0 {
+		if size, found := h.paths[strings.Join(node.Path, ".")]; found {
 			return &size
 		}
 	}
-	if t := node.Type(); t != nil {
-		if size, found := h.types[t.String()]; found {
+	if node.Type != nil {
+		if size, found := h.types[node.Type.String()]; found {
 			return &size
 		}
 	}
@@ -80,6 +81,6 @@ func (h *Hints) EstimateSize(node Node) *Estimate {
 }
 
 // EstimateCall implements the Estimator interface, deferring to the standard cost of the call.
-func (h *Hints) EstimateCall(function, overloadID string, operands []Node) *CallEstimate {
+func (h *Hints) EstimateCall(ctx EstimationContext, function, overloadID string, operands []ast.Expr) *CallEstimate {
 	return nil
 }
