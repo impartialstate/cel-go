@@ -3871,12 +3871,12 @@ func (tc testCostEstimator) EstimateSize(element checker.AstNode) *checker.SizeE
 	return nil
 }
 
-func (tc testCostEstimator) EstimateCallCost(function, overloadID string, target *checker.AstNode, args []checker.AstNode) *checker.CallEstimate {
+func (tc testCostEstimator) EstimateCall(function, overloadID string, operands []checker.AstNode) *checker.CallEstimate {
 	return nil
 }
 
-func estimateTimestampToYear(estimator checker.CostEstimator, target *checker.AstNode, args []checker.AstNode) *checker.CallEstimate {
-	return &checker.CallEstimate{CostEstimate: checker.CostEstimate{Min: 7, Max: 7}}
+func estimateTimestampToYear(operands []checker.AstNode) *checker.CallEstimate {
+	return &checker.CallEstimate{Cost: checker.CostEstimate{Min: 7, Max: 7}}
 }
 
 type testRuntimeCostEstimator struct{}

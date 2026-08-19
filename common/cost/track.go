@@ -1,4 +1,4 @@
-// Copyright 2022 Google LLC
+// Copyright 2026 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,275 +15,238 @@
 package cost
 
 import (
-	"math"
-
-	"github.com/google/cel-go/common"
-	"github.com/google/cel-go/common/overloads"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
-	"github.com/google/cel-go/common/types/traits"
 )
 
-// WARNING: Any changes to cost calculations in this file require a corresponding change to the
-// estimated cost calculations in estimate.go.
-
-// ActualCostEstimator provides function call cost estimations at runtime
-// CallCost returns an estimated cost for the function overload invocation with the given args, or nil if it has no
-// estimate to provide. CEL attempts to provide reasonable estimates for its standard function library, so CallCost
-// should typically not need to provide an estimate for CELs standard function.
-type ActualCostEstimator interface {
+// CallTracker computes the actual cost of a function call from the values which were passed to
+// it and the value it produced.
+//
+// CEL costs its own standard library, so a CallTracker only needs to answer for functions the
+// application has added itself. Returning nil defers to the cost CEL would otherwise compute.
+type CallTracker interface {
+	// CallCost returns the cost of the call, or nil if the tracker has no cost to report.
+	// Arguments are receiver-first for member functions.
 	CallCost(function, overloadID string, args []ref.Val, result ref.Val) *uint64
 }
 
-// CostTrackerOption configures the behavior of CostTracker objects.
-type CostTrackerOption func(*CostTracker) error
+// FunctionTracker computes the actual cost of a single function overload. Arguments are
+// receiver-first for member functions, mirroring the operand order used by [FunctionEstimator].
+type FunctionTracker func(args []ref.Val, result ref.Val) *uint64
 
-// CostTrackerLimit sets the runtime limit on the evaluation cost during execution and will terminate the expression
-// evaluation if the limit is exceeded.
-func CostTrackerLimit(limit uint64) CostTrackerOption {
-	return func(tracker *CostTracker) error {
-		tracker.Limit = &limit
+// Comprehension is the runtime view of a comprehension, which lets a cost tracker charge for
+// iteration itself rather than only for the work performed by each step.
+type Comprehension interface {
+	// IterRange returns the value being iterated over.
+	IterRange() ref.Val
+
+	// Iterations returns the number of iterations performed so far.
+	Iterations() uint64
+
+	// Accu returns the current value of the accumulator.
+	Accu() ref.Val
+}
+
+// ComprehensionTracker computes the cost of a comprehension, or nil if it has no cost to report.
+type ComprehensionTracker func(comp Comprehension) *uint64
+
+// TrackerOption configures the behavior of a Tracker.
+type TrackerOption func(*Tracker) error
+
+// Limit sets the maximum cost of an evaluation. Evaluation is terminated once the limit is
+// exceeded.
+func Limit(limit uint64) TrackerOption {
+	return func(t *Tracker) error {
+		t.Limit = &limit
 		return nil
 	}
 }
 
 // TrackPresenceTest determines whether presence testing has a cost of one or zero.
+//
 // Defaults to presence test has a cost of one.
-func TrackPresenceTest(hasCost bool) CostTrackerOption {
-	return func(tracker *CostTracker) error {
-		tracker.presenceTestHasCost = hasCost
+func TrackPresenceTest(hasCost bool) TrackerOption {
+	return func(t *Tracker) error {
+		t.presenceTestHasCost = hasCost
 		return nil
 	}
 }
 
-// NewCostTracker creates a new CostTracker with a given estimator and a set of functional CostTrackerOption values.
-func NewCostTracker(estimator ActualCostEstimator, opts ...CostTrackerOption) (*CostTracker, error) {
-	tracker := &CostTracker{
+// OverloadTracker binds a FunctionTracker to a function overload id, overriding the cost CEL
+// would otherwise compute for the overload.
+func OverloadTracker(overloadID string, tracker FunctionTracker) TrackerOption {
+	return func(t *Tracker) error {
+		t.overloadTrackers[overloadID] = tracker
+		return nil
+	}
+}
+
+// TrackComprehensions registers a tracker which charges for each comprehension evaluated.
+func TrackComprehensions(tracker ComprehensionTracker) TrackerOption {
+	return func(t *Tracker) error {
+		t.comprehensionTracker = tracker
+		return nil
+	}
+}
+
+// NewTracker creates a Tracker for a single evaluation.
+func NewTracker(estimator CallTracker, opts ...TrackerOption) (*Tracker, error) {
+	t := &Tracker{
 		Estimator:           estimator,
 		overloadTrackers:    map[string]FunctionTracker{},
 		presenceTestHasCost: true,
 	}
 	for _, opt := range opts {
-		err := opt(tracker)
-		if err != nil {
+		if err := opt(t); err != nil {
 			return nil, err
 		}
 	}
-	return tracker, nil
+	return t, nil
 }
 
-// OverloadCostTracker binds an overload ID to a runtime FunctionTracker implementation.
+// Tracker accumulates the cost of a single evaluation.
 //
-// OverloadCostTracker instances augment or override ActualCostEstimator decisions, allowing for  versioned and/or
-// optional cost tracking changes.
-func OverloadCostTracker(overloadID string, fnTracker FunctionTracker) CostTrackerOption {
-	return func(tracker *CostTracker) error {
-		tracker.overloadTrackers[overloadID] = fnTracker
-		return nil
-	}
+// A Tracker is created per evaluation and is not safe for concurrent use.
+type Tracker struct {
+	// Estimator reports the cost of calls which CEL does not cost itself.
+	Estimator CallTracker
+
+	// Limit is the maximum cost of the evaluation, if one was configured.
+	Limit *uint64
+
+	overloadTrackers     map[string]FunctionTracker
+	comprehensionTracker ComprehensionTracker
+	presenceTestHasCost  bool
+
+	cost uint64
+	// ops is reused across calls so that costing a call does not allocate.
+	ops valOperands
+	// operands holds the most recent value produced by each expression, indexed by expression
+	// id, which is how a call recovers the arguments it was given once they have been evaluated.
+	operands []ref.Val
 }
 
-// FunctionTracker computes the actual cost of evaluating the functions with the given arguments and result.
-type FunctionTracker func(args []ref.Val, result ref.Val) *uint64
-
-// CostTracker represents the information needed for tracking runtime cost.
-type CostTracker struct {
-	Estimator           ActualCostEstimator
-	overloadTrackers    map[string]FunctionTracker
-	Limit               *uint64
-	presenceTestHasCost bool
-
-	cost  uint64
-	stack refValStack
+// ActualCost returns the cost accumulated so far.
+func (t *Tracker) ActualCost() uint64 {
+	return t.cost
 }
 
-// ActualCost returns the runtime cost
-func (c *CostTracker) ActualCost() uint64 {
-	return c.cost
+// Add charges the evaluation for work performed.
+func (t *Tracker) Add(delta uint64) {
+	t.cost = Add(t.cost, delta)
 }
 
-// Add charges the evaluation for work which was performed.
-func (c *CostTracker) Add(delta uint64) {
-	c.cost += delta
-}
-
-// PresenceTestHasCost returns whether a presence test is charged for.
-func (c *CostTracker) PresenceTestHasCost() bool {
-	return c.presenceTestHasCost
+// PresenceTestHasCost returns whether a presence test is charged for, which lets an estimate be
+// configured to match how the expression will actually be tracked.
+func (t *Tracker) PresenceTestHasCost() bool {
+	return t.presenceTestHasCost
 }
 
 // LimitExceeded returns true when the accumulated cost has passed the configured limit.
-func (c *CostTracker) LimitExceeded() bool {
-	return c.Limit != nil && c.cost > *c.Limit
+func (t *Tracker) LimitExceeded() bool {
+	return t.Limit != nil && t.cost > *t.Limit
 }
 
-// Push records the value produced by an expression.
-func (c *CostTracker) Push(val ref.Val, id int64) {
-	c.stack.push(val, id)
-}
-
-// Drop removes the given expressions, and everything recorded after them, from the stack.
-func (c *CostTracker) Drop(ids ...int64) {
-	c.stack.drop(ids...)
-}
-
-// DropArgs removes the given expressions from the stack and returns the values they produced,
-// reporting false if any of them are absent.
-func (c *CostTracker) DropArgs(ids []int64) ([]ref.Val, bool) {
-	return c.stack.dropArgs(ids)
-}
-
-// TrackCall charges the evaluation for a function call.
-func (c *CostTracker) TrackCall(function, overloadID string, args []ref.Val, result ref.Val) {
-	c.cost += c.costCall(function, overloadID, args, result)
-}
-
-func (c *CostTracker) costCall(function, overloadID string, args []ref.Val, result ref.Val) uint64 {
-	var cost uint64
-	if len(c.overloadTrackers) != 0 {
-		if tracker, found := c.overloadTrackers[overloadID]; found {
-			callCost := tracker(args, result)
-			if callCost != nil {
-				cost += *callCost
-				return cost
-			}
-		}
+// RecordOperand retains the value produced by an expression so that a call which consumes it can
+// be costed once it completes.
+//
+// Expression ids are assigned sequentially, so the values are held in a slice indexed by id
+// rather than in a map, which keeps the bookkeeping off the hot path of an evaluation.
+func (t *Tracker) RecordOperand(id int64, val ref.Val) {
+	if id < 0 {
+		return
 	}
-	if c.Estimator != nil {
-		callCost := c.Estimator.CallCost(function, overloadID, args, result)
-		if callCost != nil {
-			cost += *callCost
-			return cost
-		}
+	if int(id) >= len(t.operands) {
+		grown := make([]ref.Val, roundUpPowerOfTwo(int(id)+1))
+		copy(grown, t.operands)
+		t.operands = grown
 	}
-	// if user didn't specify, the default way of calculating runtime cost would be used.
-	// if user has their own implementation of ActualCostEstimator, make sure to cover the mapping between overloadId and cost calculation
-	switch overloadID {
-	// O(n) functions
-	case overloads.StartsWithString, overloads.EndsWithString, overloads.StringToBytes, overloads.BytesToString, overloads.ExtQuoteString, overloads.ExtFormatString:
-		cost += uint64(math.Ceil(float64(actualSize(args[0])) * common.StringTraversalCostFactor))
-	case overloads.InList:
-		// If a list is composed entirely of constant values this is O(1), but we don't account for that here.
-		// We just assume all list containment checks are O(n).
-		cost += actualSize(args[1])
-	// O(min(m, n)) functions
-	case overloads.LessString, overloads.GreaterString, overloads.LessEqualsString, overloads.GreaterEqualsString,
-		overloads.LessBytes, overloads.GreaterBytes, overloads.LessEqualsBytes, overloads.GreaterEqualsBytes,
-		overloads.Equals, overloads.NotEquals:
-		// When we check the equality of 2 scalar values (e.g. 2 integers, 2 floating-point numbers, 2 booleans etc.),
-		// the CostTracker.ActualSize() function by definition returns 1 for each operand, resulting in an overall cost
-		// of 1.
-		lhsSize := actualSize(args[0])
-		rhsSize := actualSize(args[1])
-		minSize := lhsSize
-		if rhsSize < minSize {
-			minSize = rhsSize
-		}
-		cost += uint64(math.Ceil(float64(minSize) * common.StringTraversalCostFactor))
-	// O(m+n) functions
-	case overloads.AddString, overloads.AddBytes:
-		// In the worst case scenario, we would need to reallocate a new backing store and copy both operands over.
-		cost += uint64(math.Ceil(float64(actualSize(args[0])+actualSize(args[1])) * common.StringTraversalCostFactor))
-	// O(nm) functions
-	case overloads.MatchesString:
-		// https://swtch.com/~rsc/regexp/regexp1.html applies to RE2 implementation supported by CEL
-		// Add one to string length for purposes of cost calculation to prevent product of string and regex to be 0
-		// in case where string is empty but regex is still expensive.
-		strCost := uint64(math.Ceil((1.0 + float64(actualSize(args[0]))) * common.StringTraversalCostFactor))
-		// We don't know how many expressions are in the regex, just the string length (a huge
-		// improvement here would be to somehow get a count the number of expressions in the regex or
-		// how many states are in the regex state machine and use that to measure regex cost).
-		// For now, we're making a guess that each expression in a regex is typically at least 4 chars
-		// in length.
-		regexCost := uint64(math.Ceil(float64(actualSize(args[1])) * common.RegexStringLengthCostFactor))
-		cost += strCost * regexCost
-	case overloads.ContainsString:
-		strCost := uint64(math.Ceil(float64(actualSize(args[0])) * common.StringTraversalCostFactor))
-		substrCost := uint64(math.Ceil(float64(actualSize(args[1])) * common.StringTraversalCostFactor))
-		cost += strCost * substrCost
-
-	default:
-		// The following operations are assumed to have O(1) complexity.
-		// - AddList due to the implementation. Index lookup can be O(c) the
-		//    number of concatenated lists, but we don't track that is cost calculations.
-		// - Conversions, since none perform a traversal of a type of unbound length.
-		// - Computing the size of strings, byte sequences, lists and maps.
-		// - Logical operations and all operators on fixed width scalars (comparisons, equality)
-		// - Any functions that don't have a declared cost either here or in provided ActualCostEstimator.
-		cost++
-
-	}
-	return cost
+	t.operands[id] = val
 }
 
-// ActualSize returns the size of the value for all traits.Sizer values, a fixed size for all
-// proto-based objects, and a size of 1 for all other value types.
-func ActualSize(value ref.Val) uint64 {
-	return actualSize(value)
-}
-
-// actualSize returns the size of the value for all traits.Sizer values, a fixed size for all proto-based
-// objects, and a size of 1 for all other value types.
-func actualSize(value ref.Val) uint64 {
-	if sz, ok := value.(traits.Sizer); ok {
-		return uint64(sz.Size().(types.Int))
-	}
-	if opt, ok := value.(*types.Optional); ok && opt.HasValue() {
-		return actualSize(opt.GetValue())
-	}
-	return 1
-}
-
-type stackVal struct {
-	Val ref.Val
-	ID  int64
-}
-
-// refValStack keeps track of values of the stack for cost calculation purposes
-type refValStack []stackVal
-
-func (s *refValStack) push(val ref.Val, id int64) {
-	value := stackVal{Val: val, ID: id}
-	*s = append(*s, value)
-}
-
-// TODO: Allowing drop and dropArgs to remove stack items above the IDs they are provided is a workaround. drop and dropArgs
-// should find and remove only the stack items matching the provided IDs once all attributes are properly pushed and popped from stack.
-
-// drop searches the stack for each ID and removes the ID and all stack items above it.
-// If none of the IDs are found, the stack is not modified.
-// WARNING: It is possible for multiple expressions with the same ID to exist (due to how macros are implemented) so it's
-// possible that a dropped ID will remain on the stack.  They should be removed when IDs on the stack are popped.
-func (s *refValStack) drop(ids ...int64) {
-	for _, id := range ids {
-		for idx := len(*s) - 1; idx >= 0; idx-- {
-			if (*s)[idx].ID == id {
-				*s = (*s)[:idx]
-				break
-			}
-		}
-	}
-}
-
-// dropArgs searches the stack for all the args by their IDs, accumulates their associated ref.Vals and drops any
-// stack items above any of the arg IDs. If any of the IDs are not found the stack, false is returned.
-// Args are assumed to be found in the stack in reverse order, i.e. the last arg is expected to be found highest in
-// the stack.
-// WARNING: It is possible for multiple expressions with the same ID to exist (due to how macros are implemented) so it's
-// possible that a dropped ID will remain on the stack.  They should be removed when IDs on the stack are popped.
-func (s *refValStack) dropArgs(args []int64) ([]ref.Val, bool) {
-	result := make([]ref.Val, len(args))
-argloop:
-	for nIdx := len(args) - 1; nIdx >= 0; nIdx-- {
-		for idx := len(*s) - 1; idx >= 0; idx-- {
-			if (*s)[idx].ID == args[nIdx] {
-				el := (*s)[idx]
-				*s = (*s)[:idx]
-				result[nIdx] = el.Val
-				continue argloop
-			}
-		}
+// Operand returns the most recent value produced by an expression, and whether one was found.
+func (t *Tracker) Operand(id int64) (ref.Val, bool) {
+	if id < 0 || int(id) >= len(t.operands) {
 		return nil, false
 	}
-	return result, true
+	val := t.operands[id]
+	return val, val != nil
+}
+
+// roundUpPowerOfTwo returns the smallest power of two which is at least n, with a floor which
+// covers the expression size of a typical program.
+func roundUpPowerOfTwo(n int) int {
+	size := 32
+	for size < n {
+		size *= 2
+	}
+	return size
+}
+
+// TrackIdent charges for resolving an identifier or a field selection.
+func (t *Tracker) TrackIdent() {
+	t.Add(SelectAndIdentCost)
+}
+
+// TrackQualifier charges for applying a qualifier to a value.
+func (t *Tracker) TrackQualifier() {
+	t.Add(1)
+}
+
+// TrackPresenceTest charges for a `has()` macro, which may be configured to be free.
+func (t *Tracker) TrackPresenceTest() {
+	if t.presenceTestHasCost {
+		t.Add(SelectAndIdentCost)
+	}
+}
+
+// TrackConstruct charges for allocating a list, map, or struct value.
+func (t *Tracker) TrackConstruct(typ ref.Type) {
+	switch typ {
+	case types.ListType:
+		t.Add(ListCreateBaseCost)
+	case types.MapType:
+		t.Add(MapCreateBaseCost)
+	default:
+		t.Add(StructCreateBaseCost)
+	}
+}
+
+// TrackComprehension charges for a comprehension, which by default is free: the work a
+// comprehension performs is charged to the steps evaluated within it.
+func (t *Tracker) TrackComprehension(comp Comprehension) {
+	if t.comprehensionTracker == nil {
+		return
+	}
+	if c := t.comprehensionTracker(comp); c != nil {
+		t.Add(*c)
+	}
+}
+
+// TrackCall charges for a function call. Arguments are receiver-first for member functions.
+func (t *Tracker) TrackCall(function, overloadID string, args []ref.Val, result ref.Val) {
+	t.Add(t.CallCost(function, overloadID, args, result))
+}
+
+// CallCost returns the cost of a function call without charging for it.
+//
+// Costs are resolved in order of specificity: an overload tracker registered for the exact
+// overload, then the tracker supplied by the application, then the standard cost model for the
+// overload, and finally the O(1) default.
+func (t *Tracker) CallCost(function, overloadID string, args []ref.Val, result ref.Val) uint64 {
+	if tracker, found := t.overloadTrackers[overloadID]; found {
+		if c := tracker(args, result); c != nil {
+			return *c
+		}
+	}
+	if t.Estimator != nil {
+		if c := t.Estimator.CallCost(function, overloadID, args, result); c != nil {
+			return *c
+		}
+	}
+	if model, found := StandardModel(overloadID); found {
+		t.ops.args = args
+		return model.Cost(&t.ops, Fixed(AggregateSize(result))).Max
+	}
+	return CallCost
 }

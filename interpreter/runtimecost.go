@@ -17,44 +17,40 @@ package interpreter
 import (
 	"errors"
 
-	"github.com/google/cel-go/common"
 	"github.com/google/cel-go/common/cost"
-	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
 )
 
-// Runtime cost tracking is implemented by the common/cost package, which holds the compile time
-// estimation as well. What remains here is the plumbing which drives a cost tracker from the
-// steps of an evaluation, since that is the part which depends on the interpreter itself.
+// Runtime cost tracking is implemented by the common/cost package, which is shared with the
+// compile-time estimation in the checker so that the two cannot drift apart. This file is the
+// glue which drives a cost.Tracker from the steps of an evaluation.
 
 // ActualCostEstimator provides function call cost estimations at runtime.
 //
-// CallCost returns an estimated cost for the function overload invocation with the given args,
-// or nil if it has no estimate to provide. CEL attempts to provide reasonable estimates for its
-// standard function library, so CallCost should typically not need to provide an estimate for
-// CELs standard function.
-type ActualCostEstimator = cost.ActualCostEstimator
+// CEL provides cost estimates for its own standard library, so an ActualCostEstimator typically
+// only needs to answer for functions the application has added itself.
+type ActualCostEstimator = cost.CallTracker
 
 // CostTracker represents the information needed for tracking runtime cost.
-type CostTracker = cost.CostTracker
+type CostTracker = cost.Tracker
 
 // CostTrackerOption configures the behavior of CostTracker objects.
-type CostTrackerOption = cost.CostTrackerOption
+type CostTrackerOption = cost.TrackerOption
 
-// FunctionTracker computes the actual cost of evaluating the functions with the given arguments
-// and result.
+// FunctionTracker computes the actual cost of evaluating a function with the given arguments and
+// result. Arguments are receiver-first for member functions.
 type FunctionTracker = cost.FunctionTracker
 
 // NewCostTracker creates a new CostTracker with a given estimator and a set of functional
 // CostTrackerOption values.
 func NewCostTracker(estimator ActualCostEstimator, opts ...CostTrackerOption) (*CostTracker, error) {
-	return cost.NewCostTracker(estimator, opts...)
+	return cost.NewTracker(estimator, opts...)
 }
 
 // CostTrackerLimit sets the runtime limit on the evaluation cost during execution and will
 // terminate the expression evaluation if the limit is exceeded.
 func CostTrackerLimit(limit uint64) CostTrackerOption {
-	return cost.CostTrackerLimit(limit)
+	return cost.Limit(limit)
 }
 
 // PresenceTestHasCost determines whether presence testing has a cost of one or zero.
@@ -68,10 +64,10 @@ func PresenceTestHasCost(hasCost bool) CostTrackerOption {
 // OverloadCostTracker instances augment or override ActualCostEstimator decisions, allowing for
 // versioned and/or optional cost tracking changes.
 func OverloadCostTracker(overloadID string, fnTracker FunctionTracker) CostTrackerOption {
-	return cost.OverloadCostTracker(overloadID, fnTracker)
+	return cost.OverloadTracker(overloadID, fnTracker)
 }
 
-// costTrackPlanOption modifies the cost tracking factory associatied with the CostObserver
+// costTrackPlanOption modifies the cost tracking factory associated with the CostObserver
 type costTrackPlanOption func(*costTrackerFactory) *costTrackerFactory
 
 // CostTrackerFactory configures the factory method to generate a new cost-tracker per-evaluation.
@@ -119,7 +115,8 @@ func (cta costTrackActivation) Parent() Activation {
 	return cta.vars
 }
 
-// AsPartialActivation supports conversion to a partial activation in order to detect unknown attributes.
+// AsPartialActivation supports conversion to a partial activation in order to detect unknown
+// attributes.
 func (cta costTrackActivation) AsPartialActivation() (PartialActivation, bool) {
 	return AsPartialActivation(cta.vars)
 }
@@ -129,7 +126,8 @@ func (cta costTrackActivation) asCostTracker() *CostTracker {
 	return cta.costTracker
 }
 
-// asCostTracker walks the Activation hierarchy and returns the first cost tracker found, if present.
+// asCostTracker walks the Activation hierarchy and returns the first cost tracker found, if
+// present.
 func asCostTracker(vars Activation) (*CostTracker, bool) {
 	if conv, ok := vars.(costTrackerConverter); ok {
 		return conv.asCostTracker(), true
@@ -145,8 +143,8 @@ type costTrackerFactory struct {
 	factory func() (*CostTracker, error)
 }
 
-// InitState produces a CostTracker and bundles it into an Activation in a way which is not visible
-// to expression evaluation.
+// InitState produces a CostTracker and bundles it into an Activation in a way which is not
+// visible to expression evaluation.
 func (ct *costTrackerFactory) InitState(vars Activation) (Activation, error) {
 	tracker, err := ct.factory()
 	if err != nil {
@@ -163,76 +161,92 @@ func (ct *costTrackerFactory) GetState(vars Activation) any {
 	return nil
 }
 
-// Observe computes the incremental cost of each step and records it into the CostTracker
-// associated with the evaluation.
+// Observe charges the cost tracker for each step of an evaluation as it completes.
+//
+// Steps are observed depth-first, so by the time a call is observed each of its arguments has
+// already produced a value. Recording every step's value against its expression id is what lets
+// a call recover the arguments it was given without maintaining a shadow stack of the
+// evaluation.
 func (ct *costTrackerFactory) Observe(vars Activation, id int64, programStep any, val ref.Val) {
 	tracker, found := asCostTracker(vars)
 	if !found {
 		return
 	}
+	tracker.RecordOperand(id, val)
 	switch t := programStep.(type) {
 	case ConstantQualifier:
-		// TODO: Push identifiers on to the stack before observing constant qualifiers that apply to them
-		// and enable the below pop. Once enabled this can case can be collapsed into the Qualifier case.
-		tracker.Add(1)
+		// TODO: Push identifiers on to the stack before observing constant qualifiers that apply
+		// to them so that this case can be collapsed into the Qualifier case.
+		tracker.TrackQualifier()
 	case InterpretableConst:
-		// zero cost
+		// Constants are free.
+	case *evalTestOnly:
+		tracker.TrackPresenceTest()
 	case InterpretableAttribute:
-		switch a := t.Attr().(type) {
-		case *conditionalAttribute:
-			// Ternary has no direct cost. All cost is from the conditional and the true/false branch expressions.
-			tracker.Drop(a.falsy.ID(), a.truthy.ID(), a.expr.ID())
-		default:
-			tracker.Drop(t.Attr().ID())
-			if _, isTestOnly := programStep.(*evalTestOnly); !isTestOnly || tracker.PresenceTestHasCost() {
-				tracker.Add(common.SelectAndIdentCost)
-			}
+		if _, isConditional := t.Attr().(*conditionalAttribute); isConditional {
+			// A ternary has no cost of its own. All cost comes from the condition and from
+			// whichever branch was selected.
+			break
 		}
-	case *evalExhaustiveConditional:
-		// Ternary has no direct cost. All cost is from the conditional and the true/false branch expressions.
-		tracker.Drop(t.attr.falsy.ID(), t.attr.truthy.ID(), t.attr.expr.ID())
-
-	// While the field names are identical, the boolean operation eval structs do not share an interface and so
-	// must be handled individually.
-	case *evalOr:
-		tracker.Drop(termIDs(t.terms)...)
-	case *evalAnd:
-		tracker.Drop(termIDs(t.terms)...)
-	case *evalExhaustiveOr:
-		tracker.Drop(termIDs(t.terms)...)
-	case *evalExhaustiveAnd:
-		tracker.Drop(termIDs(t.terms)...)
-	case *evalFold:
-		tracker.Drop(t.iterRange.ID())
+		tracker.TrackIdent()
 	case Qualifier:
-		tracker.Add(1)
+		tracker.TrackQualifier()
 	case InterpretableCall:
-		if argVals, ok := tracker.DropArgs(termIDs(t.Args())); ok {
-			tracker.TrackCall(t.Function(), t.OverloadID(), argVals, val)
+		if args, ok := callArgs(tracker, t); ok {
+			tracker.TrackCall(t.Function(), t.OverloadID(), args, val)
 		}
 	case InterpretableConstructor:
-		tracker.DropArgs(termIDs(t.InitVals()))
-		switch t.Type() {
-		case types.ListType:
-			tracker.Add(common.ListCreateBaseCost)
-		case types.MapType:
-			tracker.Add(common.MapCreateBaseCost)
-		default:
-			tracker.Add(common.StructCreateBaseCost)
-		}
+		tracker.TrackConstruct(t.Type())
+	case *evalFold:
+		tracker.TrackComprehension(&foldComprehension{fold: t, tracker: tracker, result: val})
 	}
-	tracker.Push(val, id)
-
 	if tracker.LimitExceeded() {
 		panic(EvalCancelledError{Cause: CostLimitExceeded, Message: "operation cancelled: actual cost limit exceeded"})
 	}
 }
 
-// termIDs returns the expression ids of a set of evaluation steps.
-func termIDs(terms []Interpretable) []int64 {
-	ids := make([]int64, len(terms))
-	for i, term := range terms {
-		ids[i] = term.ID()
+// callArgs resolves the values which were passed to a call, and reports whether all of them were
+// observed. Arguments are receiver-first, matching the operand order used when the call cost was
+// estimated.
+func callArgs(tracker *CostTracker, call InterpretableCall) ([]ref.Val, bool) {
+	argExprs := call.Args()
+	args := make([]ref.Val, len(argExprs))
+	for i, argExpr := range argExprs {
+		val, found := tracker.Operand(argExpr.ID())
+		if !found {
+			return nil, false
+		}
+		args[i] = val
 	}
-	return ids
+	return args, true
+}
+
+// foldComprehension exposes an evaluated comprehension to cost trackers.
+type foldComprehension struct {
+	fold    *evalFold
+	tracker *CostTracker
+	result  ref.Val
+}
+
+// IterRange returns the value the comprehension iterated over.
+func (fc *foldComprehension) IterRange() ref.Val {
+	val, found := fc.tracker.Operand(fc.fold.iterRange.ID())
+	if !found {
+		return nil
+	}
+	return val
+}
+
+// Iterations returns the number of steps the comprehension performed.
+func (fc *foldComprehension) Iterations() uint64 {
+	iterRange := fc.IterRange()
+	if iterRange == nil {
+		return 0
+	}
+	return cost.AggregateSize(iterRange)
+}
+
+// Accu returns the value the comprehension accumulated.
+func (fc *foldComprehension) Accu() ref.Val {
+	return fc.result
 }
