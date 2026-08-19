@@ -16,7 +16,6 @@ package interpreter
 
 import (
 	"fmt"
-	"math"
 	"math/rand"
 	"reflect"
 	"strings"
@@ -226,10 +225,10 @@ func (tc testCostEstimator) EstimateSize(element checker.AstNode) *checker.SizeE
 	return nil
 }
 
-func (tc testCostEstimator) EstimateCallCost(function, overloadID string, target *checker.AstNode, args []checker.AstNode) *checker.CallEstimate {
+func (tc testCostEstimator) EstimateCall(function, overloadID string, operands []checker.AstNode) *checker.CallEstimate {
 	switch overloadID {
 	case overloads.TimestampToYear:
-		return &checker.CallEstimate{CostEstimate: checker.FixedCostEstimate(7)}
+		return &checker.CallEstimate{Cost: checker.FixedCostEstimate(7)}
 	}
 	return nil
 }
@@ -738,8 +737,8 @@ func TestRuntimeCost(t *testing.T) {
 			options: []CostTrackerOption{
 				OverloadCostTracker(overloads.ContainsString,
 					func(args []ref.Val, result ref.Val) *uint64 {
-						strCost := uint64(math.Ceil(float64(cost.ActualSize(args[0])) * 0.2))
-						substrCost := uint64(math.Ceil(float64(cost.ActualSize(args[1])) * 0.2))
+						strCost := cost.Scale(cost.AggregateSize(args[0]), 0.2)
+						substrCost := cost.Scale(cost.AggregateSize(args[1]), 0.2)
 						cost := strCost * substrCost
 						return &cost
 					}),
@@ -885,5 +884,38 @@ func TestRuntimeCost(t *testing.T) {
 					est.Min, est.Max, actualCost)
 			}
 		})
+	}
+}
+
+func TestRuntimeCostComprehensionTracking(t *testing.T) {
+	var observed []cost.Comprehension
+	perIteration := func(comp cost.Comprehension) *uint64 {
+		observed = append(observed, comp)
+		c := comp.Iterations() * 2
+		return &c
+	}
+	baseline, _, err := computeCost(t, `[1, 2, 3].exists(i, i > 2)`, nil, EmptyActivation(), nil)
+	if err != nil {
+		t.Fatalf("computeCost() failed: %v", err)
+	}
+	tracked, _, err := computeCost(t, `[1, 2, 3].exists(i, i > 2)`, nil, EmptyActivation(),
+		[]CostTrackerOption{cost.TrackComprehensions(perIteration)})
+	if err != nil {
+		t.Fatalf("computeCost() failed: %v", err)
+	}
+	if len(observed) != 1 {
+		t.Fatalf("comprehension tracker called %d times, wanted once", len(observed))
+	}
+	if got := observed[0].Iterations(); got != 3 {
+		t.Errorf("Comprehension.Iterations() got %d, wanted 3", got)
+	}
+	if got := cost.AggregateSize(observed[0].IterRange()); got != 3 {
+		t.Errorf("Comprehension.IterRange() had size %d, wanted 3", got)
+	}
+	if observed[0].Accu() != types.True {
+		t.Errorf("Comprehension.Accu() got %v, wanted true", observed[0].Accu())
+	}
+	if tracked != baseline+6 {
+		t.Errorf("comprehension tracking charged %d, wanted %d", tracked, baseline+6)
 	}
 }

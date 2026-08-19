@@ -852,17 +852,51 @@ func (e *evalSetMembership) Eval(ctx Activation) ref.Val {
 	return types.False
 }
 
+// observerSet fans an observation out to each of the observers watching a step.
+//
+// Observers are held behind a pointer so that an observer configured after a step has been
+// planned - and after its qualifiers have been attached - still reaches every part of the step.
+// Each observer is registered under the identity of the decorator which introduced it, since a
+// step may be decorated more than once during planning and must only report to it once.
+type observerSet struct {
+	keys      []any
+	observers []EvalObserver
+}
+
+// newObserverSet returns a set holding a single observer.
+func newObserverSet(key any, observer EvalObserver) *observerSet {
+	return &observerSet{keys: []any{key}, observers: []EvalObserver{observer}}
+}
+
+// add registers an observer which is not already present in the set.
+func (s *observerSet) add(key any, observer EvalObserver) {
+	for _, k := range s.keys {
+		if k == key {
+			return
+		}
+	}
+	s.keys = append(s.keys, key)
+	s.observers = append(s.observers, observer)
+}
+
+// observe reports an evaluation step to each observer in the set.
+func (s *observerSet) observe(vars Activation, id int64, programStep any, val ref.Val) {
+	for _, observer := range s.observers {
+		observer(vars, id, programStep, val)
+	}
+}
+
 // evalWatch is an Interpretable implementation that wraps the execution of a given
 // expression so that it may observe the computed value and send it to an observer.
 type evalWatch struct {
 	Interpretable
-	observer EvalObserver
+	observers *observerSet
 }
 
 // Eval implements the Interpretable interface method.
 func (e *evalWatch) Eval(vars Activation) ref.Val {
 	val := e.Interpretable.Eval(vars)
-	e.observer(vars, e.ID(), e.Interpretable, val)
+	e.observers.observe(vars, e.ID(), e.Interpretable, val)
 	return val
 }
 
@@ -872,7 +906,7 @@ func (e *evalWatch) Eval(vars Activation) ref.Val {
 // must implement the InterpretableAttribute interface by proxy.
 type evalWatchAttr struct {
 	InterpretableAttribute
-	observer EvalObserver
+	observers *observerSet
 }
 
 // AddQualifier creates a wrapper over the incoming qualifier which observes the qualification
@@ -885,7 +919,7 @@ func (e *evalWatchAttr) AddQualifier(q Qualifier) (Attribute, error) {
 		// Expose a method to test whether the qualifier matches the input pattern.
 		q = &evalWatchConstQual{
 			ConstantQualifier: qual,
-			observer:          e.observer,
+			observers:         e.observers,
 			adapter:           e.Adapter(),
 		}
 	case *evalWatchAttr:
@@ -893,7 +927,7 @@ func (e *evalWatchAttr) AddQualifier(q Qualifier) (Attribute, error) {
 		// QualifyIfPresent rather than Eval.
 		q = &evalWatchAttrQual{
 			Attribute: qual.InterpretableAttribute,
-			observer:  e.observer,
+			observers: e.observers,
 			adapter:   e.Adapter(),
 		}
 	case Attribute:
@@ -903,14 +937,14 @@ func (e *evalWatchAttr) AddQualifier(q Qualifier) (Attribute, error) {
 		// needed to trip the conversion to a constant.
 		q = &evalWatchAttrQual{
 			Attribute: qual,
-			observer:  e.observer,
+			observers: e.observers,
 			adapter:   e.Adapter(),
 		}
 	default:
 		// This is likely a custom qualifier type.
 		q = &evalWatchQual{
 			Qualifier: qual,
-			observer:  e.observer,
+			observers: e.observers,
 			adapter:   e.Adapter(),
 		}
 	}
@@ -921,7 +955,7 @@ func (e *evalWatchAttr) AddQualifier(q Qualifier) (Attribute, error) {
 // Eval implements the Interpretable interface method.
 func (e *evalWatchAttr) Eval(vars Activation) ref.Val {
 	val := e.InterpretableAttribute.Eval(vars)
-	e.observer(vars, e.ID(), e.InterpretableAttribute, val)
+	e.observers.observe(vars, e.ID(), e.InterpretableAttribute, val)
 	return val
 }
 
@@ -929,8 +963,8 @@ func (e *evalWatchAttr) Eval(vars Activation) ref.Val {
 // string, or uint.
 type evalWatchConstQual struct {
 	ConstantQualifier
-	observer EvalObserver
-	adapter  types.Adapter
+	observers *observerSet
+	adapter   types.Adapter
 }
 
 // Qualify observes the qualification of a object via a constant boolean, int, string, or uint.
@@ -942,7 +976,7 @@ func (e *evalWatchConstQual) Qualify(vars Activation, obj any) (any, error) {
 	} else {
 		val = e.adapter.NativeToValue(out)
 	}
-	e.observer(vars, e.ID(), e.ConstantQualifier, val)
+	e.observers.observe(vars, e.ID(), e.ConstantQualifier, val)
 	return out, err
 }
 
@@ -958,7 +992,7 @@ func (e *evalWatchConstQual) QualifyIfPresent(vars Activation, obj any, presence
 		val = types.Bool(present)
 	}
 	if present || presenceOnly {
-		e.observer(vars, e.ID(), e.ConstantQualifier, val)
+		e.observers.observe(vars, e.ID(), e.ConstantQualifier, val)
 	}
 	return out, present, err
 }
@@ -972,8 +1006,8 @@ func (e *evalWatchConstQual) QualifierValueEquals(value any) bool {
 // evalWatchAttrQual observes the qualification of an object by a value computed at runtime.
 type evalWatchAttrQual struct {
 	Attribute
-	observer EvalObserver
-	adapter  ref.TypeAdapter
+	observers *observerSet
+	adapter   ref.TypeAdapter
 }
 
 // Qualify observes the qualification of a object via a value computed at runtime.
@@ -985,7 +1019,7 @@ func (e *evalWatchAttrQual) Qualify(vars Activation, obj any) (any, error) {
 	} else {
 		val = e.adapter.NativeToValue(out)
 	}
-	e.observer(vars, e.ID(), e.Attribute, val)
+	e.observers.observe(vars, e.ID(), e.Attribute, val)
 	return out, err
 }
 
@@ -1001,7 +1035,7 @@ func (e *evalWatchAttrQual) QualifyIfPresent(vars Activation, obj any, presenceO
 		val = types.Bool(present)
 	}
 	if present || presenceOnly {
-		e.observer(vars, e.ID(), e.Attribute, val)
+		e.observers.observe(vars, e.ID(), e.Attribute, val)
 	}
 	return out, present, err
 }
@@ -1009,8 +1043,8 @@ func (e *evalWatchAttrQual) QualifyIfPresent(vars Activation, obj any, presenceO
 // evalWatchQual observes the qualification of an object by a value computed at runtime.
 type evalWatchQual struct {
 	Qualifier
-	observer EvalObserver
-	adapter  types.Adapter
+	observers *observerSet
+	adapter   types.Adapter
 }
 
 // Qualify observes the qualification of a object via a value computed at runtime.
@@ -1022,7 +1056,7 @@ func (e *evalWatchQual) Qualify(vars Activation, obj any) (any, error) {
 	} else {
 		val = e.adapter.NativeToValue(out)
 	}
-	e.observer(vars, e.ID(), e.Qualifier, val)
+	e.observers.observe(vars, e.ID(), e.Qualifier, val)
 	return out, err
 }
 
@@ -1038,7 +1072,7 @@ func (e *evalWatchQual) QualifyIfPresent(vars Activation, obj any, presenceOnly 
 		val = types.Bool(present)
 	}
 	if present || presenceOnly {
-		e.observer(vars, e.ID(), e.Qualifier, val)
+		e.observers.observe(vars, e.ID(), e.Qualifier, val)
 	}
 	return out, present, err
 }
@@ -1046,13 +1080,13 @@ func (e *evalWatchQual) QualifyIfPresent(vars Activation, obj any, presenceOnly 
 // evalWatchConst describes a watcher of an instConst Interpretable.
 type evalWatchConst struct {
 	InterpretableConst
-	observer EvalObserver
+	observers *observerSet
 }
 
 // Eval implements the Interpretable interface method.
 func (e *evalWatchConst) Eval(vars Activation) ref.Val {
 	val := e.Value()
-	e.observer(vars, e.ID(), e.InterpretableConst, val)
+	e.observers.observe(vars, e.ID(), e.InterpretableConst, val)
 	return val
 }
 
@@ -1245,7 +1279,7 @@ func (a *evalAttr) Resolve(ctx Activation) (any, error) {
 
 type evalWatchConstructor struct {
 	constructor InterpretableConstructor
-	observer    EvalObserver
+	observers   *observerSet
 }
 
 // InitVals implements the InterpretableConstructor InitVals function.
@@ -1266,7 +1300,7 @@ func (c *evalWatchConstructor) ID() int64 {
 // Eval implements the Interpretable Eval function.
 func (c *evalWatchConstructor) Eval(vars Activation) ref.Val {
 	val := c.constructor.Eval(vars)
-	c.observer(vars, c.ID(), c.constructor, val)
+	c.observers.observe(vars, c.ID(), c.constructor, val)
 	return val
 }
 

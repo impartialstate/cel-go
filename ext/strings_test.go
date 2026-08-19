@@ -675,7 +675,7 @@ func (e *noopCostEstimator) CallCost(function, overloadID string, args []ref.Val
 	return nil
 }
 
-func (e *noopCostEstimator) EstimateCallCost(function, overloadID string, target *checker.AstNode, args []checker.AstNode) *checker.CallEstimate {
+func (e *noopCostEstimator) EstimateCall(function, overloadID string, operands []checker.AstNode) *checker.CallEstimate {
 	return nil
 }
 
