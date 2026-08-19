@@ -21,6 +21,7 @@ import (
 
 	"github.com/google/cel-go/common"
 	"github.com/google/cel-go/common/containers"
+	"github.com/google/cel-go/common/cost"
 	"github.com/google/cel-go/common/decls"
 	"github.com/google/cel-go/common/overloads"
 	"github.com/google/cel-go/common/stdlib"
@@ -840,10 +841,10 @@ func listElementNode(list AstNode) AstNode {
 			path := make([]string, len(nodePath)+1)
 			copy(path, nodePath)
 			path[len(nodePath)] = "@items"
-			return &astNode{path: path, t: lt, expr: nil}
+			return cost.NewAstNode(path, lt, nil, nil)
 		} else {
 			// Provide just the type if no path is available so that worst case size can be looked up based on type.
-			return &astNode{t: lt, expr: nil}
+			return cost.NewAstNode(nil, lt, nil, nil)
 		}
 	}
 	return nil
