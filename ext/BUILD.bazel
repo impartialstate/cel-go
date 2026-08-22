@@ -55,6 +55,7 @@ go_test(
     srcs = [
         "bindings_test.go",
         "comprehensions_test.go",
+        "costs_test.go",
         "encoders_test.go",
         "extension_option_factory_test.go",
         "formatting_test.go",

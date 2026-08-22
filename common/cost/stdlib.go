@@ -83,10 +83,12 @@ var standardModels = map[string]Model{
 	overloads.AddString: concat,
 	overloads.AddBytes:  concat,
 
-	// List concatenation is O(1), but the result size is tracked for downstream estimates.
+	// List concatenation is O(1), but the shape of the result is tracked for downstream
+	// estimates: it holds everything both operands held.
 	overloads.AddList: {
 		Base:   CallCost,
 		Result: Sum(Operand(0), Operand(1)),
+		Elem:   Widest(ElemOf(0), ElemOf(1)),
 	},
 
 	// O(nm) search functions.

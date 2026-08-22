@@ -15,6 +15,7 @@
 package cost
 
 import (
+	"fmt"
 	"math"
 	"testing"
 
@@ -42,6 +43,14 @@ func (c *testContext) Size(e ast.Expr) Estimate {
 		return size
 	}
 	return Unknown()
+}
+
+func (c *testContext) Shape(e ast.Expr) Shape {
+	shape := ScalarShape(c.Size(e))
+	if elem, found := c.elemSize[e.ID()]; found {
+		return ListShape(shape.Size, ScalarShape(elem))
+	}
+	return shape
 }
 
 func (c *testContext) SizeOf(n Node) Estimate {
@@ -142,8 +151,8 @@ func TestModelEstimateAndTrackAgree(t *testing.T) {
 	if est.Cost != Fixed(14) {
 		t.Errorf("Model.Estimate() got cost %v, wanted %v", est.Cost, Fixed(14))
 	}
-	if est.ResultSize == nil || *est.ResultSize != Fixed(11) {
-		t.Errorf("Model.Estimate() got result size %v, wanted %v", est.ResultSize, Fixed(11))
+	if est.Result == nil || est.Result.Size != Fixed(11) {
+		t.Errorf("Model.Estimate() got result shape %v, wanted size %v", est.Result, Fixed(11))
 	}
 	tracked := scanModel.Track([]ref.Val{target}, target)
 	if *tracked != est.Cost.Max {
@@ -316,4 +325,105 @@ type callTracker uint64
 func (c callTracker) CallCost(function, overloadID string, args []ref.Val, result ref.Val) *uint64 {
 	cost := uint64(c)
 	return &cost
+}
+
+func TestShapeUnion(t *testing.T) {
+	strings3 := ListShape(Fixed(2), ScalarShape(Fixed(3)))
+	strings9 := ListShape(Fixed(4), ScalarShape(Fixed(9)))
+	tests := []struct {
+		name string
+		got  Shape
+		want Shape
+	}{
+		{
+			name: "sizes widen at every level",
+			got:  strings3.Union(strings9),
+			want: ListShape(Ranged(2, 4), ScalarShape(Ranged(3, 9))),
+		},
+		{
+			name: "an empty shape is the identity",
+			got:  EmptyShape().Union(strings3),
+			want: strings3,
+		},
+		{
+			name: "an empty shape is the identity from either side",
+			got:  strings3.Union(EmptyShape()),
+			want: strings3,
+		},
+		{
+			// Widening a list against a value which says nothing about its contents cannot
+			// keep claiming to know them.
+			name: "unknown contents widen known contents",
+			got:  strings3.Union(ScalarShape(Fixed(2))),
+			want: Shape{
+				Size: Fixed(2),
+				Key:  ptr(ScalarShape(Unknown())),
+				Elem: ptr(ScalarShape(Unknown())),
+				kind: types.ListKind,
+			},
+		},
+	}
+	for _, tst := range tests {
+		tc := tst
+		t.Run(tc.name, func(t *testing.T) {
+			if !shapeEqual(tc.got, tc.want) {
+				t.Errorf("Union() got %s, wanted %s", describe(tc.got), describe(tc.want))
+			}
+		})
+	}
+}
+
+func TestShapeRefine(t *testing.T) {
+	// A binding knows its size but not what it holds; a hint knows the reverse. Refining
+	// combines them rather than letting either erase the other.
+	binding := ScalarShape(Fixed(2))
+	hinted := Shape{Size: Unknown(), Elem: ptr(ScalarShape(Fixed(6))), kind: types.ListKind}
+	refined := binding.Refine(hinted)
+	if refined.Size != Fixed(2) {
+		t.Errorf("Refine() got size %v, wanted the size the binding knew", refined.Size)
+	}
+	if refined.Elements().Size != Fixed(6) {
+		t.Errorf("Refine() got element size %v, wanted the size the hint knew", refined.Elements().Size)
+	}
+}
+
+func TestShapeNesting(t *testing.T) {
+	inner := ListShape(Fixed(2), ScalarShape(Fixed(6)))
+	outer := ListShape(Fixed(3), inner)
+	if got := outer.Elements().Elements().Size; got != Fixed(6) {
+		t.Errorf("Elements().Elements() got %v, wanted the innermost size", got)
+	}
+	if got := outer.Resize(Fixed(9)); got.Size != Fixed(9) || got.Elements().Size != Fixed(2) {
+		t.Errorf("Resize() changed more than the size: %s", describe(got))
+	}
+	if got := UnknownShape().Elements(); !got.Size.IsUnknown() {
+		t.Errorf("Elements() of an unknown shape got %v, wanted unknown", got.Size)
+	}
+}
+
+func ptr(s Shape) *Shape { return &s }
+
+func shapeEqual(a, b Shape) bool {
+	if a.Size != b.Size || a.kind != b.kind || a.empty != b.empty {
+		return false
+	}
+	return childEqual(a.Key, b.Key) && childEqual(a.Elem, b.Elem)
+}
+
+func childEqual(a, b *Shape) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return shapeEqual(*a, *b)
+}
+
+func describe(s Shape) string {
+	out := fmt.Sprintf("{size:%v", s.Size)
+	if s.Key != nil {
+		out += " key:" + describe(*s.Key)
+	}
+	if s.Elem != nil {
+		out += " elem:" + describe(*s.Elem)
+	}
+	return out + "}"
 }

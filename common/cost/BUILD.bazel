@@ -12,6 +12,7 @@ go_library(
         "estimate.go",
         "hints.go",
         "model.go",
+        "shape.go",
         "stdlib.go",
         "track.go",
     ],

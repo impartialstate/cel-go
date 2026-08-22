@@ -18,6 +18,7 @@ import (
 	"math"
 
 	"github.com/google/cel-go/common/ast"
+	"github.com/google/cel-go/common/operators"
 	"github.com/google/cel-go/common/overloads"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
@@ -58,6 +59,10 @@ type EstimationContext interface {
 	// Size returns the size of the value an expression produces, or an unknown estimate.
 	Size(expr ast.Expr) Estimate
 
+	// Shape returns the size of the value an expression produces along with the sizes of the
+	// values it holds, to whatever depth is known.
+	Shape(expr ast.Expr) Shape
+
 	// SizeOf returns the size of a value which the expression does not name on its own.
 	SizeOf(node Node) Estimate
 
@@ -86,14 +91,15 @@ type Estimator interface {
 	EstimateCall(ctx EstimationContext, function, overloadID string, operands []ast.Expr) *CallEstimate
 }
 
-// CallEstimate is the cost of a call and, when the call produces an aggregate value, the size of
-// its result.
+// CallEstimate is the cost of a call and, when it is known, the shape of the value it produces.
 type CallEstimate struct {
 	// Cost of the call, including the cost of evaluating its operands.
 	Cost Estimate
 
-	// ResultSize is the size of the value the call produces, or nil when it is unknown.
-	ResultSize *Estimate
+	// Result is the shape of the value the call produces, or nil when it is unknown. Describing
+	// the shape rather than only the size is what lets the size of an element survive being
+	// returned inside a container.
+	Result *Shape
 }
 
 // FunctionEstimator computes the cost of a single function overload from its operands, which are
@@ -134,8 +140,7 @@ func EstimateCost(checked *ast.AST, estimator Estimator, opts ...EstimatorOption
 		overloadEstimators: map[string]FunctionEstimator{},
 		exprPaths:          map[int64][]string{},
 		localVars:          make(scopes),
-		computedSizes:      map[int64]Estimate{},
-		computedEntrySizes: map[int64]entrySize{},
+		computedShapes:     map[int64]Shape{},
 		presenceTestCost:   Fixed(SelectAndIdentCost),
 		estimating:         map[int64]bool{},
 	}
@@ -152,10 +157,9 @@ type coster struct {
 	exprPaths map[int64][]string
 	// localVars tracks the local and iteration variables assigned during evaluation.
 	localVars scopes
-	// computedSizes tracks the computed sizes of call results.
-	computedSizes map[int64]Estimate
-	// computedEntrySizes tracks the size of list and map entries
-	computedEntrySizes map[int64]entrySize
+	// computedShapes tracks the shapes derived for expressions, whether read off a literal,
+	// resolved from a hint, or produced by a call.
+	computedShapes map[int64]Shape
 
 	checkedAST         *ast.AST
 	estimator          Estimator
@@ -167,69 +171,22 @@ type coster struct {
 	estimating map[int64]bool
 }
 
-// entrySize captures the container kind and associated key/index and value size estimates.
-//
-// An entrySize only exists if both the key/index and the value have size estimates, otherwise a
-// nil entrySize should be used.
-type entrySize struct {
-	containerKind types.Kind
-	key           Estimate
-	val           Estimate
-}
-
-// container returns the container kind (list or map) of the entry.
-func (s *entrySize) container() types.Kind {
-	if s == nil {
-		return types.UnknownKind
-	}
-	return s.containerKind
-}
-
-// keySize returns the size estimate for the key if one exists.
-func (s *entrySize) keySize() *Estimate {
-	if s == nil {
-		return nil
-	}
-	return &s.key
-}
-
-// valSize returns the size estimate for the value if one exists.
-func (s *entrySize) valSize() *Estimate {
-	if s == nil {
-		return nil
-	}
-	return &s.val
-}
-
-func (s *entrySize) union(other *entrySize) *entrySize {
-	if s == nil || other == nil {
-		return nil
-	}
-	return &entrySize{
-		containerKind: s.containerKind,
-		key:           s.key.Union(other.key),
-		val:           s.val.Union(other.val),
-	}
-}
-
-// localVar captures the local variable size and entry size estimates if they exist for variables
+// localVar captures the shape of a local variable, if it is known
 type localVar struct {
-	exprID    int64
-	path      []string
-	size      *Estimate
-	entrySize *entrySize
+	exprID int64
+	path   []string
+	shape  *Shape
 }
 
 // scopes is a stack of variable name to integer id stack to handle scopes created by cel.bind()
 // like macros
 type scopes map[string][]*localVar
 
-func (s scopes) push(varName string, expr ast.Expr, path []string, size *Estimate, entry *entrySize) {
+func (s scopes) push(varName string, expr ast.Expr, path []string, shape *Shape) {
 	s[varName] = append(s[varName], &localVar{
-		exprID:    expr.ID(),
-		path:      path,
-		size:      size,
-		entrySize: entry,
+		exprID: expr.ID(),
+		path:   path,
+		shape:  shape,
 	})
 }
 
@@ -247,57 +204,61 @@ func (s scopes) peek(varName string) (*localVar, bool) {
 }
 
 func (c *coster) pushIterKey(varName string, rangeExpr ast.Expr) {
-	entry := c.computeEntrySize(rangeExpr)
-	size := entry.keySize()
-	path := c.getPath(rangeExpr)
-	container := entry.container()
-	if container == types.UnknownKind {
-		container = c.getType(rangeExpr).Kind()
-	}
+	shape := c.Shape(rangeExpr)
 	subpath := "@keys"
-	if container == types.ListKind {
+	if c.containerKind(rangeExpr, shape) == types.ListKind {
 		subpath = "@indices"
 	}
-	c.localVars.push(varName, rangeExpr, append(path, subpath), size, nil)
+	c.pushIterVar(varName, rangeExpr, subpath, shape.Keys())
 }
 
 func (c *coster) pushIterValue(varName string, rangeExpr ast.Expr) {
-	entry := c.computeEntrySize(rangeExpr)
-	size := entry.valSize()
-	path := c.getPath(rangeExpr)
-	container := entry.container()
-	if container == types.UnknownKind {
-		container = c.getType(rangeExpr).Kind()
-	}
+	shape := c.Shape(rangeExpr)
 	subpath := "@values"
-	if container == types.ListKind {
+	if c.containerKind(rangeExpr, shape) == types.ListKind {
 		subpath = "@items"
 	}
-	c.localVars.push(varName, rangeExpr, append(path, subpath), size, nil)
+	c.pushIterVar(varName, rangeExpr, subpath, shape.Elements())
 }
 
 func (c *coster) pushIterSingle(varName string, rangeExpr ast.Expr) {
-	entry := c.computeEntrySize(rangeExpr)
-	size := entry.keySize()
-	subpath := "@keys"
-	container := entry.container()
-	if container == types.UnknownKind {
-		container = c.getType(rangeExpr).Kind()
+	shape := c.Shape(rangeExpr)
+	// Iterating a list visits its elements, while iterating a map visits its keys.
+	entry, subpath := shape.Keys(), "@keys"
+	if c.containerKind(rangeExpr, shape) == types.ListKind {
+		entry, subpath = shape.Elements(), "@items"
 	}
-	if container == types.ListKind {
-		size = entry.valSize()
-		subpath = "@items"
+	c.pushIterVar(varName, rangeExpr, subpath, entry)
+}
+
+// pushIterVar binds an iteration variable to the shape of the entries it visits, which is what
+// carries the size of a nested container into the body of a comprehension.
+func (c *coster) pushIterVar(varName string, rangeExpr ast.Expr, subpath string, entry Shape) {
+	path := append(c.getPath(rangeExpr), subpath)
+	var shape *Shape
+	if entry.IsKnown() {
+		shape = &entry
 	}
-	path := c.getPath(rangeExpr)
-	c.localVars.push(varName, rangeExpr, append(path, subpath), size, nil)
+	c.localVars.push(varName, rangeExpr, path, shape)
+}
+
+// containerKind reports whether an iteration range is a list or a map, preferring the deduced
+// type and falling back to the shape for expressions which are dyn-typed.
+func (c *coster) containerKind(rangeExpr ast.Expr, shape Shape) types.Kind {
+	if kind := c.getType(rangeExpr).Kind(); kind != types.UnknownKind && kind != types.DynKind {
+		return kind
+	}
+	return shape.Kind()
 }
 
 func (c *coster) pushLocalVar(varName string, e ast.Expr) {
-	path := c.getPath(e)
-	// note: retrieve the entry size for the local variable based on the size of the binding
-	// expression since the binding expression could be a list or map, the entry size should also
-	// be propagated
-	c.localVars.push(varName, e, path, c.computeSize(e), c.computeEntrySize(e))
+	// The binding expression may be a container, so the whole shape is propagated rather than
+	// only its size.
+	var shape *Shape
+	if s := c.Shape(e); s.IsKnown() {
+		shape = &s
+	}
+	c.localVars.push(varName, e, c.getPath(e), shape)
 }
 
 func (c *coster) peekLocalVar(varName string) (*localVar, bool) {
@@ -357,9 +318,11 @@ func (c *coster) costSelect(e ast.Expr) Estimate {
 		// but does not add any additional cost for the qualifier, except here we do
 		// the reverse (ident adds cost)
 		sum = sum.Add(c.presenceTestCost)
+		sum = sum.Add(c.relativeAttributeCost(sel.Operand()))
 		return sum.Add(c.cost(sel.Operand()))
 	}
 	sum = sum.Add(c.cost(sel.Operand()))
+	sum = sum.Add(c.relativeAttributeCost(sel.Operand()))
 	switch c.getType(sel.Operand()).Kind() {
 	case types.MapKind, types.StructKind, types.TypeParamKind:
 		sum = sum.Add(Fixed(SelectAndIdentCost))
@@ -400,39 +363,38 @@ func (c *coster) costCall(e ast.Expr) Estimate {
 	}
 	// Pick a cost estimate range that covers all the overload cost estimation ranges
 	fnCost := Estimate{Min: uint64(math.MaxUint64), Max: 0}
-	var resultSize *Estimate
+	var resultShape *Shape
+	var indexCost Estimate
 	for _, overload := range overloadIDs {
 		overloadCost := c.functionCost(e, call.FunctionName(), overload, operands, operandCosts)
 		fnCost = fnCost.Union(overloadCost.Cost)
-		if overloadCost.ResultSize != nil {
-			if resultSize == nil {
-				resultSize = overloadCost.ResultSize
+		if overloadCost.Result != nil {
+			if resultShape == nil {
+				resultShape = overloadCost.Result
 			} else {
-				size := resultSize.Union(*overloadCost.ResultSize)
-				resultSize = &size
+				union := resultShape.Union(*overloadCost.Result)
+				resultShape = &union
 			}
 		}
-		// build and track the field path for index operations
+		// Indexing yields an entry of the container it was applied to, so the result takes the
+		// shape of the container's elements and the path to them.
 		switch overload {
-		case overloads.IndexList:
+		case overloads.IndexList, overloads.IndexMap:
 			if len(args) > 0 {
-				// note: assigning resultSize here could be redundant with the path-based lookup
-				// later
-				resultSize = c.computeEntrySize(args[0]).valSize()
-				c.addPath(e, append(c.getPath(args[0]), "@items"))
+				subpath := "@items"
+				if overload == overloads.IndexMap {
+					subpath = "@values"
+				}
+				c.addPath(e, append(c.getPath(args[0]), subpath))
+				if entry := c.Shape(args[0]).Elements(); entry.IsKnown() {
+					resultShape = &entry
+				}
+				indexCost = c.relativeAttributeCost(args[0])
 			}
-		case overloads.IndexMap:
-			if len(args) > 0 {
-				resultSize = c.computeEntrySize(args[0]).valSize()
-				c.addPath(e, append(c.getPath(args[0]), "@values"))
-			}
-		}
-		if resultSize == nil {
-			resultSize = c.computeSize(e)
 		}
 	}
-	c.setSize(e, resultSize)
-	return fnCost
+	c.setShape(e, resultShape)
+	return fnCost.Add(indexCost)
 }
 
 func (c *coster) maybeUnwrapDynCall(e ast.Expr) *Estimate {
@@ -442,44 +404,58 @@ func (c *coster) maybeUnwrapDynCall(e ast.Expr) *Estimate {
 	}
 	arg := call.Args()[0]
 	argCost := c.cost(arg)
-	c.copySizeEstimates(e, arg)
+	// Disabling type checking must not discard what is known about the value, including the path
+	// by which a hint for it would be addressed.
+	c.copyShape(e, arg)
+	c.addPath(e, c.getPath(arg))
 	callCost := Fixed(CallCost).Add(argCost)
 	return &callCost
 }
 
 func (c *coster) costCreateList(e ast.Expr) Estimate {
-	create := e.AsList()
 	var sum Estimate
-	itemSize := Estimate{Min: math.MaxUint64, Max: 0}
-	if create.Size() == 0 {
-		itemSize.Min = 0
+	for _, elem := range e.AsList().Elements() {
+		sum = sum.Add(c.cost(elem))
 	}
-	for _, e := range create.Elements() {
-		sum = sum.Add(c.cost(e))
-		itemSize = itemSize.Union(c.sizeOrUnknown(e))
-	}
-	c.setEntrySize(e, &entrySize{containerKind: types.ListKind, key: Fixed(1), val: itemSize})
+	shape := c.listLiteralShape(e)
+	c.setShape(e, &shape)
 	return sum.Add(Fixed(ListCreateBaseCost))
 }
 
-func (c *coster) costCreateMap(e ast.Expr) Estimate {
-	mapVal := e.AsMap()
-	var sum Estimate
-	keySize := Estimate{Min: math.MaxUint64, Max: 0}
-	valSize := Estimate{Min: math.MaxUint64, Max: 0}
-	if mapVal.Size() == 0 {
-		valSize.Min = 0
-		keySize.Min = 0
+// listLiteralShape describes a list written out in the expression: its size is exact and its
+// elements take the shape of the widest element it holds.
+func (c *coster) listLiteralShape(e ast.Expr) Shape {
+	create := e.AsList()
+	itemShape := EmptyShape()
+	for _, elem := range create.Elements() {
+		itemShape = itemShape.Union(c.Shape(elem))
 	}
-	for _, ent := range mapVal.Entries() {
+	return ListShape(Fixed(uint64(create.Size())), itemShape)
+}
+
+func (c *coster) costCreateMap(e ast.Expr) Estimate {
+	var sum Estimate
+	for _, ent := range e.AsMap().Entries() {
 		entry := ent.AsMapEntry()
 		sum = sum.Add(c.cost(entry.Key()))
 		sum = sum.Add(c.cost(entry.Value()))
-		keySize = keySize.Union(c.sizeOrUnknown(entry.Key()))
-		valSize = valSize.Union(c.sizeOrUnknown(entry.Value()))
 	}
-	c.setEntrySize(e, &entrySize{containerKind: types.MapKind, key: keySize, val: valSize})
+	shape := c.mapLiteralShape(e)
+	c.setShape(e, &shape)
 	return sum.Add(Fixed(MapCreateBaseCost))
+}
+
+// mapLiteralShape describes a map written out in the expression: its size is exact and its keys
+// and values take the shape of the widest key and value it holds.
+func (c *coster) mapLiteralShape(e ast.Expr) Shape {
+	mapVal := e.AsMap()
+	keyShape, valShape := EmptyShape(), EmptyShape()
+	for _, ent := range mapVal.Entries() {
+		entry := ent.AsMapEntry()
+		keyShape = keyShape.Union(c.Shape(entry.Key()))
+		valShape = valShape.Union(c.Shape(entry.Value()))
+	}
+	return MapShape(Fixed(uint64(mapVal.Size())), keyShape, valShape)
 }
 
 func (c *coster) costCreateStruct(e ast.Expr) Estimate {
@@ -522,19 +498,17 @@ func (c *coster) costComprehension(e ast.Expr) Estimate {
 	c.localVars.pop(comp.AccuVar())
 
 	// Estimate the cost of the loop.
-	rangeCnt := c.sizeOrUnknown(comp.IterRange())
+	rangeCnt := c.Size(comp.IterRange())
 	sum = sum.Add(rangeCnt.Multiply(stepCost.Add(loopCost)))
 
 	switch comp.AccuInit().Kind() {
 	case ast.LiteralKind:
-		c.setSize(e, c.computeSize(comp.AccuInit()))
+		c.copyShape(e, comp.AccuInit())
 	case ast.ListKind, ast.MapKind:
-		c.setSize(e, &rangeCnt)
-		// For a step which produces a container value, it will have an entry size associated
-		// with its expression id.
-		if stepEntrySize := c.computeEntrySize(comp.LoopStep()); stepEntrySize != nil {
-			c.setEntrySize(e, stepEntrySize)
-		}
+		// A comprehension accumulates into a container, so the result holds whatever the loop
+		// step accumulated, once per iteration of the range.
+		shape := c.Shape(comp.LoopStep()).Resize(rangeCnt)
+		c.setShape(e, &shape)
 	}
 	return sum
 }
@@ -559,8 +533,8 @@ func (c *coster) costBind(e ast.Expr) Estimate {
 	sum = sum.Add(c.cost(comp.Result()))
 	c.popLocalVar(comp.AccuVar())
 
-	// Associate the bind output size with the result size.
-	c.copySizeEstimates(e, comp.Result())
+	// Associate the bind output shape with the result shape.
+	c.copyShape(e, comp.Result())
 	return sum
 }
 
@@ -575,7 +549,7 @@ func (c *coster) functionCost(e ast.Expr, function, overloadID string, operands 
 		return sum
 	}
 	withOperands := func(est *CallEstimate) CallEstimate {
-		return CallEstimate{Cost: est.Cost.Add(operandCostSum()), ResultSize: est.ResultSize}
+		return CallEstimate{Cost: est.Cost.Add(operandCostSum()), Result: est.Result}
 	}
 	// A registered estimator for the overload takes precedence over everything else.
 	if estimator, found := c.overloadEstimators[overloadID]; found {
@@ -597,15 +571,10 @@ func (c *coster) functionCost(e ast.Expr, function, overloadID string, operands 
 		// min cost is min of LHS for short circuited && or ||
 		return CallEstimate{Cost: Estimate{Min: lhs.Min, Max: lhs.Add(rhs).Max}}
 	case overloads.Conditional:
-		size := c.Size(operands[1]).Union(c.Size(operands[2]))
-		c.setEntrySize(e, c.computeEntrySize(operands[1]).union(c.computeEntrySize(operands[2])))
+		// The result came from one branch or the other, so it is shaped like either.
+		shape := c.Shape(operands[1]).Union(c.Shape(operands[2]))
 		argCost := operandCosts[0].Add(operandCosts[1].Union(operandCosts[2]))
-		return CallEstimate{Cost: argCost, ResultSize: &size}
-	case overloads.AddString, overloads.AddBytes, overloads.AddList:
-		// Concatenation propagates the entry sizes of its operands to the result.
-		if entry := c.computeEntrySize(operands[0]).union(c.computeEntrySize(operands[1])); entry != nil {
-			c.setEntrySize(e, entry)
-		}
+		return CallEstimate{Cost: argCost, Result: &shape}
 	}
 	// Every remaining function is described by a cost model, defaulting to a call which does no
 	// work proportional to the size of its inputs.
@@ -614,6 +583,36 @@ func (c *coster) functionCost(e ast.Expr, function, overloadID string, operands 
 		model = Model{Base: CallCost}
 	}
 	return withOperands(model.Estimate(c, operands))
+}
+
+// relativeAttributeCost is the cost of qualifying a value which was computed rather than named.
+//
+// Evaluation reaches into a value by resolving an attribute and then applying qualifiers to it.
+// Resolving the attribute costs the same as resolving an identifier, and when the value being
+// qualified is named, that is exactly what it is: the cost is already charged to the identifier.
+// A value which was computed has no identifier to charge it to, so it is charged here, once for
+// the whole chain of qualifiers applied to it.
+func (c *coster) relativeAttributeCost(operand ast.Expr) Estimate {
+	if isAttributeChain(operand) {
+		return Estimate{}
+	}
+	return Fixed(SelectAndIdentCost)
+}
+
+// isAttributeChain reports whether an expression is resolved as part of a single attribute during
+// evaluation. A chain begins at an identifier, or at a ternary which selects between attributes,
+// and is extended by field selections and index operations.
+func isAttributeChain(e ast.Expr) bool {
+	switch e.Kind() {
+	case ast.IdentKind, ast.SelectKind:
+		return true
+	case ast.CallKind:
+		switch e.AsCall().FunctionName() {
+		case operators.Index, operators.Conditional:
+			return true
+		}
+	}
+	return false
 }
 
 func (c *coster) getType(e ast.Expr) *types.Type {
@@ -658,7 +657,7 @@ func (c *coster) Path(e ast.Expr) []string {
 
 // Size implements the EstimationContext interface method.
 func (c *coster) Size(e ast.Expr) Estimate {
-	return c.sizeOrUnknown(e)
+	return c.Shape(e).Size
 }
 
 // SizeOf implements the EstimationContext interface method.
@@ -666,15 +665,8 @@ func (c *coster) SizeOf(n Node) Estimate {
 	if n.Expr != nil {
 		return c.Size(n.Expr)
 	}
-	if c.estimator != nil {
-		if size := c.estimator.EstimateSize(c, n); size != nil {
-			return *size
-		}
-	}
-	if size := computeTypeSize(n.Type); size != nil {
-		return *size
-	}
-	return Unknown()
+	shape, _ := c.hintedShape(n.Path, n.Type, 0)
+	return shape.Size
 }
 
 // ElementType implements the EstimationContext interface method.
@@ -683,26 +675,8 @@ func (c *coster) ElementType(e ast.Expr) *types.Type {
 }
 
 // ElementSize implements the EstimationContext interface method.
-//
-// The size comes from the contents of the expression where CEL can see them, and otherwise from
-// the caller's estimate for the path to the elements.
 func (c *coster) ElementSize(e ast.Expr) Estimate {
-	if entry := c.computeEntrySize(e); entry != nil {
-		return entry.val
-	}
-	elemType := c.ElementType(e)
-	if elemType == nil {
-		return Unknown()
-	}
-	var path []string
-	if p := c.Path(e); len(p) != 0 {
-		subpath := "@items"
-		if c.getType(e).Kind() == types.MapKind {
-			subpath = "@values"
-		}
-		path = append(append(make([]string, 0, len(p)+1), p...), subpath)
-	}
-	return c.SizeOf(Node{Type: elemType, Path: path})
+	return c.Shape(e).Elements().Size
 }
 
 // Constant implements the EstimationContext interface method.
@@ -713,108 +687,154 @@ func (c *coster) Constant(e ast.Expr) (ref.Val, bool) {
 	return e.AsLiteral(), true
 }
 
-func (c *coster) setSize(e ast.Expr, size *Estimate) {
-	if size == nil {
-		return
+// Shape implements the EstimationContext interface method.
+//
+// Shapes are resolved in order of how much they are worth: what an earlier step recorded for the
+// expression, what the expression says about itself, what the application hinted for the path to
+// it, and finally what its type alone implies.
+func (c *coster) Shape(e ast.Expr) Shape {
+	if e == nil {
+		return UnknownShape()
 	}
-	// Store the computed size with the expression
-	c.computedSizes[e.ID()] = *size
-}
-
-func (c *coster) sizeOrUnknown(e ast.Expr) Estimate {
-	if sz := c.computeSize(e); sz != nil {
-		return *sz
+	if shape, found := c.computedShapes[e.ID()]; found {
+		return shape
 	}
-	return Unknown()
-}
-
-func (c *coster) copySizeEstimates(dst, src ast.Expr) {
-	c.setSize(dst, c.computeSize(src))
-	c.setEntrySize(dst, c.computeEntrySize(src))
-}
-
-func (c *coster) computeSize(e ast.Expr) *Estimate {
-	if size, ok := c.computedSizes[e.ID()]; ok {
-		return &size
+	if shape, found := c.literalShape(e); found {
+		c.computedShapes[e.ID()] = shape
+		return shape
 	}
-	if size := computeExprSize(e); size != nil {
-		return size
-	}
-	// Ensure size estimates are computed first as users may choose to override the costs that
-	// CEL would otherwise ascribe to the type.
-	if c.estimator != nil && !c.estimating[e.ID()] {
-		// An estimator is handed the context, and may ask it about the very expression it is
-		// being asked to size, so the question is only asked once.
-		c.estimating[e.ID()] = true
-		size := c.estimator.EstimateSize(c, Node{Expr: e, Path: c.Path(e), Type: c.getType(e)})
-		delete(c.estimating, e.ID())
-		if size != nil {
-			// storing the computed size should reduce calls to EstimateSize()
-			c.computedSizes[e.ID()] = *size
-			return size
-		}
-	}
-	if size := computeTypeSize(c.getType(e)); size != nil {
-		return size
-	}
+	shape, found := c.hintedShape(c.Path(e), c.getType(e), 0)
 	if e.Kind() == ast.IdentKind {
-		if v, ok := c.peekLocalVar(e.AsIdent()); ok && v.size != nil {
-			return v.size
+		// A local variable is described by the expression it was bound to, or by the entries of
+		// the range it iterates, which says more than anything addressed by path alone. Hints
+		// only fill in what the binding does not say.
+		if v, ok := c.peekLocalVar(e.AsIdent()); ok && v.shape != nil {
+			return v.shape.Refine(shape)
 		}
+		// The shape of an identifier depends on the scope it is resolved in, so it is not
+		// recorded against the expression.
+		return shape
 	}
-	return nil
+	if found {
+		c.computedShapes[e.ID()] = shape
+	}
+	return shape
 }
 
-func (c *coster) setEntrySize(e ast.Expr, size *entrySize) {
-	if size == nil {
-		return
-	}
-	c.computedEntrySizes[e.ID()] = *size
-}
-
-func (c *coster) computeEntrySize(e ast.Expr) *entrySize {
-	if sz, found := c.computedEntrySizes[e.ID()]; found {
-		return &sz
-	}
-	if e.Kind() == ast.IdentKind {
-		if v, ok := c.peekLocalVar(e.AsIdent()); ok && v.entrySize != nil {
-			return v.entrySize
-		}
-	}
-	return nil
-}
-
-func computeExprSize(expr ast.Expr) *Estimate {
-	var v uint64
-	switch expr.Kind() {
+// literalShape reads the shape of a value which is written out in the expression itself.
+func (c *coster) literalShape(e ast.Expr) (Shape, bool) {
+	switch e.Kind() {
 	case ast.LiteralKind:
-		switch ck := expr.AsLiteral().(type) {
+		var size uint64
+		switch lit := e.AsLiteral().(type) {
 		case types.String:
-			// converting to runes here is an O(n) operation, but
-			// this is consistent with how size is computed at runtime,
-			// and how the language definition defines string size
-			v = uint64(len([]rune(ck)))
+			// converting to runes here is an O(n) operation, but this is consistent with how
+			// size is computed at runtime, and how the language definition defines string size
+			size = uint64(len([]rune(lit)))
 		case types.Bytes:
-			v = uint64(len(ck))
+			size = uint64(len(lit))
 		case types.Bool, types.Double, types.Duration,
 			types.Int, types.Timestamp, types.Uint,
 			types.Null:
-			v = uint64(1)
+			size = 1
 		default:
-			return nil
+			return UnknownShape(), false
 		}
+		return ScalarShape(Fixed(size)), true
 	case ast.ListKind:
-		v = uint64(expr.AsList().Size())
+		return c.listLiteralShape(e), true
 	case ast.MapKind:
-		v = uint64(expr.AsMap().Size())
-	default:
-		return nil
+		return c.mapLiteralShape(e), true
 	}
-	size := Fixed(v)
-	return &size
+	return UnknownShape(), false
 }
 
-func computeTypeSize(t *types.Type) *Estimate {
+// maxShapeDepth bounds how far a shape is resolved from hints. Type nesting terminates on its
+// own, so the limit only guards against a pathological type.
+const maxShapeDepth = 8
+
+// hintedShape resolves the shape of a value from the sizes an application hinted for the path to
+// it, descending into the contents of a container so that a hint for `x.@items` describes the
+// elements of `x` and `x.@items.@items` the elements of those.
+//
+// Where no hint is offered the type is consulted, which pins the size of every scalar.
+func (c *coster) hintedShape(path []string, t *types.Type, depth int) (Shape, bool) {
+	if depth > maxShapeDepth {
+		return UnknownShape(), false
+	}
+	shape, found := UnknownShape(), false
+	if c.estimator != nil {
+		if size := c.askEstimator(Node{Path: path, Type: t}); size != nil {
+			shape.Size, found = *size, true
+		}
+	}
+	if t == nil {
+		return shape, found
+	}
+	switch t.Kind() {
+	case types.ListKind:
+		shape.kind = types.ListKind
+		index := ScalarShape(Fixed(1))
+		shape.Key = &index
+		if elem, ok := c.hintedShape(subpath(path, "@items"), t.Parameters()[0], depth+1); ok {
+			shape.Elem, found = &elem, true
+		}
+	case types.MapKind:
+		shape.kind = types.MapKind
+		if key, ok := c.hintedShape(subpath(path, "@keys"), t.Parameters()[0], depth+1); ok {
+			shape.Key, found = &key, true
+		}
+		if val, ok := c.hintedShape(subpath(path, "@values"), t.Parameters()[1], depth+1); ok {
+			shape.Elem, found = &val, true
+		}
+	default:
+		if !found {
+			if size := typeSize(t); size != nil {
+				shape.Size, found = *size, true
+			}
+		}
+	}
+	return shape, found
+}
+
+// subpath extends a field path without sharing its backing array.
+func subpath(path []string, sub string) []string {
+	if len(path) == 0 {
+		return nil
+	}
+	return append(append(make([]string, 0, len(path)+1), path...), sub)
+}
+
+// askEstimator consults the application for the size of a value, guarding against an estimator
+// which asks the context about the very value it is being asked to size.
+func (c *coster) askEstimator(n Node) *Estimate {
+	var id int64
+	if n.Expr != nil {
+		id = n.Expr.ID()
+		if c.estimating[id] {
+			return nil
+		}
+		c.estimating[id] = true
+		defer delete(c.estimating, id)
+	}
+	return c.estimator.EstimateSize(c, n)
+}
+
+func (c *coster) setShape(e ast.Expr, shape *Shape) {
+	if shape == nil {
+		return
+	}
+	c.computedShapes[e.ID()] = *shape
+}
+
+func (c *coster) copyShape(dst, src ast.Expr) {
+	if shape := c.Shape(src); shape.IsKnown() {
+		c.computedShapes[dst.ID()] = shape
+	}
+}
+
+// typeSize returns the size implied by a type alone, which is known only for fixed width values.
+func typeSize(t *types.Type) *Estimate {
 	if isScalar(t) {
 		size := Fixed(1)
 		return &size

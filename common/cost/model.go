@@ -47,6 +47,9 @@ type Operands interface {
 
 	// ElemType returns the element type of a list or map operand, or nil when it is unknown.
 	ElemType(i int) *types.Type
+
+	// Shape returns the size of an operand along with the sizes of the values it holds.
+	Shape(i int) Shape
 }
 
 // SizeFn computes a size from the operands of a call.
@@ -213,6 +216,49 @@ func ElementFactor(i int, base float64) func(ops Operands) float64 {
 	}
 }
 
+// ShapeFn computes the shape of a value from the operands of a call.
+type ShapeFn func(ops Operands) Shape
+
+// ShapeOf returns the shape of an operand, which describes a call that hands one of its inputs
+// back unchanged.
+func ShapeOf(i int) ShapeFn {
+	return func(ops Operands) Shape { return ops.Shape(i) }
+}
+
+// ElemOf returns the shape of the values held by an operand, which describes a call whose result
+// holds what its input held.
+func ElemOf(i int) ShapeFn {
+	return func(ops Operands) Shape { return ops.Shape(i).Elements() }
+}
+
+// KeyOf returns the shape of the keys of an operand.
+func KeyOf(i int) ShapeFn {
+	return func(ops Operands) Shape { return ops.Shape(i).Keys() }
+}
+
+// Scalar returns the shape of a value of a given size which holds nothing.
+func Scalar(size SizeFn) ShapeFn {
+	return func(ops Operands) Shape { return ScalarShape(size(ops)) }
+}
+
+// Widest returns a shape which encompasses all of the input shapes, describing a call whose
+// result may have come from any of its operands.
+func Widest(shapes ...ShapeFn) ShapeFn {
+	return func(ops Operands) Shape {
+		result := EmptyShape()
+		for _, shape := range shapes {
+			result = result.Union(shape(ops))
+		}
+		return result
+	}
+}
+
+// Elements returns the shape of the values held by this shape, which describes a call that
+// unwraps one level of nesting.
+func (f ShapeFn) Elements() ShapeFn {
+	return func(ops Operands) Shape { return f(ops).Elements() }
+}
+
 // Model declares how the cost of a single function overload relates to the sizes of its
 // operands and of the value it produces.
 //
@@ -238,18 +284,43 @@ type Model struct {
 	// of the result unknown, which is the right answer for calls that produce a scalar.
 	Result SizeFn
 
+	// Elem reports the shape of the values held by the container the call produces. It is what
+	// keeps the size of an element from being lost when a call rearranges, filters, or rebuilds
+	// the container holding it.
+	Elem ShapeFn
+
+	// Key reports the shape of the keys of the map the call produces. Lists index by position,
+	// so only map-producing calls need it.
+	Key ShapeFn
+
 	// ChargeResult adds the size of the result to the cost of the call, accounting for the
 	// allocation performed by calls which build a new string, bytes, list, or map value.
 	ChargeResult bool
 }
 
-// ResultSize returns the estimated size of the value produced by the call, and whether the
-// model was able to determine it.
-func (m Model) ResultSize(ops Operands) (Estimate, bool) {
-	if m.Result == nil {
-		return Unknown(), false
+// ResultShape returns the estimated shape of the value produced by the call, and whether the
+// model was able to determine anything about it.
+func (m Model) ResultShape(ops Operands) (Shape, bool) {
+	if m.Result == nil && m.Elem == nil && m.Key == nil {
+		return UnknownShape(), false
 	}
-	return m.Result(ops), true
+	shape := UnknownShape()
+	if m.Result != nil {
+		shape.Size = m.Result(ops)
+	}
+	if m.Elem != nil {
+		elem := m.Elem(ops)
+		shape.Elem = &elem
+		shape.kind = types.ListKind
+		index := ScalarShape(Fixed(1))
+		shape.Key = &index
+	}
+	if m.Key != nil {
+		key := m.Key(ops)
+		shape.Key = &key
+		shape.kind = types.MapKind
+	}
+	return shape, true
 }
 
 // Cost returns the cost of a call given its operands and the size of its result.
@@ -267,10 +338,10 @@ func (m Model) Cost(ops Operands, resultSize Estimate) Estimate {
 // Estimate computes the compile-time cost of a call over the estimated sizes of its operands.
 func (m Model) Estimate(ctx EstimationContext, args []ast.Expr) *CallEstimate {
 	ops := ExprOperands(ctx, args)
-	size, known := m.ResultSize(ops)
-	est := &CallEstimate{Cost: m.Cost(ops, size)}
+	shape, known := m.ResultShape(ops)
+	est := &CallEstimate{Cost: m.Cost(ops, shape.Size)}
 	if known {
-		est.ResultSize = &size
+		est.Result = &shape
 	}
 	return est
 }
@@ -365,6 +436,14 @@ func (ops *exprOperands) ElemType(i int) *types.Type {
 	return ops.ctx.ElementType(expr)
 }
 
+func (ops *exprOperands) Shape(i int) Shape {
+	expr := ops.expr(i)
+	if expr == nil {
+		return UnknownShape()
+	}
+	return ops.ctx.Shape(expr)
+}
+
 // ValOperands adapts the runtime view of a call's arguments to the Operands interface.
 func ValOperands(args []ref.Val) Operands {
 	return &valOperands{args: args}
@@ -403,6 +482,19 @@ func (ops *valOperands) Type(i int) *types.Type {
 		return nil
 	}
 	return t
+}
+
+// Shape describes a value which has already been produced, so its size is exact.
+//
+// The sizes of the values it holds are left unknown: measuring them means walking the container,
+// and a tracker never needs them, because it measures the result of a call rather than
+// predicting it from the inputs.
+func (ops *valOperands) Shape(i int) Shape {
+	val, found := ops.Value(i)
+	if !found {
+		return UnknownShape()
+	}
+	return ScalarShape(Fixed(AggregateSize(val)))
 }
 
 func (ops *valOperands) ElemType(i int) *types.Type {
