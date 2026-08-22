@@ -42,42 +42,42 @@ func TestCostShapes(t *testing.T) {
 		{name: "map index", expr: `m["k"].contains("x")`, want: rng(2, 3)},
 		{name: "nested index", expr: `nested[0][0].contains("x")`, want: rng(3, 4)},
 		{name: "map of lists", expr: `mm["k"][0].contains("x")`, want: rng(3, 4)},
-		{name: "dyn", expr: `dyn(strs)[0].contains("x")`, want: rng(3, 4)},
+		{name: "dyn", expr: `dyn(strs)[0].contains("x")`, want: rng(4, 5)},
 
 		// A value which came from one of two places is shaped like either.
-		{name: "concat", expr: `(strs + strs2)[0].contains("x")`, want: rng(4, 5)},
-		{name: "concat literal", expr: `(strs + ["lit"])[0].contains("x")`, want: rng(13, 14)},
+		{name: "concat", expr: `(strs + strs2)[0].contains("x")`, want: rng(5, 6)},
+		{name: "concat literal", expr: `(strs + ["lit"])[0].contains("x")`, want: rng(14, 15)},
 		{name: "ternary", expr: `(flag ? strs : strs2)[0].contains("x")`, want: rng(3, 4)},
 
 		// Literals describe what they hold, to any depth.
-		{name: "list of variables", expr: `[strs, strs2][0][0].contains("x")`, want: rng(14, 15)},
-		{name: "map of variables", expr: `{"a": strs}["a"][0].contains("x")`, want: rng(33, 34)},
-		{name: "nested list literal", expr: `[["hello"], ["hi"]][0][0].contains("x")`, want: fixed(33)},
+		{name: "list of variables", expr: `[strs, strs2][0][0].contains("x")`, want: rng(15, 16)},
+		{name: "map of variables", expr: `{"a": strs}["a"][0].contains("x")`, want: rng(34, 35)},
+		{name: "nested list literal", expr: `[["hello"], ["hi"]][0][0].contains("x")`, want: fixed(34)},
 
 		// A comprehension holds whatever its loop step accumulated.
-		{name: "map to scalar", expr: `strs.map(s, s + "!")[0].contains("x")`, want: rng(14, 70)},
-		{name: "map to list", expr: `strs.map(s, [s])[0][0].contains("x")`, want: rng(14, 107)},
-		{name: "map to map", expr: `strs.map(s, {"k": s})[0]["k"].contains("x")`, want: rng(14, 187)},
-		{name: "filter", expr: `strs.filter(s, s != "")[0].contains("x")`, want: rng(13, 70)},
-		{name: "map over nested", expr: `nested.map(l, l)[0][0].contains("x")`, want: rng(14, 54)},
-		{name: "nested map", expr: `nested.map(l, l.map(s, s))[0][0].contains("x")`, want: rng(14, 243)},
-		{name: "chained map", expr: `strs.map(s, s).map(s, s)[0].contains("x")`, want: rng(24, 129)},
-		{name: "map over an element", expr: `nested[0].map(s, s)[0].contains("x")`, want: rng(14, 67)},
+		{name: "map to scalar", expr: `strs.map(s, s + "!")[0].contains("x")`, want: rng(15, 71)},
+		{name: "map to list", expr: `strs.map(s, [s])[0][0].contains("x")`, want: rng(15, 108)},
+		{name: "map to map", expr: `strs.map(s, {"k": s})[0]["k"].contains("x")`, want: rng(15, 188)},
+		{name: "filter", expr: `strs.filter(s, s != "")[0].contains("x")`, want: rng(14, 71)},
+		{name: "map over nested", expr: `nested.map(l, l)[0][0].contains("x")`, want: rng(15, 55)},
+		{name: "nested map", expr: `nested.map(l, l.map(s, s))[0][0].contains("x")`, want: rng(15, 244)},
+		{name: "chained map", expr: `strs.map(s, s).map(s, s)[0].contains("x")`, want: rng(25, 130)},
+		{name: "map over an element", expr: `nested[0].map(s, s)[0].contains("x")`, want: rng(15, 68)},
 		{name: "two variable comprehension",
-			expr: `m.transformMapEntry(k, v, {k: [v]})["a"][0].contains("x")`, want: rng(34, 255)},
+			expr: `m.transformMapEntry(k, v, {k: [v]})["a"][0].contains("x")`, want: rng(35, 256)},
 
 		// A binding carries the shape of the expression it was bound to.
 		{name: "bind", expr: `cel.bind(v, strs, v[0].contains("x"))`, want: rng(13, 14)},
 		{name: "bind nested", expr: `cel.bind(v, nested, v[0][0].contains("x"))`, want: rng(14, 15)},
 
 		// Extension functions which rebuild a container hold what it held.
-		{name: "slice", expr: `strs.slice(0, 2)[0].contains("x")`, want: rng(15, 16)},
-		{name: "reverse", expr: `strs.reverse()[0].contains("x")`, want: rng(13, 18)},
-		{name: "distinct", expr: `strs.distinct()[0].contains("x")`, want: rng(13, 48)},
-		{name: "sort", expr: `strs.sort()[0].contains("x")`, want: rng(13, 48)},
-		{name: "sortBy", expr: `strs.sortBy(s, s)[0].contains("x")`, want: rng(36, 123)},
-		{name: "flatten", expr: `nested.flatten()[0].contains("x")`, want: rng(13, 17)},
-		{name: "split", expr: `strs.join(",").split(",")[0].contains("x")`, want: rng(16, 77)},
+		{name: "slice", expr: `strs.slice(0, 2)[0].contains("x")`, want: rng(16, 17)},
+		{name: "reverse", expr: `strs.reverse()[0].contains("x")`, want: rng(14, 19)},
+		{name: "distinct", expr: `strs.distinct()[0].contains("x")`, want: rng(14, 49)},
+		{name: "sort", expr: `strs.sort()[0].contains("x")`, want: rng(14, 49)},
+		{name: "sortBy", expr: `strs.sortBy(s, s)[0].contains("x")`, want: rng(37, 124)},
+		{name: "flatten", expr: `nested.flatten()[0].contains("x")`, want: rng(14, 18)},
+		{name: "split", expr: `strs.join(",").split(",")[0].contains("x")`, want: rng(17, 78)},
 	}
 	env := testShapeEnv(t)
 	hints := testShapeHints()
@@ -102,8 +102,8 @@ func TestCostShapes(t *testing.T) {
 	}
 }
 
-// TestCostShapesBracketRuntime checks that the estimates derived from element shapes still
-// contain the cost the expression actually incurs.
+// TestCostShapesBracketRuntime checks that the estimates derived from element shapes contain the
+// cost the expression actually incurs, in both directions.
 func TestCostShapesBracketRuntime(t *testing.T) {
 	exprs := []string{
 		`[{'x':4}, {'x':3}].sortBy(m, m['x']) == [{'x':3}, {'x':4}]`,
@@ -112,6 +112,15 @@ func TestCostShapesBracketRuntime(t *testing.T) {
 		`[1, 2].map(x, [x, x]).all(y, y.size() == 2)`,
 		`["a,b", "c"].map(s, s.split(","))[0].size() == 2`,
 		`cel.bind(v, [["hello"]], v[0].size() == 1)`,
+		// Qualifying a value which was computed rather than named.
+		`["hello", "hi"][0].contains("h")`,
+		`[["hello"], ["hi"]][0][0].contains("h")`,
+		`[[["hello"]]][0][0][0].contains("h")`,
+		`(["a"] + ["bb"])[1].contains("b")`,
+		`["a", "bb"].map(s, [s])[0][0].contains("a")`,
+		`has({"a": 1}.a)`,
+		// Two chains, each rooted at a value which was computed.
+		`['hello', 'hi'][0] != ['hello', 'bye'][1]`,
 	}
 	env := testShapeEnv(t)
 	hints := testShapeHints()
@@ -176,49 +185,4 @@ func rng(min, max uint64) checker.CostEstimate {
 
 func fixed(size uint64) checker.CostEstimate {
 	return checker.FixedCostEstimate(size)
-}
-
-// TestCostIndexIntoComputedValueUndercharged records a discrepancy which predates element
-// shapes and is unrelated to them: indexing a value which was computed rather than named costs
-// one unit less to estimate than it does to evaluate.
-//
-// At runtime, indexing a constructed list resolves a relative attribute, which is charged the
-// cost of an identifier, and then applies a qualifier, which is charged again. Estimation charges
-// only for the qualifier. Indexing a variable or a field agrees, because there the identifier is
-// part of the expression and is charged by both halves.
-//
-// The expressions below could not be estimated at all before element shapes were recursive, so
-// the gap had nowhere to show. This test pins it so that closing it is a deliberate change rather
-// than a surprise.
-func TestCostIndexIntoComputedValueUndercharged(t *testing.T) {
-	exprs := []string{
-		`["hello", "hi"][0].contains("x")`,
-		`[["hello"], ["hi"]][0][0].contains("x")`,
-		`(["a"] + ["bb"])[1].contains("b")`,
-		`["a", "bb"].map(s, [s])[0][0].contains("a")`,
-	}
-	env := testShapeEnv(t)
-	for _, expr := range exprs {
-		t.Run(expr, func(t *testing.T) {
-			ast, iss := env.Compile(expr)
-			if iss.Err() != nil {
-				t.Fatalf("env.Compile() failed: %v", iss.Err())
-			}
-			est, err := env.EstimateCost(ast, testShapeHints())
-			if err != nil {
-				t.Fatalf("env.EstimateCost() failed: %v", err)
-			}
-			prg, err := env.Program(ast, cel.CostTracking(nil))
-			if err != nil {
-				t.Fatalf("env.Program() failed: %v", err)
-			}
-			_, det, err := prg.Eval(cel.NoVars())
-			if err != nil {
-				t.Fatalf("prg.Eval() failed: %v", err)
-			}
-			if actual := *det.ActualCost(); actual != est.Max+1 {
-				t.Errorf("prg.Eval() cost %d, wanted one more than the estimated maximum %d", actual, est.Max)
-			}
-		})
-	}
 }

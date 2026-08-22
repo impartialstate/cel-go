@@ -18,6 +18,7 @@ import (
 	"math"
 
 	"github.com/google/cel-go/common/ast"
+	"github.com/google/cel-go/common/operators"
 	"github.com/google/cel-go/common/overloads"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
@@ -317,9 +318,11 @@ func (c *coster) costSelect(e ast.Expr) Estimate {
 		// but does not add any additional cost for the qualifier, except here we do
 		// the reverse (ident adds cost)
 		sum = sum.Add(c.presenceTestCost)
+		sum = sum.Add(c.relativeAttributeCost(sel.Operand()))
 		return sum.Add(c.cost(sel.Operand()))
 	}
 	sum = sum.Add(c.cost(sel.Operand()))
+	sum = sum.Add(c.relativeAttributeCost(sel.Operand()))
 	switch c.getType(sel.Operand()).Kind() {
 	case types.MapKind, types.StructKind, types.TypeParamKind:
 		sum = sum.Add(Fixed(SelectAndIdentCost))
@@ -361,6 +364,7 @@ func (c *coster) costCall(e ast.Expr) Estimate {
 	// Pick a cost estimate range that covers all the overload cost estimation ranges
 	fnCost := Estimate{Min: uint64(math.MaxUint64), Max: 0}
 	var resultShape *Shape
+	var indexCost Estimate
 	for _, overload := range overloadIDs {
 		overloadCost := c.functionCost(e, call.FunctionName(), overload, operands, operandCosts)
 		fnCost = fnCost.Union(overloadCost.Cost)
@@ -385,11 +389,12 @@ func (c *coster) costCall(e ast.Expr) Estimate {
 				if entry := c.Shape(args[0]).Elements(); entry.IsKnown() {
 					resultShape = &entry
 				}
+				indexCost = c.relativeAttributeCost(args[0])
 			}
 		}
 	}
 	c.setShape(e, resultShape)
-	return fnCost
+	return fnCost.Add(indexCost)
 }
 
 func (c *coster) maybeUnwrapDynCall(e ast.Expr) *Estimate {
@@ -578,6 +583,36 @@ func (c *coster) functionCost(e ast.Expr, function, overloadID string, operands 
 		model = Model{Base: CallCost}
 	}
 	return withOperands(model.Estimate(c, operands))
+}
+
+// relativeAttributeCost is the cost of qualifying a value which was computed rather than named.
+//
+// Evaluation reaches into a value by resolving an attribute and then applying qualifiers to it.
+// Resolving the attribute costs the same as resolving an identifier, and when the value being
+// qualified is named, that is exactly what it is: the cost is already charged to the identifier.
+// A value which was computed has no identifier to charge it to, so it is charged here, once for
+// the whole chain of qualifiers applied to it.
+func (c *coster) relativeAttributeCost(operand ast.Expr) Estimate {
+	if isAttributeChain(operand) {
+		return Estimate{}
+	}
+	return Fixed(SelectAndIdentCost)
+}
+
+// isAttributeChain reports whether an expression is resolved as part of a single attribute during
+// evaluation. A chain begins at an identifier, or at a ternary which selects between attributes,
+// and is extended by field selections and index operations.
+func isAttributeChain(e ast.Expr) bool {
+	switch e.Kind() {
+	case ast.IdentKind, ast.SelectKind:
+		return true
+	case ast.CallKind:
+		switch e.AsCall().FunctionName() {
+		case operators.Index, operators.Conditional:
+			return true
+		}
+	}
+	return false
 }
 
 func (c *coster) getType(e ast.Expr) *types.Type {

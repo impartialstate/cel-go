@@ -567,17 +567,17 @@ func TestCost(t *testing.T) {
 		{
 			name:   ".map list literal selection",
 			expr:   `[1,2,3,4,5].map(x, x)[4]`,
-			wanted: CostEstimate{Min: 87, Max: 87},
+			wanted: CostEstimate{Min: 88, Max: 88},
 		},
 		{
 			name:   "nested array selection",
 			expr:   `[[1,2],[1,2],[1,2],[1,2],[1,2]][4]`,
-			wanted: CostEstimate{Min: 61, Max: 61},
+			wanted: CostEstimate{Min: 62, Max: 62},
 		},
 		{
 			name:   "nested map selection",
 			expr:   `{'a': [1,2], 'b': [1,2], 'c': [1,2], 'd': [1,2], 'e': [1,2]}.b`,
-			wanted: CostEstimate{Min: 81, Max: 81},
+			wanted: CostEstimate{Min: 82, Max: 82},
 		},
 		{
 			name:   "comprehension on nested list",
@@ -622,12 +622,12 @@ func TestCost(t *testing.T) {
 		{
 			name:   "literal map access",
 			expr:   `{'hello': 'hi'}['hello'] != {'hello': 'bye'}['hello']`,
-			wanted: CostEstimate{Min: 63, Max: 63},
+			wanted: CostEstimate{Min: 65, Max: 65},
 		},
 		{
 			name:   "literal list access",
 			expr:   `['hello', 'hi'][0] != ['hello', 'bye'][1]`,
-			wanted: CostEstimate{Min: 23, Max: 23},
+			wanted: CostEstimate{Min: 25, Max: 25},
 		},
 		{
 			name:   "type call",
