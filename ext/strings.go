@@ -906,8 +906,10 @@ var stringSplit = cost.Model{
 	Base:  cost.CallCost,
 	Alloc: cost.ListCreateBaseCost,
 	// The target is scanned once, offset by one so that splitting an empty string is not free.
-	Traversed:    cost.Operand(0).Offset(1).Scale(cost.StringTraversalCostFactor),
-	Result:       cost.Operand(0).UpTo(),
+	Traversed: cost.Operand(0).Offset(1).Scale(cost.StringTraversalCostFactor),
+	Result:    cost.Operand(0).UpTo(),
+	// Splitting produces substrings of the target, none longer than the target itself.
+	Elem:         cost.Scalar(cost.Operand(0).UpTo()),
 	ChargeResult: true,
 }
 

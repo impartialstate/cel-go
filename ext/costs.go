@@ -61,24 +61,26 @@ func matchRegex(target, pattern int) cost.SizeFn {
 }
 
 // buildList describes a call which allocates a new list, where the cost of traversal and the
-// size of the resulting list are one and the same.
-func buildList(size cost.SizeFn) cost.Model {
+// size of the resulting list are one and the same, holding elements of the given shape.
+func buildList(size cost.SizeFn, elem cost.ShapeFn) cost.Model {
 	return cost.Model{
 		Base:      cost.CallCost,
 		Alloc:     cost.ListCreateBaseCost,
 		Traversed: size,
 		Result:    size,
+		Elem:      elem,
 	}
 }
 
 // compareElements describes a call which compares every element of a list operand against every
 // other element, such as a sort or a duplicate check. Comparing variable-width elements costs
 // more per comparison than comparing scalars.
-func compareElements(operand int, result cost.SizeFn) cost.Model {
+func compareElements(operand int, result cost.SizeFn, elem cost.ShapeFn) cost.Model {
 	return cost.Model{
 		Base:      cost.CallCost,
 		Alloc:     cost.ListCreateBaseCost,
 		Traversed: cost.Square(cost.Operand(operand)).ScaleBy(cost.ElementFactor(operand, 2.0)),
 		Result:    result,
+		Elem:      elem,
 	}
 }

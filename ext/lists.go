@@ -367,26 +367,31 @@ func (lib *listsLib) ProgramOptions() []cel.ProgramOption {
 // function whose only operand is the number of elements to produce.
 func listCostModels() []cost.Overload {
 	models := []cost.Overload{
-		cost.Function("list_slice", buildList(cost.Span(0, 1, 2))),
-		cost.Function("lists_range", buildList(cost.IntValue(0, math.MaxUint64))),
-		cost.Function("list_reverse", buildList(cost.Operand(0))),
-		// Flattening visits every element of the list once per level of nesting it unwraps.
-		cost.Function("list_flatten", buildList(cost.Operand(0))),
+		// Slicing, reversing and removing duplicates all hand back a list of the elements they
+		// were given, so the result holds values of the same shape.
+		cost.Function("list_slice", buildList(cost.Span(0, 1, 2), cost.ElemOf(0))),
+		cost.Function("lists_range",
+			buildList(cost.IntValue(0, math.MaxUint64), cost.Scalar(cost.Const(1)))),
+		cost.Function("list_reverse", buildList(cost.Operand(0), cost.ElemOf(0))),
+		// Flattening visits every element of the list once per level of nesting it unwraps, and
+		// the result holds what the nested lists held.
+		cost.Function("list_flatten", buildList(cost.Operand(0), cost.ElemOf(0).Elements())),
 		cost.Function("list_flatten_int",
-			buildList(cost.Operand(0).Times(cost.IntValue(1, math.MaxUint64)))),
+			buildList(cost.Operand(0).Times(cost.IntValue(1, math.MaxUint64)),
+				cost.ElemOf(0).Elements())),
 		// Removing duplicates compares every element against every other element, and produces
 		// a list which is no larger than the one it started with.
-		cost.Function("list_distinct", compareElements(0, cost.Operand(0).UpTo())),
+		cost.Function("list_distinct", compareElements(0, cost.Operand(0).UpTo(), cost.ElemOf(0))),
 	}
 	for _, t := range comparableTypes {
 		models = append(models,
 			// Sorting compares the elements of the target list against each other.
 			cost.Function(fmt.Sprintf("list_%s_sort", t.TypeName()),
-				compareElements(0, cost.Operand(0))),
+				compareElements(0, cost.Operand(0), cost.ElemOf(0))),
 			// Sorting by an associated key compares the keys rather than the elements, but the
 			// result is still the target list.
 			cost.Function(fmt.Sprintf("list_%s_sortByAssociatedKeys", t.TypeName()),
-				compareElements(1, cost.Operand(0))),
+				compareElements(1, cost.Operand(0), cost.ElemOf(0))),
 		)
 	}
 	return models

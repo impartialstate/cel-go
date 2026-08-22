@@ -20,6 +20,7 @@ import (
 
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/common/ast"
+	"github.com/google/cel-go/common/cost"
 	"github.com/google/cel-go/common/operators"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
@@ -230,8 +231,27 @@ func (*compreV2Lib) CompileOptions() []cel.EnvOption {
 					return tm
 				})),
 		),
+		cel.CostEstimatorOptions(cost.Estimators(comprehensionCostModels...)...),
 	}
 	return opts
+}
+
+// comprehensionCostModels describes the map insertion which two variable comprehensions
+// accumulate into. Insertion is O(1), but the shape of the merged map is what carries the sizes
+// of the transformed keys and values out of the comprehension.
+var comprehensionCostModels = []cost.Overload{
+	cost.Function(mapInsertOverloadKeyValue, cost.Model{
+		Base:   cost.CallCost,
+		Result: cost.Operand(0).Offset(1),
+		Key:    cost.Widest(cost.KeyOf(0), cost.ShapeOf(1)),
+		Elem:   cost.Widest(cost.ElemOf(0), cost.ShapeOf(2)),
+	}),
+	cost.Function(mapInsertOverloadMap, cost.Model{
+		Base:   cost.CallCost,
+		Result: cost.Sum(cost.Operand(0), cost.Operand(1)),
+		Key:    cost.Widest(cost.KeyOf(0), cost.KeyOf(1)),
+		Elem:   cost.Widest(cost.ElemOf(0), cost.ElemOf(1)),
+	}),
 }
 
 // ProgramOptions implements the cel.Library interface method

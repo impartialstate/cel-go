@@ -337,10 +337,12 @@ var regexCostModels = []cost.Overload{
 	// Extracting every match allocates a list of substrings which together are no larger than
 	// the target.
 	cost.Function("regex_extractAll_string_string", cost.Model{
-		Base:         cost.CallCost,
-		Alloc:        cost.ListCreateBaseCost,
-		Traversed:    matchRegex(0, 1),
-		Result:       cost.Operand(0).UpTo(),
+		Base:      cost.CallCost,
+		Alloc:     cost.ListCreateBaseCost,
+		Traversed: matchRegex(0, 1),
+		Result:    cost.Operand(0).UpTo(),
+		// Every match is a substring of the target.
+		Elem:         cost.Scalar(cost.Operand(0).UpTo()),
 		ChargeResult: true,
 	}),
 	cost.Function("regex_replace_string_string_string", regexReplaceCost),
