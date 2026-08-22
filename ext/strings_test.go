@@ -903,7 +903,7 @@ func TestStringCostTracking(t *testing.T) {
 		{
 			name:          "join",
 			expr:          `["a", "b", "c", "d", "e"].join("-")`,
-			estimatedCost: checker.CostEstimate{Min: 12, Max: 23},
+			estimatedCost: checker.CostEstimate{Min: 12, Max: 22},
 			actualCost:    21,
 		},
 		{

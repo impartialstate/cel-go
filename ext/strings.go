@@ -921,13 +921,14 @@ var stringJoin = cost.Model{
 	ChargeResult: true,
 }
 
-// joinedSize bounds the size of a join by the size of the list times the largest element and
-// separator it could hold.
+// joinedSize bounds the size of a join by every element the list holds plus a separator between
+// each pair of them.
 func joinedSize(ops cost.Operands) cost.Estimate {
+	list := ops.Shape(0)
 	sep := cost.Fixed(0)
 	if ops.Len() > 1 {
 		sep = ops.Size(1)
 	}
-	elems := cost.Multiply(ops.Size(0).Max, cost.Add(1, sep.Max))
-	return cost.Ranged(0, cost.Add(elems, sep.Max))
+	elems := cost.Multiply(list.Size.Max, list.Elements().Size.Max)
+	return cost.Ranged(0, cost.Add(elems, cost.Multiply(list.Size.Max, sep.Max)))
 }

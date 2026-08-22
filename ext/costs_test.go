@@ -77,7 +77,7 @@ func TestCostShapes(t *testing.T) {
 		{name: "sort", expr: `strs.sort()[0].contains("x")`, want: rng(13, 48)},
 		{name: "sortBy", expr: `strs.sortBy(s, s)[0].contains("x")`, want: rng(36, 123)},
 		{name: "flatten", expr: `nested.flatten()[0].contains("x")`, want: rng(13, 17)},
-		{name: "split", expr: `strs.join(",").split(",")[0].contains("x")`, want: rng(16, 35)},
+		{name: "split", expr: `strs.join(",").split(",")[0].contains("x")`, want: rng(16, 77)},
 	}
 	env := testShapeEnv(t)
 	hints := testShapeHints()
