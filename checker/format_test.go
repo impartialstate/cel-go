@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/google/cel-go/checker/decls"
+	"github.com/google/cel-go/common"
 	"github.com/google/cel-go/common/types"
 )
 
@@ -61,7 +62,7 @@ func TestFormatType(t *testing.T) {
 
 func TestFormatFunctionType(t *testing.T) {
 	// native type representation of function(string, int) -> bool
-	ct := FormatCELType(newFunctionType(types.BoolType, types.StringType, types.IntType))
+	ct := FormatCELType(newFunctionType(common.UnknownCallEstimate(), types.BoolType, types.StringType, types.IntType))
 	// protobuf-based function type
 	et := FormatCheckedType(decls.NewFunctionType(decls.Bool, decls.String, decls.Int))
 	if ct != et {

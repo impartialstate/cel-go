@@ -575,9 +575,11 @@ Examples:
 
     [1, 3, 2].sortWith(greaterThan) // return [3, 2, 1] for a greaterThan of (int, int) -> bool
 
-Note, the cost of the function value invoked by `map()`, `filter()`, `sortBy()`
-and `sortWith()` is not included in the cost estimate or the runtime cost of the
-call itself.
+The cost of the function value invoked by `map()`, `filter()`, `sortBy()` and
+`sortWith()` is included in both the cost estimate and the runtime cost of the
+call: one invocation per element for `map()`, `filter()` and `sortBy()`, and
+O(n^2) comparisons for `sortWith()`. A function value which does not declare a
+cost is charged a baseline cost of one per invocation.
 
 ### Last
 

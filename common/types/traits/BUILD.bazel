@@ -25,6 +25,7 @@ go_library(
     ],
     importpath = "github.com/google/cel-go/common/types/traits",
     deps = [
+        "//common/functions:go_default_library",
         "//common/types/ref:go_default_library",
     ],
 )

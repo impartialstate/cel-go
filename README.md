@@ -149,14 +149,15 @@ function value is supplied at evaluation time and may be called from within the
 expression:
 
 ```go
-env, _ := cel.NewEnv(
-    cel.Variable("cmp", cel.FunctionType(cel.BoolType, cel.IntType, cel.IntType)),
-)
+cmpType := cel.FunctionType(
+    cel.FixedCallEstimate(2), // the cost of one invocation
+    cel.BoolType, cel.IntType, cel.IntType)
+env, _ := cel.NewEnv(cel.Variable("cmp", cmpType))
+
 // The expression `cmp(1, 2)` invokes the value bound to `cmp` at evaluation
 // time, which is created with cel.FunctionVal:
-lessThan := cel.FunctionVal("cmp",
-    cel.FunctionType(cel.BoolType, cel.IntType, cel.IntType),
-    func(args ...ref.Val) ref.Val {
+lessThan := cel.FunctionVal("cmp", cmpType, cel.FixedCallEstimate(2),
+    func(frame cel.ExecutionFrame, args ...ref.Val) ref.Val {
         return types.Bool(args[0].(types.Int) < args[1].(types.Int))
     })
 ```
@@ -168,6 +169,53 @@ most general signature which describes them all; overloads which accept
 differing numbers of arguments cannot be referenced. Note also that function
 references and the invocation of function values are resolved by the
 type-checker, so they are not available in parse-only expressions.
+
+##### Cost of a function value
+
+Every function type and function value declares the cost of a single
+invocation and the size of its result, so that calls made through a function
+value are accounted for by both cost estimation and runtime cost tracking. A
+declared function makes its cost referenceable with `cel.OverloadCallEstimate`:
+
+```go
+cel.Function("expensive",
+    cel.Overload("expensive_int", []*cel.Type{cel.IntType}, cel.IntType,
+        cel.OverloadCallEstimate(cel.FixedCallEstimate(10)),
+        cel.UnaryBinding(expensiveImpl)))
+```
+
+The declared cost becomes part of the function type produced when the function
+is referenced by name, so a higher-order function can estimate the calls it
+will make from the type of its argument, e.g. with
+`types.FunctionCallEstimate(arg.Type())` inside a
+`checker.OverloadCostEstimate`. At evaluation time each invocation charges the
+value's declared cost against the evaluation's budget, so a cost limit also
+covers work done inside a higher-order call. Values which declare
+`cel.UnknownCallEstimate()` are charged a baseline cost of one per invocation.
+
+##### Writing a higher-order function
+
+An implementation which invokes a function value needs the execution frame of
+the evaluation which called it, because the frame is what accounts for the cost
+of the invocation. Declare it with `cel.FrameBinding`:
+
+```go
+cel.Function("applyTwice",
+    cel.Overload("apply_twice_int",
+        []*cel.Type{
+            cel.FunctionType(cel.UnknownCallEstimate(), cel.IntType, cel.IntType),
+            cel.IntType,
+        },
+        cel.IntType,
+        cel.FrameBinding(func(frame cel.ExecutionFrame, args ...ref.Val) ref.Val {
+            fn := args[0].(traits.Invoker)
+            return fn.Invoke(frame, fn.Invoke(frame, args[1]))
+        })))
+```
+
+The frame also exposes the evaluation's variable bindings through
+`ResolveName`, and lets an implementation charge for its own work with
+`ChargeCost`.
 
 ### Evaluate
 

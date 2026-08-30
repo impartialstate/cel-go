@@ -17,6 +17,7 @@ package cel
 import (
 	"fmt"
 
+	"github.com/google/cel-go/common"
 	"github.com/google/cel-go/common/ast"
 	"github.com/google/cel-go/common/decls"
 	"github.com/google/cel-go/common/functions"
@@ -140,6 +141,22 @@ var (
 
 // Type holds a reference to a runtime type with an optional type-checked set of type parameters.
 type Type = types.Type
+
+// ExecutionFrame provides a function implementation with access to the evaluation which invoked
+// it, and is what accounts for the cost of invoking a function value.
+type ExecutionFrame = functions.ExecutionFrame
+
+// CallEstimate declares the cost of a single invocation of a function and the size of its result.
+type CallEstimate = common.CallEstimate
+
+var (
+	// UnknownCallEstimate returns a call estimate with an unknown cost and result size.
+	UnknownCallEstimate = common.UnknownCallEstimate
+	// FixedCallEstimate returns a call estimate with a fixed cost and no result size estimate.
+	FixedCallEstimate = common.FixedCallEstimate
+	// FixedCallEstimateWithSize returns a call estimate with a fixed cost and result size.
+	FixedCallEstimateWithSize = common.FixedCallEstimateWithSize
+)
 
 // Constant creates an instances of an identifier declaration with a variable name, type, and value.
 func Constant(name string, t *Type, v ref.Val) EnvOption {
@@ -289,6 +306,12 @@ func SingletonFunctionImpl(fn functions.FunctionOp, traits ...int) FunctionOpt {
 	return decls.SingletonFunctionBinding(fn, traits...)
 }
 
+// SingletonFrameBinding creates a singleton function definition which receives the execution frame
+// of the evaluation which invoked it in addition to the call arguments.
+func SingletonFrameBinding(fn functions.FrameOp, traits ...int) FunctionOpt {
+	return decls.SingletonFrameBinding(fn, traits...)
+}
+
 // SingletonFunctionBinding creates a singleton function definition to be used with all function overloads.
 //
 // Note, this approach works well if operand is expected to have a specific trait which it implements,
@@ -347,6 +370,26 @@ func BinaryBinding(binding functions.BinaryOp) OverloadOpt {
 // type-guard which ensures runtime type agreement between the overload signature and runtime argument types.
 func FunctionBinding(binding functions.FunctionOp) OverloadOpt {
 	return decls.FunctionBinding(binding)
+}
+
+// FrameBinding provides the implementation of an overload which requires access to the execution
+// frame of the evaluation which invoked it.
+//
+// A frame binding is what allows a function implementation to invoke a function value it has been
+// given, e.g. the comparator in `list.sortWith(cmp)`, as the frame accounts for the cost of the
+// invocation. The provided function is protected by a runtime type-guard which ensures runtime
+// type agreement between the overload's arguments and the argument values supplied at call time.
+func FrameBinding(binding functions.FrameOp) OverloadOpt {
+	return decls.FrameBinding(binding)
+}
+
+// OverloadCallEstimate declares the cost of a single invocation of the overload and the size of
+// its result, which permits the overload to be referenced as a function value.
+//
+// The cost excludes the cost of evaluating the arguments to the call. The result size should only
+// be provided when the overload returns a string, bytes, list, or map.
+func OverloadCallEstimate(estimate CallEstimate) OverloadOpt {
+	return decls.OverloadCallEstimate(estimate)
 }
 
 // LateFunctionBinding indicates that the function has a binding which is not known at compile time.

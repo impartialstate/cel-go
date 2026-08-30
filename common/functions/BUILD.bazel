@@ -8,6 +8,7 @@ package(
 go_library(
     name = "go_default_library",
     srcs = [
+        "frame.go",
         "functions.go",
     ],
     importpath = "github.com/google/cel-go/common/functions",

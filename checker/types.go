@@ -15,6 +15,7 @@
 package checker
 
 import (
+	"github.com/google/cel-go/common"
 	"github.com/google/cel-go/common/types"
 )
 
@@ -284,7 +285,13 @@ func substitute(m *mapping, t *types.Type, typeParamToDyn bool) *types.Type {
 	}
 	switch kind {
 	case types.OpaqueKind:
-		return types.NewOpaqueType(t.TypeName(), substituteParams(m, t.Parameters(), typeParamToDyn)...)
+		params := substituteParams(m, t.Parameters(), typeParamToDyn)
+		if types.IsFunctionType(t) {
+			// Function types carry a declared call estimate which must be preserved through
+			// substitution.
+			return types.NewFunctionType(types.FunctionCallEstimate(t), params[0], params[1:]...)
+		}
+		return types.NewOpaqueType(t.TypeName(), params...)
 	case types.ListKind:
 		return types.NewListType(substitute(m, t.Parameters()[0], typeParamToDyn))
 	case types.MapKind:
@@ -309,6 +316,6 @@ func substituteParams(m *mapping, typeParams []*types.Type, typeParamToDyn bool)
 	return subParams
 }
 
-func newFunctionType(resultType *types.Type, argTypes ...*types.Type) *types.Type {
-	return types.NewFunctionType(resultType, argTypes...)
+func newFunctionType(estimate common.CallEstimate, resultType *types.Type, argTypes ...*types.Type) *types.Type {
+	return types.NewFunctionType(estimate, resultType, argTypes...)
 }

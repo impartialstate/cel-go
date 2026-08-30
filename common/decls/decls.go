@@ -342,6 +342,7 @@ func (f *FunctionDecl) Bindings() ([]*functions.Overload, error) {
 				Unary:        o.guardedUnaryOp(f.Name(), f.disableTypeGuards),
 				Binary:       o.guardedBinaryOp(f.Name(), f.disableTypeGuards),
 				Function:     o.guardedFunctionOp(f.Name(), f.disableTypeGuards),
+				Frame:        o.guardedFrameOp(f.Name(), f.disableTypeGuards),
 				OperandTrait: o.OperandTrait(),
 				NonStrict:    o.IsNonStrict(),
 			}
@@ -362,6 +363,7 @@ func (f *FunctionDecl) Bindings() ([]*functions.Overload, error) {
 				Unary:        f.singleton.Unary,
 				Binary:       f.singleton.Binary,
 				Function:     f.singleton.Function,
+				Frame:        f.singleton.Frame,
 				OperandTrait: f.singleton.OperandTrait,
 			},
 		}
@@ -380,6 +382,7 @@ func (f *FunctionDecl) Bindings() ([]*functions.Overload, error) {
 			Unary:        overloads[0].Unary,
 			Binary:       overloads[0].Binary,
 			Function:     overloads[0].Function,
+			Frame:        overloads[0].Frame,
 			NonStrict:    overloads[0].NonStrict,
 			OperandTrait: overloads[0].OperandTrait,
 		}), nil
@@ -387,7 +390,11 @@ func (f *FunctionDecl) Bindings() ([]*functions.Overload, error) {
 	// All of the defined overloads are wrapped into a top-level function which
 	// performs dynamic dispatch to the proper overload based on the argument types.
 	bindings := append([]*functions.Overload{}, overloads...)
-	funcDispatch := func(args ...ref.Val) ref.Val {
+	hasFrameBinding := false
+	for _, oID := range f.overloadOrdinals {
+		hasFrameBinding = hasFrameBinding || f.overloads[oID].HasFrameBinding()
+	}
+	funcDispatch := func(frame functions.ExecutionFrame, args ...ref.Val) ref.Val {
 		for _, oID := range f.overloadOrdinals {
 			o := f.overloads[oID]
 			// During dynamic dispatch over multiple functions, signature agreement checks
@@ -405,14 +412,25 @@ func (f *FunctionDecl) Bindings() ([]*functions.Overload, error) {
 			if o.functionOp != nil && o.matchesRuntimeSignature(f.disableTypeGuards, args...) {
 				return o.functionOp(args...)
 			}
+			if o.frameOp != nil && o.matchesRuntimeSignature(f.disableTypeGuards, args...) {
+				return o.frameOp(frame, args...)
+			}
 			// eventually this will fall through to the noSuchOverload below.
 		}
 		return MaybeNoSuchOverload(f.Name(), args...)
 	}
 	function := &functions.Overload{
 		Operator:  f.Name(),
-		Function:  funcDispatch,
 		NonStrict: nonStrict,
+	}
+	// When any overload requires the execution frame, dispatch over the overload set must also
+	// receive the frame so that it can be handed on to the matching implementation.
+	if hasFrameBinding {
+		function.Frame = funcDispatch
+	} else {
+		function.Function = func(args ...ref.Val) ref.Val {
+			return funcDispatch(nil, args...)
+		}
 	}
 	return append(bindings, function), nil
 }
@@ -538,6 +556,26 @@ func SingletonFunctionBinding(fn functions.FunctionOp, traits ...int) FunctionOp
 	}
 }
 
+// SingletonFrameBinding creates a singleton function definition which receives the execution frame
+// of the evaluation which invoked it in addition to the call arguments.
+func SingletonFrameBinding(fn functions.FrameOp, traits ...int) FunctionOpt {
+	trait := 0
+	for _, t := range traits {
+		trait = trait | t
+	}
+	return func(f *FunctionDecl) (*FunctionDecl, error) {
+		if f.singleton != nil {
+			return nil, fmt.Errorf("function already has a singleton binding: %s", f.Name())
+		}
+		f.singleton = &functions.Overload{
+			Operator:     f.Name(),
+			Frame:        fn,
+			OperandTrait: trait,
+		}
+		return f, nil
+	}
+}
+
 // Overload defines a new global overload with an overload id, argument types, and result type. Through the
 // use of OverloadOpt options, the overload may also be configured with a binding, an operand trait, and to
 // be non-strict.
@@ -586,6 +624,7 @@ func newOverloadInternal(overloadID string,
 		argTypes:         args,
 		resultType:       resultType,
 		isMemberFunction: memberFunction,
+		callEstimate:     common.UnknownCallEstimate(),
 	}
 	var err error
 	for _, opt := range opts {
@@ -622,6 +661,12 @@ type OverloadDecl struct {
 	binaryOp functions.BinaryOp
 	// functionOp is a catch-all for zero-arity and three-plus arity functions.
 	functionOp functions.FunctionOp
+	// frameOp is a binding which receives the execution frame of the evaluation which invoked it.
+	frameOp functions.FrameOp
+
+	// callEstimate declares the cost of a single invocation of the overload and the size of its
+	// result, which is what makes the overload referenceable as a function value.
+	callEstimate common.CallEstimate
 }
 
 // Examples returns a list of string examples for the overload.
@@ -750,7 +795,24 @@ func (o *OverloadDecl) SignatureOverlaps(other *OverloadDecl) bool {
 
 // HasBinding indicates whether the overload already has a definition.
 func (o *OverloadDecl) HasBinding() bool {
-	return o != nil && (o.unaryOp != nil || o.binaryOp != nil || o.functionOp != nil)
+	return o != nil && (o.unaryOp != nil || o.binaryOp != nil || o.functionOp != nil || o.frameOp != nil)
+}
+
+// HasFrameBinding indicates whether the overload implementation requires the execution frame.
+func (o *OverloadDecl) HasFrameBinding() bool {
+	return o != nil && o.frameOp != nil
+}
+
+// CallEstimate returns the declared cost of invoking the overload and the size of its result.
+//
+// The estimate is used when the overload is referenced as a function value, as neither the
+// type-checker nor the runtime can otherwise attribute a cost to a call which is made from within
+// another function implementation.
+func (o *OverloadDecl) CallEstimate() common.CallEstimate {
+	if o == nil {
+		return common.UnknownCallEstimate()
+	}
+	return o.callEstimate
 }
 
 // guardedUnaryOp creates an invocation guard around the provided unary operator, if one is defined.
@@ -789,6 +851,19 @@ func (o *OverloadDecl) guardedFunctionOp(funcName string, disableTypeGuards bool
 			return MaybeNoSuchOverload(funcName, args...)
 		}
 		return o.functionOp(args...)
+	}
+}
+
+// guardedFrameOp creates an invocation guard around the provided frame binding, if one is provided.
+func (o *OverloadDecl) guardedFrameOp(funcName string, disableTypeGuards bool) functions.FrameOp {
+	if o.frameOp == nil {
+		return nil
+	}
+	return func(frame functions.ExecutionFrame, args ...ref.Val) ref.Val {
+		if !o.matchesRuntimeSignature(disableTypeGuards, args...) {
+			return MaybeNoSuchOverload(funcName, args...)
+		}
+		return o.frameOp(frame, args...)
 	}
 }
 
@@ -905,6 +980,34 @@ func LateFunctionBinding() OverloadOpt {
 			return nil, fmt.Errorf("overload already has a binding: %s", o.ID())
 		}
 		o.hasLateBinding = true
+		return o, nil
+	}
+}
+
+// FrameBinding provides the implementation of an overload which requires access to the execution
+// frame of the evaluation which invoked it, e.g. a higher-order function which invokes a function
+// value supplied as one of its arguments.
+func FrameBinding(binding functions.FrameOp) OverloadOpt {
+	return func(o *OverloadDecl) (*OverloadDecl, error) {
+		if o.hasLateBinding {
+			return nil, fmt.Errorf("overload already has a late binding: %s", o.ID())
+		}
+		if o.frameOp != nil {
+			return nil, fmt.Errorf("overload already has a frame binding: %s", o.ID())
+		}
+		o.frameOp = binding
+		return o, nil
+	}
+}
+
+// OverloadCallEstimate declares the cost of a single invocation of the overload and the size of
+// its result, which permits the overload to be referenced as a function value.
+//
+// The cost excludes the cost of evaluating the arguments to the call. The result size should only
+// be provided when the overload returns a string, bytes, list, or map.
+func OverloadCallEstimate(estimate common.CallEstimate) OverloadOpt {
+	return func(o *OverloadDecl) (*OverloadDecl, error) {
+		o.callEstimate = estimate
 		return o, nil
 	}
 }

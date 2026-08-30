@@ -674,26 +674,26 @@ func TestListsHigherOrderFunctionCosts(t *testing.T) {
 		{
 			name:          "list_map_function",
 			expr:          `[1, 2, 3].map(twice) == [2, 4, 6]`,
-			estimatedCost: checker.FixedCostEstimate(36),
-			actualCost:    35,
+			estimatedCost: checker.FixedCostEstimate(38),
+			actualCost:    38,
 		},
 		{
 			name:          "list_filter_function",
 			expr:          `[1, 2, 3].filter(isOdd) == [1, 3]`,
-			estimatedCost: checker.FixedCostEstimate(36),
-			actualCost:    35,
+			estimatedCost: checker.FixedCostEstimate(38),
+			actualCost:    38,
 		},
 		{
 			name:          "list_sortBy_function",
 			expr:          `[1, 2, 3].sortBy(twice) == [1, 2, 3]`,
-			estimatedCost: checker.FixedCostEstimate(51),
-			actualCost:    50,
+			estimatedCost: checker.FixedCostEstimate(53),
+			actualCost:    53,
 		},
 		{
 			name:          "list_sortWith_function",
 			expr:          `[1, 2, 3].sortWith(greaterThan) == [3, 2, 1]`,
-			estimatedCost: checker.FixedCostEstimate(51),
-			actualCost:    50,
+			estimatedCost: checker.FixedCostEstimate(59),
+			actualCost:    53,
 		},
 	}
 	for _, tst := range tests {

@@ -211,8 +211,10 @@ var comparableTypes = []*cel.Type{
 //
 //	[1, 3, 2].sortWith(greaterThan) // return [3, 2, 1] for a greaterThan of (int, int) -> bool
 //
-// Note, the cost of the function value invoked by map(), filter(), sortBy() and sortWith() is not
-// included in the cost estimate or the runtime cost of the call itself.
+// The cost of the function value invoked by map(), filter(), sortBy() and sortWith() is included
+// in both the cost estimate and the runtime cost of the call: one invocation per element for
+// map(), filter() and sortBy(), and O(n^2) comparisons for sortWith(). A function value which does
+// not declare a cost is charged a baseline cost of one per invocation.
 func Lists(options ...ListsOption) cel.EnvOption {
 	l := &listsLib{version: math.MaxUint32}
 	for _, o := range options {
@@ -432,13 +434,13 @@ func (lib listsLib) CompileOptions() []cel.EnvOption {
 			estimators = append(estimators,
 				checker.OverloadCostEstimate("list_map_function", estimateListTraversal),
 				checker.OverloadCostEstimate("list_filter_function", estimateListTraversal),
-				checker.OverloadCostEstimate("list_sortWith_function", estimateListSortFunction(types.DynType)),
+				checker.OverloadCostEstimate("list_sortWith_function", estimateListSortWithFunction),
 			)
 			for _, t := range comparableTypes {
 				estimators = append(estimators,
 					checker.OverloadCostEstimate(
 						fmt.Sprintf("list_%s_sortBy_function", t.TypeName()),
-						estimateListSortFunction(t),
+						estimateListSortByFunction(t),
 					),
 				)
 			}
@@ -449,19 +451,23 @@ func (lib listsLib) CompileOptions() []cel.EnvOption {
 		listU := cel.ListType(cel.TypeParamType("U"))
 		paramT := cel.TypeParamType("T")
 		paramU := cel.TypeParamType("U")
+		// The function values accepted by the higher-order list functions may have any cost, so
+		// the declared parameter types leave the estimate unknown and the cost of each call is
+		// taken from the function value supplied at the call site.
+		anyCost := cel.UnknownCallEstimate()
 		opts = append(opts, cel.Function("map",
 			cel.MemberOverload("list_map_function",
-				[]*cel.Type{listType, cel.FunctionType(paramU, paramT)}, listU,
-				cel.BinaryBinding(func(arg1, arg2 ref.Val) ref.Val {
-					return mapListWithFunction(arg1, arg2)
+				[]*cel.Type{listType, cel.FunctionType(anyCost, paramU, paramT)}, listU,
+				cel.FrameBinding(func(frame cel.ExecutionFrame, args ...ref.Val) ref.Val {
+					return mapListWithFunction(frame, args[0], args[1])
 				}),
 			),
 		))
 		opts = append(opts, cel.Function("filter",
 			cel.MemberOverload("list_filter_function",
-				[]*cel.Type{listType, cel.FunctionType(cel.BoolType, paramT)}, listType,
-				cel.BinaryBinding(func(arg1, arg2 ref.Val) ref.Val {
-					return filterListWithFunction(arg1, arg2)
+				[]*cel.Type{listType, cel.FunctionType(anyCost, cel.BoolType, paramT)}, listType,
+				cel.FrameBinding(func(frame cel.ExecutionFrame, args ...ref.Val) ref.Val {
+					return filterListWithFunction(frame, args[0], args[1])
 				}),
 			),
 		))
@@ -470,12 +476,12 @@ func (lib listsLib) CompileOptions() []cel.EnvOption {
 				templatedOverloads(comparableTypes, func(u *cel.Type) cel.FunctionOpt {
 					return cel.MemberOverload(
 						fmt.Sprintf("list_%s_sortBy_function", u.TypeName()),
-						[]*cel.Type{listType, cel.FunctionType(u, paramT)}, listType,
+						[]*cel.Type{listType, cel.FunctionType(anyCost, u, paramT)}, listType,
 					)
 				}),
-				cel.SingletonBinaryBinding(
-					func(arg1, arg2 ref.Val) ref.Val {
-						return sortListByKeyFunction(arg1, arg2)
+				cel.SingletonFrameBinding(
+					func(frame cel.ExecutionFrame, args ...ref.Val) ref.Val {
+						return sortListByKeyFunction(frame, args[0], args[1])
 					},
 					// List traits
 					traits.ListerType,
@@ -484,9 +490,9 @@ func (lib listsLib) CompileOptions() []cel.EnvOption {
 		))
 		opts = append(opts, cel.Function("sortWith",
 			cel.MemberOverload("list_sortWith_function",
-				[]*cel.Type{listType, cel.FunctionType(cel.BoolType, paramT, paramT)}, listType,
-				cel.BinaryBinding(func(arg1, arg2 ref.Val) ref.Val {
-					return sortListWithComparator(arg1, arg2)
+				[]*cel.Type{listType, cel.FunctionType(anyCost, cel.BoolType, paramT, paramT)}, listType,
+				cel.FrameBinding(func(frame cel.ExecutionFrame, args ...ref.Val) ref.Val {
+					return sortListWithComparator(frame, args[0], args[1])
 				}),
 			),
 		))
@@ -631,14 +637,14 @@ func asListAndInvoker(fnName string, listArg, fnArg ref.Val) (traits.Lister, tra
 // Example:
 //
 //	[1, 2, 3].map(double) // return [2, 4, 6] for a 'double' function of (int) -> int
-func mapListWithFunction(listArg, fnArg ref.Val) ref.Val {
+func mapListWithFunction(frame cel.ExecutionFrame, listArg, fnArg ref.Val) ref.Val {
 	list, fn, err := asListAndInvoker("map", listArg, fnArg)
 	if err != nil {
 		return err
 	}
 	mapped := make([]ref.Val, 0, list.Size().(types.Int))
 	for it := list.Iterator(); it.HasNext() == types.True; {
-		elem := fn.Invoke(it.Next())
+		elem := fn.Invoke(frame, it.Next())
 		if types.IsUnknownOrError(elem) {
 			return elem
 		}
@@ -655,7 +661,7 @@ func mapListWithFunction(listArg, fnArg ref.Val) ref.Val {
 // Example:
 //
 //	[1, 2, 3].filter(isOdd) // return [1, 3] for an 'isOdd' function of (int) -> bool
-func filterListWithFunction(listArg, fnArg ref.Val) ref.Val {
+func filterListWithFunction(frame cel.ExecutionFrame, listArg, fnArg ref.Val) ref.Val {
 	list, fn, err := asListAndInvoker("filter", listArg, fnArg)
 	if err != nil {
 		return err
@@ -663,7 +669,7 @@ func filterListWithFunction(listArg, fnArg ref.Val) ref.Val {
 	filtered := []ref.Val{}
 	for it := list.Iterator(); it.HasNext() == types.True; {
 		elem := it.Next()
-		keep := fn.Invoke(elem)
+		keep := fn.Invoke(frame, elem)
 		if types.IsUnknownOrError(keep) {
 			return keep
 		}
@@ -687,14 +693,14 @@ func filterListWithFunction(listArg, fnArg ref.Val) ref.Val {
 // Example:
 //
 //	["foo", "ba", "c"].sortBy(size) // return ["c", "ba", "foo"]
-func sortListByKeyFunction(listArg, fnArg ref.Val) ref.Val {
+func sortListByKeyFunction(frame cel.ExecutionFrame, listArg, fnArg ref.Val) ref.Val {
 	list, fn, err := asListAndInvoker("sortBy", listArg, fnArg)
 	if err != nil {
 		return err
 	}
 	keys := make([]ref.Val, 0, list.Size().(types.Int))
 	for it := list.Iterator(); it.HasNext() == types.True; {
-		key := fn.Invoke(it.Next())
+		key := fn.Invoke(frame, it.Next())
 		if types.IsUnknownOrError(key) {
 			return key
 		}
@@ -718,7 +724,7 @@ func sortListByKeyFunction(listArg, fnArg ref.Val) ref.Val {
 // Example:
 //
 //	[1, 3, 2].sortWith(greaterThan) // return [3, 2, 1]
-func sortListWithComparator(listArg, fnArg ref.Val) ref.Val {
+func sortListWithComparator(frame cel.ExecutionFrame, listArg, fnArg ref.Val) ref.Val {
 	list, cmp, err := asListAndInvoker("sortWith", listArg, fnArg)
 	if err != nil {
 		return err
@@ -732,7 +738,7 @@ func sortListWithComparator(listArg, fnArg ref.Val) ref.Val {
 		if failure != nil {
 			return false
 		}
-		ordered := cmp.Invoke(elems[i], elems[j])
+		ordered := cmp.Invoke(frame, elems[i], elems[j])
 		if types.IsUnknownOrError(ordered) {
 			failure = ordered
 			return false
@@ -964,17 +970,30 @@ func estimateListSortBy(u *types.Type) checker.FunctionEstimator {
 	}
 }
 
-// estimateListSortFunction computes an O(n^2) sort operation over the target list for the sorts
-// which take a key or comparator function value as their single argument.
-//
-// Note, the cost of the function value itself is not known statically and is not included.
-func estimateListSortFunction(elemType *types.Type) checker.FunctionEstimator {
+// estimateListSortByFunction computes an O(n^2) sort over the keys produced by invoking the key
+// function value once per element of the target list.
+func estimateListSortByFunction(keyType *types.Type) checker.FunctionEstimator {
 	return func(estimator checker.CostEstimator, target *checker.AstNode, args []checker.AstNode) *checker.CallEstimate {
 		if target == nil || len(args) != 1 {
 			return nil
 		}
-		return estimateListSortCost(estimator, *target, elemType)
+		est := estimateListSortCost(estimator, *target, keyType)
+		sz := estimateSize(estimator, *target)
+		est.CostEstimate = est.CostEstimate.Add(sz.MultiplyByCost(calleeCallCost(args[0])))
+		return est
 	}
+}
+
+// estimateListSortWithFunction computes an O(n^2) sort of the target list in which each of the
+// comparisons is an invocation of the comparator function value.
+func estimateListSortWithFunction(estimator checker.CostEstimator, target *checker.AstNode, args []checker.AstNode) *checker.CallEstimate {
+	if target == nil || len(args) != 1 {
+		return nil
+	}
+	est := estimateListSortCost(estimator, *target, types.DynType)
+	sz := estimateSize(estimator, *target)
+	est.CostEstimate = est.CostEstimate.Add(sz.Multiply(sz).MultiplyByCost(calleeCallCost(args[0])))
+	return est
 }
 
 // estimateListSortCost estimates an O(n^2) sort operation with a cost factor of 2 for the equality
@@ -989,15 +1008,28 @@ func estimateListSortCost(estimator checker.CostEstimator, node checker.AstNode,
 	return estimateAllocatingListCall(costFactor, sz.Multiply(sz))
 }
 
-// estimateListTraversal computes an O(n) traversal of the target list with a cost factor of 1.
-//
-// Note, the cost of the function value invoked for each element is not known statically and is
-// not included in the estimate.
+// estimateListTraversal computes an O(n) traversal of the target list with a cost factor of 1,
+// invoking the function value argument once per element.
 func estimateListTraversal(estimator checker.CostEstimator, target *checker.AstNode, args []checker.AstNode) *checker.CallEstimate {
 	if target == nil || len(args) != 1 {
 		return nil
 	}
-	return estimateAllocatingListCall(1, estimateSize(estimator, *target))
+	sz := estimateSize(estimator, *target)
+	est := estimateAllocatingListCall(1, sz)
+	est.CostEstimate = est.CostEstimate.Add(sz.MultiplyByCost(calleeCallCost(args[0])))
+	return est
+}
+
+// calleeCallCost returns the cost declared by the function type of a function value argument.
+//
+// Function values which do not declare a cost are charged the same baseline cost that they are
+// charged at runtime.
+func calleeCallCost(arg checker.AstNode) checker.CostEstimate {
+	estimate := types.FunctionCallEstimate(arg.Type())
+	if estimate.IsUnknown() {
+		return checker.FixedCostEstimate(types.DefaultCallCost)
+	}
+	return estimate.CostEstimate
 }
 
 // estimateAllocatingListCall computes cost as a function of the size of the result list with a

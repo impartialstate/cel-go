@@ -20,6 +20,7 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//common:go_default_library",
+        "//common/overloads:go_default_library",
         "//common/ast:go_default_library",
         "//common/operators:go_default_library",
         "//common/runes:go_default_library",

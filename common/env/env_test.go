@@ -429,7 +429,7 @@ func TestConfigAddVariableDecls(t *testing.T) {
 		},
 		{
 			name: "function var decl",
-			in:   decls.NewVariable("var", types.NewFunctionType(types.BoolType, types.IntType, types.IntType)),
+			in:   decls.NewVariable("var", types.NewFunctionType(common.UnknownCallEstimate(), types.BoolType, types.IntType, types.IntType)),
 			out: NewVariable("var",
 				NewTypeDesc("function", NewTypeDesc("bool"), NewTypeDesc("int"), NewTypeDesc("int"))),
 		},
@@ -735,7 +735,7 @@ func TestVariableAsCELVariable(t *testing.T) {
 					NewTypeDesc("bool"), NewTypeParam("T"), NewTypeParam("T")),
 			},
 			want: decls.NewVariable("cmp",
-				types.NewFunctionType(types.BoolType,
+				types.NewFunctionType(common.UnknownCallEstimate(), types.BoolType,
 					types.NewTypeParamType("T"), types.NewTypeParamType("T"))),
 		},
 		{

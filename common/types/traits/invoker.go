@@ -14,7 +14,10 @@
 
 package traits
 
-import "github.com/google/cel-go/common/types/ref"
+import (
+	"github.com/google/cel-go/common/functions"
+	"github.com/google/cel-go/common/types/ref"
+)
 
 // Invoker interface for values which may be called as functions.
 //
@@ -24,7 +27,11 @@ import "github.com/google/cel-go/common/types/ref"
 type Invoker interface {
 	// Invoke calls the function with the given arguments and returns its result.
 	//
+	// The frame is the execution frame of the evaluation which is making the call, and is what
+	// accounts for the cost of the invocation. It may be nil when the value is invoked outside
+	// of an evaluation.
+	//
 	// Implementations are strict: an error or unknown argument is returned to the caller
 	// rather than being passed through to the underlying function implementation.
-	Invoke(args ...ref.Val) ref.Val
+	Invoke(frame functions.ExecutionFrame, args ...ref.Val) ref.Val
 }

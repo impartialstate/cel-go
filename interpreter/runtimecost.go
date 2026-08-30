@@ -270,6 +270,21 @@ func (c *CostTracker) ActualCost() uint64 {
 	return c.cost
 }
 
+// chargeCost adds the cost of work performed outside of the observed program steps, e.g. the
+// invocation of a function value from within a function implementation.
+//
+// An error is returned when the additional cost exceeds the tracker's limit.
+func (c *CostTracker) chargeCost(cost uint64) error {
+	c.cost += cost
+	if c.Limit != nil && c.cost > *c.Limit {
+		return EvalCancelledError{
+			Cause:   CostLimitExceeded,
+			Message: "operation cancelled: actual cost limit exceeded",
+		}
+	}
+	return nil
+}
+
 func (c *CostTracker) costCall(call InterpretableCall, args []ref.Val, result ref.Val) uint64 {
 	var cost uint64
 	if len(c.overloadTrackers) != 0 {

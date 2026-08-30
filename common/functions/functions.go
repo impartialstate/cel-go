@@ -45,6 +45,12 @@ type Overload struct {
 	// nil.
 	Function FunctionOp
 
+	// Frame defines the overload with a FrameOp implementation which receives the execution
+	// frame of the evaluation in addition to the call arguments. May be nil.
+	//
+	// A frame binding takes precedence over the Unary, Binary, and Function bindings.
+	Frame FrameOp
+
 	// NonStrict specifies whether the Overload will tolerate arguments that
 	// are types.Err or types.Unknown.
 	NonStrict bool
@@ -59,3 +65,11 @@ type BinaryOp func(lhs ref.Val, rhs ref.Val) ref.Val
 // FunctionOp is a function with accepts zero or more arguments and produces
 // a value or error as a result.
 type FunctionOp func(values ...ref.Val) ref.Val
+
+// FrameOp is a function which accepts the execution frame of the evaluation which invoked it
+// along with zero or more arguments, and produces a value or error as a result.
+//
+// Frame bindings are needed by implementations which invoke function values, e.g. higher-order
+// functions such as list.sortWith(comparator), as the frame is what accounts for the cost of the
+// invoked function.
+type FrameOp func(frame ExecutionFrame, args ...ref.Val) ref.Val

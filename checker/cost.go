@@ -45,12 +45,35 @@ type CostEstimator interface {
 	EstimateCallCost(function, overloadID string, target *AstNode, args []AstNode) *CallEstimate
 }
 
+// CostEstimate represents an estimated cost range and provides add and multiply operations
+// that do not overflow.
+type CostEstimate = common.CostEstimate
+
+// SizeEstimate represents an estimated size of a variable length string, bytes, map or list.
+type SizeEstimate = common.SizeEstimate
+
 // CallEstimate includes a CostEstimate for the call, and an optional estimate of the result object size.
 // The ResultSize should only be provided if the call results in a map, list, string or bytes.
-type CallEstimate struct {
-	CostEstimate
+type CallEstimate = common.CallEstimate
 
-	ResultSize *SizeEstimate
+// UnknownCostEstimate returns a cost with an unknown impact.
+func UnknownCostEstimate() CostEstimate {
+	return common.UnknownCostEstimate()
+}
+
+// FixedCostEstimate returns a cost with a fixed min and max range.
+func FixedCostEstimate(cost uint64) CostEstimate {
+	return common.FixedCostEstimate(cost)
+}
+
+// UnknownSizeEstimate returns a size between 0 and max uint
+func UnknownSizeEstimate() SizeEstimate {
+	return common.UnknownSizeEstimate()
+}
+
+// FixedSizeEstimate returns a size estimate with a fixed min and max range.
+func FixedSizeEstimate(size uint64) SizeEstimate {
+	return common.FixedSizeEstimate(size)
 }
 
 // AstNode represents an AST node for the purpose of cost estimations.
@@ -94,160 +117,6 @@ func (e astNode) Expr() ast.Expr {
 
 func (e astNode) ComputedSize() *SizeEstimate {
 	return e.derivedSize
-}
-
-// SizeEstimate represents an estimated size of a variable length string, bytes, map or list.
-type SizeEstimate struct {
-	Min, Max uint64
-}
-
-// UnknownSizeEstimate returns a size between 0 and max uint
-func UnknownSizeEstimate() SizeEstimate {
-	return unknownSizeEstimate
-}
-
-// FixedSizeEstimate returns a size estimate with a fixed min and max range.
-func FixedSizeEstimate(size uint64) SizeEstimate {
-	return SizeEstimate{Min: size, Max: size}
-}
-
-// Add adds to another SizeEstimate and returns the sum.
-// If add would result in an uint64 overflow, the result is math.MaxUint64.
-func (se SizeEstimate) Add(sizeEstimate SizeEstimate) SizeEstimate {
-	return SizeEstimate{
-		addUint64NoOverflow(se.Min, sizeEstimate.Min),
-		addUint64NoOverflow(se.Max, sizeEstimate.Max),
-	}
-}
-
-// Multiply multiplies by another SizeEstimate and returns the product.
-// If multiply would result in an uint64 overflow, the result is math.MaxUint64.
-func (se SizeEstimate) Multiply(sizeEstimate SizeEstimate) SizeEstimate {
-	return SizeEstimate{
-		multiplyUint64NoOverflow(se.Min, sizeEstimate.Min),
-		multiplyUint64NoOverflow(se.Max, sizeEstimate.Max),
-	}
-}
-
-// MultiplyByCostFactor multiplies a SizeEstimate by a cost factor and returns the CostEstimate with the
-// nearest integer of the result, rounded up.
-func (se SizeEstimate) MultiplyByCostFactor(costPerUnit float64) CostEstimate {
-	return CostEstimate{
-		multiplyByCostFactor(se.Min, costPerUnit),
-		multiplyByCostFactor(se.Max, costPerUnit),
-	}
-}
-
-// MultiplyByCost multiplies by the cost and returns the product.
-// If multiply would result in an uint64 overflow, the result is math.MaxUint64.
-func (se SizeEstimate) MultiplyByCost(cost CostEstimate) CostEstimate {
-	return CostEstimate{
-		multiplyUint64NoOverflow(se.Min, cost.Min),
-		multiplyUint64NoOverflow(se.Max, cost.Max),
-	}
-}
-
-// Union returns a SizeEstimate that encompasses both input the SizeEstimate.
-func (se SizeEstimate) Union(size SizeEstimate) SizeEstimate {
-	result := se
-	if size.Min < result.Min {
-		result.Min = size.Min
-	}
-	if size.Max > result.Max {
-		result.Max = size.Max
-	}
-	return result
-}
-
-// AsCost converts a size estimates to an equivalent cost estimate.
-func (se SizeEstimate) AsCost() CostEstimate {
-	return se.MultiplyByCostFactor(1)
-}
-
-// CostEstimate represents an estimated cost range and provides add and multiply operations
-// that do not overflow.
-type CostEstimate struct {
-	Min, Max uint64
-}
-
-// UnknownCostEstimate returns a cost with an unknown impact.
-func UnknownCostEstimate() CostEstimate {
-	return unknownCostEstimate
-}
-
-// FixedCostEstimate returns a cost with a fixed min and max range.
-func FixedCostEstimate(cost uint64) CostEstimate {
-	return CostEstimate{Min: cost, Max: cost}
-}
-
-// Add adds the costs and returns the sum.
-// If add would result in an uint64 overflow for the min or max, the value is set to math.MaxUint64.
-func (ce CostEstimate) Add(cost CostEstimate) CostEstimate {
-	return CostEstimate{
-		Min: addUint64NoOverflow(ce.Min, cost.Min),
-		Max: addUint64NoOverflow(ce.Max, cost.Max),
-	}
-}
-
-// Multiply multiplies by the cost and returns the product.
-// If multiply would result in an uint64 overflow, the result is math.MaxUint64.
-func (ce CostEstimate) Multiply(cost CostEstimate) CostEstimate {
-	return CostEstimate{
-		Min: multiplyUint64NoOverflow(ce.Min, cost.Min),
-		Max: multiplyUint64NoOverflow(ce.Max, cost.Max),
-	}
-}
-
-// MultiplyByCostFactor multiplies a CostEstimate by a cost factor and returns the CostEstimate with the
-// nearest integer of the result, rounded up.
-func (ce CostEstimate) MultiplyByCostFactor(costPerUnit float64) CostEstimate {
-	return CostEstimate{
-		Min: multiplyByCostFactor(ce.Min, costPerUnit),
-		Max: multiplyByCostFactor(ce.Max, costPerUnit),
-	}
-}
-
-// Union returns a CostEstimate that encompasses both input the CostEstimates.
-func (ce CostEstimate) Union(size CostEstimate) CostEstimate {
-	result := ce
-	if size.Min < result.Min {
-		result.Min = size.Min
-	}
-	if size.Max > result.Max {
-		result.Max = size.Max
-	}
-	return result
-}
-
-// addUint64NoOverflow adds non-negative ints. If the result is exceeds math.MaxUint64, math.MaxUint64
-// is returned.
-func addUint64NoOverflow(x, y uint64) uint64 {
-	if y > 0 && x > math.MaxUint64-y {
-		return math.MaxUint64
-	}
-	return x + y
-}
-
-// multiplyUint64NoOverflow multiplies non-negative ints. If the result is exceeds math.MaxUint64, math.MaxUint64
-// is returned.
-func multiplyUint64NoOverflow(x, y uint64) uint64 {
-	if y != 0 && x > math.MaxUint64/y {
-		return math.MaxUint64
-	}
-	return x * y
-}
-
-// multiplyByFactor multiplies an integer by a cost factor float and returns the nearest integer value, rounded up.
-func multiplyByCostFactor(x uint64, y float64) uint64 {
-	xFloat := float64(x)
-	if xFloat > 0 && y > 0 && xFloat > math.MaxUint64/y {
-		return math.MaxUint64
-	}
-	ceil := math.Ceil(xFloat * y)
-	if ceil >= doubleTwoTo64 {
-		return math.MaxUint64
-	}
-	return uint64(ceil)
 }
 
 // CostOption configures flags which affect cost computations.
@@ -501,6 +370,11 @@ func (c *coster) costIdent(e ast.Expr) CostEstimate {
 	} else {
 		c.addPath(e, []string{identName})
 	}
+	// An identifier which refers to a declared function is a reference to the function itself,
+	// which is resolved when the expression is planned rather than when it is evaluated.
+	if len(c.checkedAST.GetOverloadIDs(e.ID())) != 0 {
+		return constCost
+	}
 	return selectAndIdentCost
 }
 
@@ -532,6 +406,12 @@ func (c *coster) costCall(e ast.Expr) CostEstimate {
 	// Dyn is just a way to disable type-checking, so return the cost of 1 with the cost of the argument
 	if dynEstimate := c.maybeUnwrapDynCall(e); dynEstimate != nil {
 		return *dynEstimate
+	}
+
+	// Invocations of a function value are estimated from the cost declared by the callee's
+	// function type, as the implementation which will be bound at evaluation time is not known.
+	if invokeEstimate := c.maybeCostInvoke(e); invokeEstimate != nil {
+		return *invokeEstimate
 	}
 
 	// Continue estimating the cost of all other calls.
@@ -590,6 +470,33 @@ func (c *coster) costCall(e ast.Expr) CostEstimate {
 	}
 	c.setSize(e, resultSize)
 	return sum.Add(fnCost)
+}
+
+// maybeCostInvoke estimates the cost of invoking a function value, returning nil if the call is
+// not an invocation.
+//
+// The cost of the call is the cost declared by the callee's function type, and the size of the
+// result is the size declared alongside it. Callees which do not declare an estimate are costed
+// as a single call.
+func (c *coster) maybeCostInvoke(e ast.Expr) *CostEstimate {
+	call := e.AsCall()
+	if call.FunctionName() != overloads.Invoke || len(call.Args()) == 0 {
+		return nil
+	}
+	args := call.Args()
+	sum := c.cost(args[0])
+	for _, arg := range args[1:] {
+		sum = sum.Add(c.cost(arg))
+	}
+	estimate := types.FunctionCallEstimate(c.getType(args[0]))
+	callCost := FixedCostEstimate(types.DefaultCallCost)
+	if !estimate.IsUnknown() {
+		callCost = estimate.CostEstimate
+	}
+	c.setSize(e, estimate.ResultSize)
+	// The cost of the call is the cost of dispatching it plus the cost declared by the callee.
+	sum = sum.Add(FixedCostEstimate(1)).Add(callCost)
+	return &sum
 }
 
 func (c *coster) maybeUnwrapDynCall(e ast.Expr) *CostEstimate {
@@ -1033,11 +940,6 @@ func isScalar(t *types.Type) bool {
 }
 
 var (
-	doubleTwoTo64 = math.Ldexp(1.0, 64)
-
-	unknownSizeEstimate = SizeEstimate{Min: 0, Max: math.MaxUint64}
-	unknownCostEstimate = unknownSizeEstimate.MultiplyByCostFactor(1)
-
 	selectAndIdentCost = FixedCostEstimate(common.SelectAndIdentCost)
 	constCost          = FixedCostEstimate(common.ConstCost)
 

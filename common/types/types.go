@@ -22,6 +22,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	chkdecls "github.com/google/cel-go/checker/decls"
+	"github.com/google/cel-go/common"
 	"github.com/google/cel-go/common/types/ref"
 	"github.com/google/cel-go/common/types/traits"
 
@@ -238,6 +239,10 @@ type Type struct {
 
 	// traitMask is a mask of flags which indicate the capabilities of the type.
 	traitMask int
+
+	// callEstimate declares the cost of invoking a value of a function type and the size of its
+	// result. Only set for function types, and not considered when comparing types.
+	callEstimate *common.CallEstimate
 }
 
 // ConvertToNative implements ref.Val.ConvertToNative.

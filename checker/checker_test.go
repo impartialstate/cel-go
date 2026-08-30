@@ -2489,7 +2489,7 @@ func functionRefTestCases(t testing.TB) []testInfo {
 				},
 			},
 			out:     `greaterThan~(int, int) -> bool^greater_than_int`,
-			outType: types.NewFunctionType(types.BoolType, types.IntType, types.IntType),
+			outType: types.NewFunctionType(common.FixedCallEstimate(2), types.BoolType, types.IntType, types.IntType),
 		},
 		{
 			// A call of a variable of function type invokes the value.
@@ -2497,10 +2497,14 @@ func functionRefTestCases(t testing.TB) []testInfo {
 			env: testEnv{
 				idents: []*decls.VariableDecl{
 					decls.NewVariable("cmp",
-						types.NewFunctionType(types.BoolType, types.IntType, types.IntType)),
+						types.NewFunctionType(common.FixedCallEstimate(2), types.BoolType, types.IntType, types.IntType)),
 				},
 			},
-			out:     `cmp(1~int, 2~int)~bool^@invoke`,
+			out: `@invoke(
+    		  cmp~(int, int) -> bool^cmp,
+    		  1~int,
+    		  2~int
+    		)~bool^@invoke`,
 			outType: types.BoolType,
 		},
 		{
@@ -2509,10 +2513,14 @@ func functionRefTestCases(t testing.TB) []testInfo {
 			env: testEnv{
 				idents: []*decls.VariableDecl{
 					decls.NewVariable("acme.cmp",
-						types.NewFunctionType(types.BoolType, types.IntType, types.IntType)),
+						types.NewFunctionType(common.FixedCallEstimate(2), types.BoolType, types.IntType, types.IntType)),
 				},
 			},
-			out:     `acme.cmp(1~int, 2~int)~bool^@invoke`,
+			out: `@invoke(
+    		  acme.cmp~(int, int) -> bool^acme.cmp,
+    		  1~int,
+    		  2~int
+    		)~bool^@invoke`,
 			outType: types.BoolType,
 		},
 		{
@@ -2520,7 +2528,7 @@ func functionRefTestCases(t testing.TB) []testInfo {
 			env: testEnv{
 				idents: []*decls.VariableDecl{
 					decls.NewVariable("cmp",
-						types.NewFunctionType(types.BoolType, types.IntType, types.IntType)),
+						types.NewFunctionType(common.FixedCallEstimate(2), types.BoolType, types.IntType, types.IntType)),
 				},
 			},
 			err: `

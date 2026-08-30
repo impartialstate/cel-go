@@ -194,14 +194,15 @@ func (p *planBuilder) planFunctionRef(id int64, identRef *ast.ReferenceInfo) (In
 	if !found {
 		return nil, fmt.Errorf("no such overload: %s", identRef.Name)
 	}
-	fnVal := types.NewFunctionVal(identRef.Name, fnType, overloadInvoker(identRef.Name, impl))
+	fnVal := types.NewFunctionVal(identRef.Name, fnType,
+		types.FunctionCallEstimate(fnType), overloadInvoker(identRef.Name, impl))
 	return NewConstValue(id, fnVal), nil
 }
 
 // overloadInvoker adapts a dispatcher binding to the implementation signature used by function
 // values, preferring the most specific binding available for the argument count.
-func overloadInvoker(name string, impl *functions.Overload) func(args ...ref.Val) ref.Val {
-	return func(args ...ref.Val) ref.Val {
+func overloadInvoker(name string, impl *functions.Overload) functions.FrameOp {
+	return func(frame functions.ExecutionFrame, args ...ref.Val) ref.Val {
 		if impl.OperandTrait != 0 && len(args) != 0 && !args[0].Type().HasTrait(impl.OperandTrait) {
 			return types.MaybeNoSuchOverloadErr(args[0])
 		}
@@ -217,6 +218,9 @@ func overloadInvoker(name string, impl *functions.Overload) func(args ...ref.Val
 		}
 		if impl.Function != nil {
 			return impl.Function(args...)
+		}
+		if impl.Frame != nil {
+			return impl.Frame(frame, args...)
 		}
 		return types.NewErr("no such overload: %s", name)
 	}
@@ -328,9 +332,9 @@ func (p *planBuilder) planCall(expr ast.Expr) (Interpretable, error) {
 	}
 
 	// Invocation of a function value, e.g. a variable declared with a function type, rather than
-	// a call of a declared function.
-	if oName == overloads.Invoke {
-		return p.planInvoke(expr, fnName, args)
+	// a call of a declared function. The callee is the first operand of the call.
+	if fnName == overloads.Invoke {
+		return p.planInvoke(expr, args)
 	}
 
 	// Otherwise, generate Interpretable calls specialized by argument count.
@@ -342,6 +346,11 @@ func (p *planBuilder) planCall(expr ast.Expr) (Interpretable, error) {
 	// If the overload id couldn't resolve the function, try the simple function name.
 	if fnDef == nil {
 		fnDef, _ = p.disp.FindOverload(fnName)
+	}
+	// Function implementations which require the execution frame, e.g. higher-order functions
+	// which invoke a function value, are planned independently of their argument count.
+	if fnDef != nil && fnDef.Frame != nil {
+		return p.planCallFrame(expr, fnName, oName, fnDef, args)
 	}
 	switch argCount {
 	case 0:
@@ -365,18 +374,49 @@ func (p *planBuilder) planCall(expr ast.Expr) (Interpretable, error) {
 	}
 }
 
-// planInvoke generates an Interpretable which resolves a function value by name and calls it with
-// the planned arguments.
-func (p *planBuilder) planInvoke(expr ast.Expr, fnName string, args []Interpretable) (Interpretable, error) {
-	fn := &evalAttr{
-		adapter: p.adapter,
-		attr:    p.attrFactory.AbsoluteAttribute(expr.ID(), fnName),
+// planInvoke generates an Interpretable which calls the function value produced by the first
+// operand of the call with the remaining operands as its arguments.
+func (p *planBuilder) planInvoke(expr ast.Expr, args []Interpretable) (Interpretable, error) {
+	if len(args) == 0 {
+		return nil, fmt.Errorf("invoke requires a function value operand: %d", expr.ID())
+	}
+	name := overloads.Invoke
+	if callee, isIdent := calleeName(expr); isIdent {
+		name = callee
 	}
 	return &evalInvoke{
 		id:   expr.ID(),
-		name: fnName,
-		fn:   fn,
-		args: args,
+		name: name,
+		fn:   args[0],
+		args: args[1:],
+	}, nil
+}
+
+// calleeName returns the name of the function value being invoked when it is a simple identifier,
+// which is used to improve the readability of runtime errors.
+func calleeName(expr ast.Expr) (string, bool) {
+	callee := expr.AsCall().Args()[0]
+	if callee.Kind() != ast.IdentKind {
+		return "", false
+	}
+	return callee.AsIdent(), true
+}
+
+// planCallFrame generates a callable Interpretable for an overload which is implemented with a
+// frame binding.
+func (p *planBuilder) planCallFrame(expr ast.Expr,
+	function string,
+	overload string,
+	impl *functions.Overload,
+	args []Interpretable) (Interpretable, error) {
+	return &evalFrameArgs{
+		id:        expr.ID(),
+		function:  function,
+		overload:  overload,
+		args:      args,
+		trait:     impl.OperandTrait,
+		impl:      impl.Frame,
+		nonStrict: impl.NonStrict,
 	}, nil
 }
 

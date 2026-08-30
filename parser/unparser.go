@@ -23,6 +23,7 @@ import (
 
 	"github.com/google/cel-go/common/ast"
 	"github.com/google/cel-go/common/operators"
+	"github.com/google/cel-go/common/overloads"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
 )
@@ -128,6 +129,9 @@ func (un *unparser) visitCall(expr ast.Expr) error {
 	// optional index operator
 	case operators.OptIndex:
 		return un.visitCallOptIndex(expr)
+	// invocation of a function value
+	case overloads.Invoke:
+		return un.visitCallInvoke(expr)
 	// unary operators
 	case operators.LogicalNot, operators.Negate:
 		return un.visitCallUnary(expr)
@@ -229,6 +233,30 @@ func (un *unparser) visitCallFunc(expr ast.Expr) error {
 			return err
 		}
 		if i < len(args)-1 {
+			un.str.WriteString(", ")
+		}
+	}
+	un.str.WriteString(")")
+	return nil
+}
+
+// visitCallInvoke renders the invocation of a function value, e.g. `@invoke(cmp, 1, 2)`, in the
+// source form it was written in, e.g. `cmp(1, 2)`.
+func (un *unparser) visitCallInvoke(expr ast.Expr) error {
+	args := expr.AsCall().Args()
+	if len(args) == 0 {
+		return fmt.Errorf("unsupported expression: %v", expr)
+	}
+	nested := isBinaryOrTernaryOperator(args[0])
+	if err := un.visitMaybeNested(args[0], nested); err != nil {
+		return err
+	}
+	un.str.WriteString("(")
+	for i, arg := range args[1:] {
+		if err := un.visit(arg); err != nil {
+			return err
+		}
+		if i < len(args)-2 {
 			un.str.WriteString(", ")
 		}
 	}

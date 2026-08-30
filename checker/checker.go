@@ -39,6 +39,9 @@ type checker struct {
 	errors             *typeErrors
 	mappings           *mapping
 	freeTypeVarCounter int
+	// nextExprID is the next unused expression id, used when the check introduces a node which
+	// was not present in the parsed expression.
+	nextExprID int64
 }
 
 // Check performs type checking, giving a typed AST.
@@ -60,6 +63,7 @@ func Check(parsed *ast.AST, source common.Source, env *Env) (*ast.AST, *common.E
 		errors:             &typeErrors{errs: errs},
 		mappings:           newMapping(),
 		freeTypeVarCounter: 0,
+		nextExprID:         ast.MaxID(parsed),
 	}
 	c.check(c.Expr())
 
@@ -182,7 +186,7 @@ func (c *checker) checkFunctionRef(e ast.Expr, fn *decls.FunctionDecl) {
 func (c *checker) functionRefType(candidates []*decls.OverloadDecl) (*types.Type, bool) {
 	first := candidates[0]
 	if len(candidates) == 1 {
-		fnType := newFunctionType(first.ResultType(), first.ArgTypes()...)
+		fnType := newFunctionType(first.CallEstimate(), first.ResultType(), first.ArgTypes()...)
 		typeParams := first.TypeParams()
 		if len(typeParams) == 0 {
 			return fnType, true
@@ -201,6 +205,7 @@ func (c *checker) functionRefType(candidates []*decls.OverloadDecl) (*types.Type
 	toDyn := newMapping()
 	resultType := substitute(toDyn, first.ResultType(), true)
 	argTypes := substituteParams(toDyn, first.ArgTypes(), true)
+	estimate := first.CallEstimate()
 	for _, overload := range candidates[1:] {
 		if len(overload.ArgTypes()) != len(argTypes) {
 			return nil, false
@@ -213,8 +218,23 @@ func (c *checker) functionRefType(candidates []*decls.OverloadDecl) (*types.Type
 				argTypes[i] = types.DynType
 			}
 		}
+		estimate = unionCallEstimates(estimate, overload.CallEstimate())
 	}
-	return newFunctionType(resultType, argTypes...), true
+	return newFunctionType(estimate, resultType, argTypes...), true
+}
+
+// unionCallEstimates returns the estimate which encompasses both inputs, as a reference to a
+// function with multiple overloads may dispatch to any one of them.
+func unionCallEstimates(lhs, rhs common.CallEstimate) common.CallEstimate {
+	if lhs.IsUnknown() || rhs.IsUnknown() {
+		return common.UnknownCallEstimate()
+	}
+	union := common.CallEstimate{CostEstimate: lhs.CostEstimate.Union(rhs.CostEstimate)}
+	if lhs.ResultSize != nil && rhs.ResultSize != nil {
+		size := lhs.ResultSize.Union(*rhs.ResultSize)
+		union.ResultSize = &size
+	}
+	return union
 }
 
 func (c *checker) checkSelect(e ast.Expr) {
@@ -358,6 +378,10 @@ func (c *checker) checkCall(e ast.Expr) {
 		c.checkOptSelect(e)
 		return
 	}
+	if fnName == overloads.Invoke {
+		c.checkInvokeCall(e)
+		return
+	}
 
 	args := call.Args()
 	// Traverse arguments.
@@ -426,9 +450,9 @@ func (c *checker) checkCall(e ast.Expr) {
 // checkInvoke type-checks a call whose name resolves to a variable of function type, e.g. a
 // function reference bound to a variable or to a comprehension variable.
 //
-// The call expression is rewritten as a global call to the fully-qualified variable name and is
-// annotated with the overloads.Invoke reference so that the planner knows to resolve the callee
-// as a value. Returns whether the call was resolved as an invocation.
+// The call expression is rewritten as an invocation of the function value, with the callee as its
+// first operand, so that the planner knows to resolve the callee as a value. Returns whether the
+// call was resolved as an invocation.
 func (c *checker) checkInvoke(e ast.Expr, name string, args []ast.Expr) bool {
 	ident := c.env.resolveSimpleIdent(name)
 	if ident == nil {
@@ -442,29 +466,63 @@ func (c *checker) checkInvoke(e ast.Expr, name string, args []ast.Expr) bool {
 	if ident.requiresDisambiguation {
 		identName = "." + identName
 	}
+	// Rewrite the call as an invocation of the function value. Modeling the callee as an
+	// expression keeps its declared type, and with it the declared cost of the call, available to
+	// later phases such as cost estimation, and gives the check a stable form to re-check when an
+	// expression is optimized and checked again.
+	callee := c.NewIdent(c.newExprID(e), identName)
+	c.setType(callee, fnType)
+	c.setReference(callee, ast.NewIdentReference(identName, nil))
+	e.SetKindCase(c.NewCall(e.ID(), overloads.Invoke, append([]ast.Expr{callee}, args...)...))
+	c.checkInvokeSignature(e, identName, fnType, args)
+	return true
+}
 
+// checkInvokeCall type-checks a call which invokes the function value produced by its first
+// operand.
+//
+// Calls of this form are produced by checkInvoke, and are re-checked when a checked expression is
+// modified and checked again, e.g. by a static optimizer.
+func (c *checker) checkInvokeCall(e ast.Expr) {
+	call := e.AsCall()
+	args := call.Args()
+	if call.IsMemberFunction() || len(args) == 0 {
+		c.setType(e, types.ErrorType)
+		c.errors.undeclaredReference(e.ID(), c.location(e), c.env.container.Name(), overloads.Invoke)
+		return
+	}
+	for _, arg := range args {
+		c.check(arg)
+	}
+	callee := args[0]
+	calleeName := overloads.Invoke
+	if callee.Kind() == ast.IdentKind {
+		calleeName = callee.AsIdent()
+	}
+	c.checkInvokeSignature(e, calleeName, c.getType(callee), args[1:])
+}
+
+// checkInvokeSignature checks the arguments of an invocation against the signature of the function
+// value being called, and records the result type and reference for the call.
+func (c *checker) checkInvokeSignature(e ast.Expr, calleeName string, fnType *types.Type, args []ast.Expr) {
+	fnType = substitute(c.mappings, fnType, false)
 	argTypes := make([]*types.Type, len(args))
 	for i, arg := range args {
 		argTypes[i] = c.getType(arg)
 	}
 	paramTypes := types.FunctionArgTypes(fnType)
-	if len(argTypes) != len(paramTypes) || !c.isAssignableList(argTypes, paramTypes) {
+	if !types.IsFunctionType(fnType) ||
+		len(argTypes) != len(paramTypes) ||
+		!c.isAssignableList(argTypes, paramTypes) {
 		for i, argType := range argTypes {
 			argTypes[i] = substitute(c.mappings, argType, true)
 		}
-		c.errors.noMatchingOverload(e.ID(), c.location(e), identName, argTypes, false)
+		c.errors.noMatchingOverload(e.ID(), c.location(e), calleeName, argTypes, false)
 		c.setType(e, types.ErrorType)
-		return true
+		return
 	}
-	// Rewrite the call so that it is always a global call on the resolved variable name. The
-	// receiver-style form `a.b(x)` is only reached here when `a.b` names a function-typed
-	// variable, in which case the target is not an operand of the call.
-	e.SetKindCase(c.NewCall(e.ID(), identName, args...))
 	c.setType(e, substitute(c.mappings, types.FunctionResultType(fnType), false))
-	invokeRef := ast.NewFunctionReference(overloads.Invoke)
-	invokeRef.Name = identName
-	c.setReference(e, invokeRef)
-	return true
+	c.setReference(e, ast.NewFunctionReference(overloads.Invoke))
 }
 
 func (c *checker) resolveOverloadOrError(
@@ -527,7 +585,7 @@ func (c *checker) resolveOverload(
 			return newResolution(checkedRef, types.BoolType)
 		}
 
-		overloadType := newFunctionType(overload.ResultType(), overload.ArgTypes()...)
+		overloadType := newFunctionType(common.UnknownCallEstimate(), overload.ResultType(), overload.ArgTypes()...)
 		typeParams := overload.TypeParams()
 		if len(typeParams) != 0 {
 			// Instantiate overload's type with fresh type variables.
@@ -774,6 +832,17 @@ func (c *checker) joinTypes(e ast.Expr, previous, current *types.Type) *types.Ty
 
 func (c *checker) dynAggregateLiteralElementTypesEnabled() bool {
 	return c.env.aggLitElemType == dynElementType
+}
+
+// newExprID allocates an expression id for a node introduced by the check, giving it the source
+// location of the expression it was derived from.
+func (c *checker) newExprID(derivedFrom ast.Expr) int64 {
+	id := c.nextExprID
+	c.nextExprID++
+	if offset, found := c.SourceInfo().GetOffsetRange(derivedFrom.ID()); found {
+		c.SourceInfo().SetOffsetRange(id, offset)
+	}
+	return id
 }
 
 func (c *checker) newTypeVar() *types.Type {

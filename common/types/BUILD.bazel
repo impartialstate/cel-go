@@ -37,6 +37,8 @@ go_library(
     importpath = "github.com/google/cel-go/common/types",
     deps = [
         "//checker/decls:go_default_library",
+        "//common:go_default_library",
+        "//common/functions:go_default_library",
         "//common/overloads:go_default_library",
         "//common/types/pb:go_default_library",
         "//common/types/ref:go_default_library",
@@ -82,6 +84,8 @@ go_test(
     ],
     embed = [":go_default_library"],
     deps = [
+        "//common:go_default_library",
+        "//common/functions:go_default_library",
         "//common/types/ref:go_default_library",
         "//common/types/traits:go_default_library",
         "//test:go_default_library",

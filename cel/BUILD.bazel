@@ -85,6 +85,7 @@ go_test(
         "//cel/testdata:test_fds_with_source_info",
     ],
     deps = [
+        "//checker:go_default_library",
         "//common/operators:go_default_library",
         "//common/overloads:go_default_library",
         "//common/types:go_default_library",

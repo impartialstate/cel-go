@@ -579,7 +579,7 @@ func (fn *evalInvoke) Eval(ctx Activation) ref.Val {
 			return argVals[i]
 		}
 	}
-	return types.LabelErrNode(fn.id, invoker.Invoke(argVals...))
+	return types.LabelErrNode(fn.id, invoker.Invoke(newExecFrame(ctx), argVals...))
 }
 
 // Function implements the InterpretableCall interface method.
@@ -594,6 +594,60 @@ func (fn *evalInvoke) OverloadID() string {
 
 // Args implements the InterpretableCall interface method.
 func (fn *evalInvoke) Args() []Interpretable {
+	return fn.args
+}
+
+// evalFrameArgs calls a function implementation which requires the execution frame of the
+// evaluation, e.g. a higher-order function which invokes a function value.
+type evalFrameArgs struct {
+	id        int64
+	function  string
+	overload  string
+	args      []Interpretable
+	trait     int
+	impl      functions.FrameOp
+	nonStrict bool
+}
+
+var _ InterpretableCall = &evalFrameArgs{}
+
+// ID implements the Interpretable interface method.
+func (fn *evalFrameArgs) ID() int64 {
+	return fn.id
+}
+
+// Eval implements the Interpretable interface method.
+func (fn *evalFrameArgs) Eval(ctx Activation) ref.Val {
+	argVals := make([]ref.Val, len(fn.args))
+	// Early return if any argument to the function is unknown or error.
+	strict := !fn.nonStrict
+	for i, arg := range fn.args {
+		argVals[i] = arg.Eval(ctx)
+		if strict && types.IsUnknownOrError(argVals[i]) {
+			return argVals[i]
+		}
+	}
+	if len(argVals) != 0 && fn.trait != 0 {
+		arg0 := argVals[0]
+		if !(!strict && types.IsUnknownOrError(arg0)) && !arg0.Type().HasTrait(fn.trait) {
+			return types.NewErrWithNodeID(fn.id, "no such overload: %s %d", fn.function, fn.id)
+		}
+	}
+	return types.LabelErrNode(fn.id, fn.impl(newExecFrame(ctx), argVals...))
+}
+
+// Function implements the InterpretableCall interface method.
+func (fn *evalFrameArgs) Function() string {
+	return fn.function
+}
+
+// OverloadID implements the InterpretableCall interface method.
+func (fn *evalFrameArgs) OverloadID() string {
+	return fn.overload
+}
+
+// Args implements the InterpretableCall interface method.
+func (fn *evalFrameArgs) Args() []Interpretable {
 	return fn.args
 }
 

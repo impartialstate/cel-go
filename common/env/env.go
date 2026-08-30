@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/google/cel-go/common"
 	"github.com/google/cel-go/common/decls"
 	"github.com/google/cel-go/common/types"
 )
@@ -950,6 +951,9 @@ func (td *TypeDesc) AsCELType(tp types.Provider) (*types.Type, error) {
 	case types.FunctionTypeName:
 		// The first parameter of a function type is its result type, and the remainder are its
 		// argument types in declaration order.
+		//
+		// Note, the serialized form does not carry the call estimate of the function type, so the
+		// cost of calls made through values of the type is not known to the type-checker.
 		params := make([]*types.Type, len(td.Params))
 		for i, p := range td.Params {
 			params[i], err = p.AsCELType(tp)
@@ -957,7 +961,7 @@ func (td *TypeDesc) AsCELType(tp types.Provider) (*types.Type, error) {
 				return nil, err
 			}
 		}
-		return types.NewFunctionType(params[0], params[1:]...), nil
+		return types.NewFunctionType(common.UnknownCallEstimate(), params[0], params[1:]...), nil
 	default:
 		if td.IsTypeParam {
 			return types.NewTypeParamType(td.TypeName), nil

@@ -15,21 +15,44 @@
 package types
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/google/cel-go/common"
+	"github.com/google/cel-go/common/functions"
 	"github.com/google/cel-go/common/types/ref"
 	"github.com/google/cel-go/common/types/traits"
 )
 
 var (
-	lessThanType = NewFunctionType(BoolType, IntType, IntType)
-	lessThanFn   = NewFunctionVal("lessThan", lessThanType,
-		func(args ...ref.Val) ref.Val {
+	lessThanEstimate = common.FixedCallEstimate(2)
+	lessThanType     = NewFunctionType(lessThanEstimate, BoolType, IntType, IntType)
+	lessThanFn       = NewFunctionVal("lessThan", lessThanType, lessThanEstimate,
+		func(frame functions.ExecutionFrame, args ...ref.Val) ref.Val {
 			return Bool(args[0].(Int) < args[1].(Int))
 		})
 )
+
+// testFrame is a minimal ExecutionFrame which records the cost charged to it and fails charges
+// beyond an optional limit.
+type testFrame struct {
+	cost  uint64
+	limit *uint64
+}
+
+func (f *testFrame) ResolveName(name string) (any, bool) { return nil, false }
+
+func (f *testFrame) ChargeCost(cost uint64) error {
+	f.cost += cost
+	if f.limit != nil && f.cost > *f.limit {
+		return fmt.Errorf("cost limit exceeded")
+	}
+	return nil
+}
+
+func (f *testFrame) Cost() uint64 { return f.cost }
 
 func TestFunctionType(t *testing.T) {
 	if !IsFunctionType(lessThanType) {
@@ -60,10 +83,10 @@ func TestFunctionType(t *testing.T) {
 		t.Errorf("String() got %s, wanted (int, int) -> bool", got)
 	}
 	// Function types with differing signatures must not be exact or equivalent matches.
-	if lessThanType.IsExactType(NewFunctionType(BoolType, IntType)) {
+	if lessThanType.IsExactType(NewFunctionType(lessThanEstimate, BoolType, IntType)) {
 		t.Error("IsExactType() got true for differing arities, wanted false")
 	}
-	if !lessThanType.IsExactType(NewFunctionType(BoolType, IntType, IntType)) {
+	if !lessThanType.IsExactType(NewFunctionType(lessThanEstimate, BoolType, IntType, IntType)) {
 		t.Error("IsExactType() got false for identical signatures, wanted true")
 	}
 	if !lessThanType.IsAssignableRuntimeType(lessThanFn) {
@@ -72,10 +95,10 @@ func TestFunctionType(t *testing.T) {
 }
 
 func TestFunctionInvoke(t *testing.T) {
-	if got := lessThanFn.Invoke(Int(1), Int(2)); got != True {
+	if got := lessThanFn.Invoke(nil, Int(1), Int(2)); got != True {
 		t.Errorf("Invoke(1, 2) got %v, wanted true", got)
 	}
-	if got := lessThanFn.Invoke(Int(2), Int(1)); got != False {
+	if got := lessThanFn.Invoke(nil, Int(2), Int(1)); got != False {
 		t.Errorf("Invoke(2, 1) got %v, wanted false", got)
 	}
 	if got := lessThanFn.Arity(); got != 2 {
@@ -90,7 +113,7 @@ func TestFunctionInvoke(t *testing.T) {
 }
 
 func TestFunctionInvokeArityMismatch(t *testing.T) {
-	got := lessThanFn.Invoke(Int(1))
+	got := lessThanFn.Invoke(nil, Int(1))
 	if !IsError(got) || !strings.Contains(got.(*Err).String(), "expects 2 arguments, got 1") {
 		t.Errorf("Invoke(1) got %v, wanted an arity error", got)
 	}
@@ -98,16 +121,83 @@ func TestFunctionInvokeArityMismatch(t *testing.T) {
 
 func TestFunctionInvokeStrict(t *testing.T) {
 	wantErr := NewErr("no such key")
-	if got := lessThanFn.Invoke(wantErr, Int(1)); got != wantErr {
+	if got := lessThanFn.Invoke(nil, wantErr, Int(1)); got != wantErr {
 		t.Errorf("Invoke() got %v, wanted the error argument", got)
 	}
 	unk := NewUnknown(1, nil)
-	if got := lessThanFn.Invoke(Int(1), unk); !IsUnknown(got) {
+	if got := lessThanFn.Invoke(nil, Int(1), unk); !IsUnknown(got) {
 		t.Errorf("Invoke() got %v, wanted an unknown", got)
 	}
-	unbound := NewFunctionVal("unbound", NewFunctionType(BoolType), nil)
-	if got := unbound.Invoke(); !IsError(got) {
+	unbound := NewFunctionVal("unbound",
+		NewFunctionType(lessThanEstimate, BoolType), lessThanEstimate, nil)
+	if got := unbound.Invoke(nil); !IsError(got) {
 		t.Errorf("Invoke() got %v, wanted an error for a function without an implementation", got)
+	}
+}
+
+func TestFunctionCallEstimate(t *testing.T) {
+	if got := lessThanFn.CallEstimate(); got != lessThanEstimate {
+		t.Errorf("CallEstimate() got %v, wanted %v", got, lessThanEstimate)
+	}
+	if got := lessThanFn.CallCost(); got != 2 {
+		t.Errorf("CallCost() got %d, wanted 2", got)
+	}
+	if got := FunctionCallEstimate(lessThanType); got != lessThanEstimate {
+		t.Errorf("FunctionCallEstimate() got %v, wanted %v", got, lessThanEstimate)
+	}
+	// A type which is not a function type, and a function type built without an estimate, both
+	// report an unknown estimate.
+	if got := FunctionCallEstimate(StringType); !got.IsUnknown() {
+		t.Errorf("FunctionCallEstimate(string) got %v, wanted unknown", got)
+	}
+	opaque := NewOpaqueType(FunctionTypeName, BoolType, IntType)
+	if got := FunctionCallEstimate(opaque); !got.IsUnknown() {
+		t.Errorf("FunctionCallEstimate() got %v, wanted unknown", got)
+	}
+	// Functions which do not declare a cost are charged the baseline call cost.
+	undeclared := NewFunctionVal("undeclared", opaque, common.UnknownCallEstimate(),
+		func(frame functions.ExecutionFrame, args ...ref.Val) ref.Val { return True })
+	if got := undeclared.CallCost(); got != DefaultCallCost {
+		t.Errorf("CallCost() got %d, wanted %d", got, DefaultCallCost)
+	}
+	// The declared estimate is not part of type identity.
+	if !lessThanType.IsExactType(NewFunctionType(common.FixedCallEstimate(100), BoolType, IntType, IntType)) {
+		t.Error("IsExactType() got false for types which differ only by cost, wanted true")
+	}
+}
+
+func TestFunctionInvokeChargesCost(t *testing.T) {
+	frame := &testFrame{}
+	if got := lessThanFn.Invoke(frame, Int(1), Int(2)); got != True {
+		t.Errorf("Invoke() got %v, wanted true", got)
+	}
+	if frame.cost != 2 {
+		t.Errorf("frame cost got %d, wanted 2", frame.cost)
+	}
+	if got := lessThanFn.Invoke(frame, Int(1), Int(2)); got != True {
+		t.Errorf("Invoke() got %v, wanted true", got)
+	}
+	if frame.cost != 4 {
+		t.Errorf("frame cost got %d, wanted 4", frame.cost)
+	}
+	// Arguments which are not evaluated do not incur a cost.
+	if got := lessThanFn.Invoke(frame, NewErr("boom")); !IsError(got) {
+		t.Errorf("Invoke() got %v, wanted error", got)
+	}
+	if frame.cost != 4 {
+		t.Errorf("frame cost got %d, wanted 4", frame.cost)
+	}
+}
+
+func TestFunctionInvokeCostLimit(t *testing.T) {
+	limit := uint64(3)
+	frame := &testFrame{limit: &limit}
+	if got := lessThanFn.Invoke(frame, Int(1), Int(2)); got != True {
+		t.Errorf("Invoke() got %v, wanted true", got)
+	}
+	got := lessThanFn.Invoke(frame, Int(1), Int(2))
+	if !IsError(got) || !strings.Contains(got.(*Err).String(), "cost limit exceeded") {
+		t.Errorf("Invoke() got %v, wanted a cost limit error", got)
 	}
 }
 
@@ -141,14 +231,14 @@ func TestFunctionConvertToNative(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ConvertToNative() failed: %v", err)
 	}
-	if got := invoker.(traits.Invoker).Invoke(Int(1), Int(2)); got != True {
+	if got := invoker.(traits.Invoker).Invoke(nil, Int(1), Int(2)); got != True {
 		t.Errorf("Invoke() got %v, wanted true", got)
 	}
-	fn, err := lessThanFn.ConvertToNative(reflect.TypeOf(func(...ref.Val) ref.Val { return nil }))
+	fn, err := lessThanFn.ConvertToNative(reflect.TypeOf(functions.FrameOp(nil)))
 	if err != nil {
 		t.Fatalf("ConvertToNative() failed: %v", err)
 	}
-	if got := fn.(func(...ref.Val) ref.Val)(Int(1), Int(2)); got != True {
+	if got := fn.(functions.FrameOp)(nil, Int(1), Int(2)); got != True {
 		t.Errorf("Invoke() got %v, wanted true", got)
 	}
 	if _, err := lessThanFn.ConvertToNative(reflect.TypeOf("")); err == nil {
@@ -160,7 +250,7 @@ func TestFunctionEqual(t *testing.T) {
 	if lessThanFn.Equal(lessThanFn) != True {
 		t.Error("Equal() got false for the same function value, wanted true")
 	}
-	other := NewFunctionVal("lessThan", lessThanType, lessThanFn.impl)
+	other := NewFunctionVal("lessThan", lessThanType, lessThanEstimate, lessThanFn.impl)
 	if lessThanFn.Equal(other) != False {
 		t.Error("Equal() got true for distinct function values, wanted false")
 	}
