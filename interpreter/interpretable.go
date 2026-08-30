@@ -545,6 +545,58 @@ func (bin *evalBinary) Args() []Interpretable {
 	return []Interpretable{bin.lhs, bin.rhs}
 }
 
+// evalInvoke calls a function value, e.g. a function reference bound to a variable, with the
+// evaluated arguments of the call.
+type evalInvoke struct {
+	id   int64
+	name string
+	fn   Interpretable
+	args []Interpretable
+}
+
+var _ InterpretableCall = &evalInvoke{}
+
+// ID implements the Interpretable interface method.
+func (fn *evalInvoke) ID() int64 {
+	return fn.id
+}
+
+// Eval implements the Interpretable interface method.
+func (fn *evalInvoke) Eval(ctx Activation) ref.Val {
+	fnVal := fn.fn.Eval(ctx)
+	if types.IsUnknownOrError(fnVal) {
+		return fnVal
+	}
+	invoker, ok := fnVal.(traits.Invoker)
+	if !ok {
+		return types.NewErrWithNodeID(fn.id,
+			"no such overload: %s is not a function", fn.name)
+	}
+	argVals := make([]ref.Val, len(fn.args))
+	for i, arg := range fn.args {
+		argVals[i] = arg.Eval(ctx)
+		if types.IsUnknownOrError(argVals[i]) {
+			return argVals[i]
+		}
+	}
+	return types.LabelErrNode(fn.id, invoker.Invoke(argVals...))
+}
+
+// Function implements the InterpretableCall interface method.
+func (fn *evalInvoke) Function() string {
+	return fn.name
+}
+
+// OverloadID implements the InterpretableCall interface method.
+func (fn *evalInvoke) OverloadID() string {
+	return overloads.Invoke
+}
+
+// Args implements the InterpretableCall interface method.
+func (fn *evalInvoke) Args() []Interpretable {
+	return fn.args
+}
+
 type evalVarArgs struct {
 	id        int64
 	function  string

@@ -67,6 +67,7 @@ go_test(
         "env_test.go",
         "fieldpaths_test.go",
         "folding_test.go",
+        "functionref_test.go",
         "inlining_test.go",
         "io_test.go",
         "optimizer_test.go",

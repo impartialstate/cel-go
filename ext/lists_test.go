@@ -22,6 +22,7 @@ import (
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/checker"
 	"github.com/google/cel-go/common/types"
+	"github.com/google/cel-go/common/types/ref"
 
 	proto2pb "github.com/google/cel-go/test/proto2pb"
 )
@@ -116,6 +117,151 @@ func TestLists(t *testing.T) {
 	}
 }
 
+func TestListsHigherOrderFunctions(t *testing.T) {
+	listsTests := []struct {
+		expr string
+		err  string
+	}{
+		// map
+		{expr: `[].map(twice) == []`},
+		{expr: `[1, 2, 3].map(twice) == [2, 4, 6]`},
+		{expr: `[[1], [1, 2]].map(size) == [1, 2]`},
+		{expr: `[1, 2].map(twice).map(twice) == [4, 8]`},
+		{expr: `[1, 2].map(cmpErr)`, err: "boom"},
+		// filter
+		{expr: `[].filter(isOdd) == []`},
+		{expr: `[1, 2, 3, 4].filter(isOdd) == [1, 3]`},
+		{expr: `[1, 2, 3, 4].filter(dynFn) == [1, 3]`},
+		{expr: `[1, 2].filter(dynTwice)`, err: "filter() predicate must return a bool"},
+		// sortBy with a key function
+		{expr: `[].sortBy(twice) == []`},
+		{expr: `[-3, 1, -5, -2, 4].sortBy(twice) == [-5, -3, -2, 1, 4]`},
+		{expr: `[[1, 2], [1], [1, 2, 3]].sortBy(size) == [[1], [1, 2], [1, 2, 3]]`},
+		{expr: `[1, 2].sortBy(cmpErr)`, err: "boom"},
+		// sortWith with a comparator function
+		{expr: `[].sortWith(greaterThan) == []`},
+		{expr: `[1].sortWith(greaterThan) == [1]`},
+		{expr: `[1, 3, 2].sortWith(greaterThan) == [3, 2, 1]`},
+		{expr: `[1, 3, 2].sortWith(lessThan) == [1, 2, 3]`},
+		{expr: `[1, 3, 2].sortWith(dynSum)`, err: "sortWith() comparator must return a bool"},
+		// the macro forms remain available alongside the function value forms
+		{expr: `[1, 2, 3].map(e, e * 2) == [2, 4, 6]`},
+		{expr: `[1, 2, 3].filter(e, e > 1) == [2, 3]`},
+		{expr: `[-3, 1, -5].sortBy(e, -e) == [1, -3, -5]`},
+		{expr: `[1, 2, 3].map(e, e * 2).sortWith(greaterThan) == [6, 4, 2]`},
+	}
+
+	env := testListsEnv(t, higherOrderFunctionOpts()...)
+	for i, tst := range listsTests {
+		tc := tst
+		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			// Function references are resolved by the type-checker, so only checked expressions
+			// are evaluated here.
+			ast, iss := env.Compile(tc.expr)
+			if iss.Err() != nil {
+				t.Fatalf("env.Compile(%v) failed: %v", tc.expr, iss.Err())
+			}
+			prg, err := env.Program(ast)
+			if err != nil {
+				t.Fatalf("env.Program() failed: %v", err)
+			}
+			out, _, err := prg.Eval(cel.NoVars())
+			if tc.err != "" {
+				if err == nil {
+					t.Fatalf("got value %v, wanted error %s for expr: %s", out.Value(), tc.err, tc.expr)
+				}
+				if !strings.Contains(err.Error(), tc.err) {
+					t.Errorf("got error %v, wanted error %s for expr: %s", err, tc.err, tc.expr)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			} else if out.Value() != true {
+				t.Errorf("got %v, wanted true for expr: %s", out.Value(), tc.expr)
+			}
+		})
+	}
+}
+
+func TestListsHigherOrderFunctionCompileErrors(t *testing.T) {
+	listsTests := []struct {
+		expr string
+		err  string
+	}{
+		{
+			expr: `[1, 2].map(greaterThan)`,
+			err:  "found no matching overload for 'map' applied to 'list(int).((int, int) -> bool)'",
+		},
+		{
+			expr: `[1, 2].filter(twice)`,
+			err:  "found no matching overload for 'filter' applied to 'list(int).((int) -> int)'",
+		},
+		{
+			expr: `[1, 2].sortWith(isOdd)`,
+			err:  "found no matching overload for 'sortWith' applied to 'list(int).((int) -> bool)'",
+		},
+		{
+			expr: `[[1], [2]].sortBy(twice)`,
+			err:  "found no matching overload for 'sortBy'",
+		},
+		{
+			expr: `[1, 2].map(undeclaredFn)`,
+			err:  "undeclared reference to 'undeclaredFn'",
+		},
+	}
+	env := testListsEnv(t, higherOrderFunctionOpts()...)
+	for i, tst := range listsTests {
+		tc := tst
+		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			_, iss := env.Compile(tc.expr)
+			if iss.Err() == nil {
+				t.Fatalf("env.Compile(%v) succeeded, wanted error %s", tc.expr, tc.err)
+			}
+			if !strings.Contains(iss.Err().Error(), tc.err) {
+				t.Errorf("env.Compile(%v) got %v, wanted error %s", tc.expr, iss.Err(), tc.err)
+			}
+		})
+	}
+}
+
+// higherOrderFunctionOpts declares the functions referenced by value within the higher-order
+// function tests.
+func higherOrderFunctionOpts() []cel.EnvOption {
+	return []cel.EnvOption{
+		cel.Function("twice",
+			cel.Overload("twice_int", []*cel.Type{cel.IntType}, cel.IntType,
+				cel.UnaryBinding(func(v ref.Val) ref.Val { return v.(types.Int) * 2 }))),
+		cel.Function("isOdd",
+			cel.Overload("is_odd_int", []*cel.Type{cel.IntType}, cel.BoolType,
+				cel.UnaryBinding(func(v ref.Val) ref.Val { return types.Bool(v.(types.Int)%2 != 0) }))),
+		cel.Function("greaterThan",
+			cel.Overload("greater_than_int", []*cel.Type{cel.IntType, cel.IntType}, cel.BoolType,
+				cel.BinaryBinding(func(lhs, rhs ref.Val) ref.Val {
+					return types.Bool(lhs.(types.Int) > rhs.(types.Int))
+				}))),
+		cel.Function("lessThan",
+			cel.Overload("less_than_int", []*cel.Type{cel.IntType, cel.IntType}, cel.BoolType,
+				cel.BinaryBinding(func(lhs, rhs ref.Val) ref.Val {
+					return types.Bool(lhs.(types.Int) < rhs.(types.Int))
+				}))),
+		// A function whose declared result type is dyn, used to check the runtime validation of
+		// predicate and comparator results.
+		cel.Function("dynFn",
+			cel.Overload("dyn_fn_int", []*cel.Type{cel.IntType}, cel.DynType,
+				cel.UnaryBinding(func(v ref.Val) ref.Val { return types.Bool(v.(types.Int)%2 != 0) }))),
+		cel.Function("dynTwice",
+			cel.Overload("dyn_twice_int", []*cel.Type{cel.IntType}, cel.DynType,
+				cel.UnaryBinding(func(v ref.Val) ref.Val { return v.(types.Int) * 2 }))),
+		cel.Function("dynSum",
+			cel.Overload("dyn_sum_int", []*cel.Type{cel.IntType, cel.IntType}, cel.DynType,
+				cel.BinaryBinding(func(lhs, rhs ref.Val) ref.Val {
+					return lhs.(types.Int) + rhs.(types.Int)
+				}))),
+		cel.Function("cmpErr",
+			cel.Overload("cmp_err_int", []*cel.Type{cel.IntType}, cel.IntType,
+				cel.UnaryBinding(func(v ref.Val) ref.Val { return types.NewErr("boom") }))),
+	}
+}
+
 func TestListsRuntimeErrors(t *testing.T) {
 	env, err := cel.NewEnv(Lists(ListsVersion(1)))
 	if err != nil {
@@ -188,9 +334,20 @@ func TestListsVersion(t *testing.T) {
 				"sortBy":   "[{'field': 'lo'}, {'field': 'hi'}].sortBy(m, m.field) == [{'field': 'hi'}, {'field': 'lo'}]",
 			},
 		},
+		{
+			version: 4,
+			supportedFunctions: map[string]string{
+				"map_function":    "[[1], [1, 2]].map(size) == [1, 2]",
+				"filter_function": "[1, 2, 3, 4].filter(isOdd) == [1, 3]",
+				"sortBy_function": "[[1, 2], [1]].sortBy(size) == [[1], [1, 2]]",
+				"sortWith":        "[1, 3, 2].sortWith(greaterThan) == [3, 2, 1]",
+			},
+		},
 	}
 	for _, lib := range versionCases {
-		env, err := cel.NewEnv(Lists(ListsVersion(lib.version)))
+		env, err := cel.NewEnv(
+			append([]cel.EnvOption{Lists(ListsVersion(lib.version))},
+				higherOrderFunctionOpts()...)...)
 		if err != nil {
 			t.Fatalf("cel.NewEnv(Lists(ListsVersion(%d))) failed: %v", lib.version, err)
 		}
@@ -503,6 +660,52 @@ func TestListsCosts(t *testing.T) {
 			for _, ast := range asts {
 				testEvalWithCost(t, env, ast, tc.in, tc.actualCost)
 			}
+		})
+	}
+}
+
+func TestListsHigherOrderFunctionCosts(t *testing.T) {
+	tests := []struct {
+		name          string
+		expr          string
+		estimatedCost checker.CostEstimate
+		actualCost    uint64
+	}{
+		{
+			name:          "list_map_function",
+			expr:          `[1, 2, 3].map(twice) == [2, 4, 6]`,
+			estimatedCost: checker.FixedCostEstimate(36),
+			actualCost:    35,
+		},
+		{
+			name:          "list_filter_function",
+			expr:          `[1, 2, 3].filter(isOdd) == [1, 3]`,
+			estimatedCost: checker.FixedCostEstimate(36),
+			actualCost:    35,
+		},
+		{
+			name:          "list_sortBy_function",
+			expr:          `[1, 2, 3].sortBy(twice) == [1, 2, 3]`,
+			estimatedCost: checker.FixedCostEstimate(51),
+			actualCost:    50,
+		},
+		{
+			name:          "list_sortWith_function",
+			expr:          `[1, 2, 3].sortWith(greaterThan) == [3, 2, 1]`,
+			estimatedCost: checker.FixedCostEstimate(51),
+			actualCost:    50,
+		},
+	}
+	for _, tst := range tests {
+		tc := tst
+		t.Run(tc.name, func(t *testing.T) {
+			env := testListsEnv(t, higherOrderFunctionOpts()...)
+			cAst, iss := env.Compile(tc.expr)
+			if iss.Err() != nil {
+				t.Fatalf("env.Compile(%v) failed: %v", tc.expr, iss.Err())
+			}
+			testCheckCost(t, env, cAst, nil, tc.estimatedCost)
+			testEvalWithCost(t, env, cAst, nil, tc.actualCost)
 		})
 	}
 }

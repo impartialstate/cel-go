@@ -40,6 +40,17 @@ func (e *typeErrors) noMatchingOverload(id int64, l common.Location, name string
 	e.errs.ReportErrorAtID(id, l, "found no matching overload for '%s' applied to '%s'", name, signature)
 }
 
+func (e *typeErrors) ambiguousFunctionReference(id int64, l common.Location, name string) {
+	e.errs.ReportErrorAtID(id, l,
+		"function '%s' cannot be used as a value: global overloads accept differing argument counts",
+		name)
+}
+
+func (e *typeErrors) noReferenceableOverload(id int64, l common.Location, name string) {
+	e.errs.ReportErrorAtID(id, l,
+		"function '%s' cannot be used as a value: no global overload is declared", name)
+}
+
 func (e *typeErrors) notAComprehensionRange(id int64, l common.Location, t *types.Type) {
 	e.errs.ReportErrorAtID(id, l, "expression of type '%s' cannot be range of a comprehension (must be list, map, or dynamic)",
 		FormatCELType(t))

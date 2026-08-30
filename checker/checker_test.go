@@ -36,7 +36,7 @@ import (
 
 func testCases(t testing.TB) []testInfo {
 	t.Helper()
-	return []testInfo{
+	return append([]testInfo{
 		// Const types
 		{
 			in:      `"A"`,
@@ -2449,7 +2449,7 @@ _&&_(_==_(list~type(list(dyn))^list,
              | TestAllTypes{singleInt32: 1, single_bool: true}.singleInt32
              | ........................................^`,
 		},
-	}
+	}, functionRefTestCases(t)...)
 }
 
 func testEnvs(t testing.TB) map[string]testEnv {
@@ -2471,6 +2471,94 @@ func testEnvs(t testing.TB) map[string]testEnv {
 				decls.NewVariable("id", types.DoubleType),
 				decls.NewVariable("ix", types.NullType),
 			},
+		},
+	}
+}
+
+func functionRefTestCases(t testing.TB) []testInfo {
+	t.Helper()
+	return []testInfo{
+		{
+			// A declared function referenced by name is a first-class value.
+			in: `greaterThan`,
+			env: testEnv{
+				functions: []*decls.FunctionDecl{
+					testFunction(t, "greaterThan",
+						decls.Overload("greater_than_int",
+							[]*types.Type{types.IntType, types.IntType}, types.BoolType)),
+				},
+			},
+			out:     `greaterThan~(int, int) -> bool^greater_than_int`,
+			outType: types.NewFunctionType(types.BoolType, types.IntType, types.IntType),
+		},
+		{
+			// A call of a variable of function type invokes the value.
+			in: `cmp(1, 2)`,
+			env: testEnv{
+				idents: []*decls.VariableDecl{
+					decls.NewVariable("cmp",
+						types.NewFunctionType(types.BoolType, types.IntType, types.IntType)),
+				},
+			},
+			out:     `cmp(1~int, 2~int)~bool^@invoke`,
+			outType: types.BoolType,
+		},
+		{
+			// A namespaced function-typed variable is invoked in the same manner.
+			in: `acme.cmp(1, 2)`,
+			env: testEnv{
+				idents: []*decls.VariableDecl{
+					decls.NewVariable("acme.cmp",
+						types.NewFunctionType(types.BoolType, types.IntType, types.IntType)),
+				},
+			},
+			out:     `acme.cmp(1~int, 2~int)~bool^@invoke`,
+			outType: types.BoolType,
+		},
+		{
+			in: `cmp(1)`,
+			env: testEnv{
+				idents: []*decls.VariableDecl{
+					decls.NewVariable("cmp",
+						types.NewFunctionType(types.BoolType, types.IntType, types.IntType)),
+				},
+			},
+			err: `
+	ERROR: <input>:1:4: found no matching overload for 'cmp' applied to '(int)'
+	  | cmp(1)
+	  | ...^
+	`,
+		},
+		{
+			in: `varArity`,
+			env: testEnv{
+				functions: []*decls.FunctionDecl{
+					testFunction(t, "varArity",
+						decls.Overload("var_arity_int", []*types.Type{types.IntType}, types.IntType),
+						decls.Overload("var_arity_int_int",
+							[]*types.Type{types.IntType, types.IntType}, types.IntType)),
+				},
+			},
+			err: `
+	ERROR: <input>:1:1: function 'varArity' cannot be used as a value: global overloads accept differing argument counts
+	  | varArity
+	  | ^
+	`,
+		},
+		{
+			in: `memberOnly`,
+			env: testEnv{
+				functions: []*decls.FunctionDecl{
+					testFunction(t, "memberOnly",
+						decls.MemberOverload("int_member_only",
+							[]*types.Type{types.IntType}, types.IntType)),
+				},
+			},
+			err: `
+	ERROR: <input>:1:1: function 'memberOnly' cannot be used as a value: no global overload is declared
+	  | memberOnly
+	  | ^
+	`,
 		},
 	}
 }

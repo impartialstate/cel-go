@@ -128,6 +128,47 @@ has(message.field)
 Both cases traditionally require special syntax at the language level, but
 these features are exposed via macros in CEL.
 
+#### Function References
+
+A declared function may be referenced by name as a value, which makes it
+possible to write higher-order functions whose behavior is supplied by the
+caller. The `ext.Lists` library uses this to provide `map`, `filter`, `sortBy`
+and `sortWith` variants which accept a function rather than a comprehension
+variable and expression:
+
+```javascript
+// Sort by a key function, and by a comparator function.
+[[1, 2], [1], [1, 2, 3]].sortBy(size)  // [[1], [1, 2], [1, 2, 3]]
+[1, 3, 2].sortWith(greaterThan)        // [3, 2, 1]
+```
+
+A function reference has a function type whose first type parameter is the
+result type of the function, e.g. `(int, int) -> bool` for `greaterThan` above.
+Function types may also be used to declare variables, in which case the
+function value is supplied at evaluation time and may be called from within the
+expression:
+
+```go
+env, _ := cel.NewEnv(
+    cel.Variable("cmp", cel.FunctionType(cel.BoolType, cel.IntType, cel.IntType)),
+)
+// The expression `cmp(1, 2)` invokes the value bound to `cmp` at evaluation
+// time, which is created with cel.FunctionVal:
+lessThan := cel.FunctionVal("cmp",
+    cel.FunctionType(cel.BoolType, cel.IntType, cel.IntType),
+    func(args ...ref.Val) ref.Val {
+        return types.Bool(args[0].(types.Int) < args[1].(types.Int))
+    })
+```
+
+Only the global (non-receiver) overloads of a function may be referenced as a
+value. When a function declares more than one global overload, the reference
+dispatches over them by argument type at evaluation time, and its type is the
+most general signature which describes them all; overloads which accept
+differing numbers of arguments cannot be referenced. Note also that function
+references and the invocation of function values are resolved by the
+type-checker, so they are not available in parse-only expressions.
+
 ### Evaluate
 
 Now, evaluate for fun and profit. The evaluation is thread-safe and side-effect

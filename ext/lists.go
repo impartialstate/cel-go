@@ -115,6 +115,35 @@ var comparableTypes = []*cel.Type{
 // [1,[2,[3,[4]]]].flatten(2) // return [1, 2, 3, [4]]
 // [1,[2,[3,[4]]]].flatten(-1) // error
 //
+// # Map
+//
+// Introduced in version: 4
+//
+// Returns a new list produced by applying a function value to every element of the list. The
+// function is a first-class function reference, either the name of a declared function or a
+// variable of function type.
+//
+//	<list(T)>.map(<function(U, T)>) -> <list(U)>
+//
+// Examples:
+//
+//	[[1], [1, 2]].map(size) // return [1, 2]
+//
+// # Filter
+//
+// Introduced in version: 4
+//
+// Returns the elements of the list for which the predicate function returns true.
+//
+//	<list(T)>.filter(<function(bool, T)>) -> <list(T)>
+//
+// Examples:
+//
+//	["true", "false", "true"].filter(bool) // return ["true", "true"]
+//
+// Note, the two-argument macro forms of map() and filter(), e.g. list.map(e, e * 2), remain
+// available and are unaffected by the single-argument function value forms.
+//
 // # Sort
 //
 // Introduced in version: 2 (cost support in version 3)
@@ -152,6 +181,38 @@ var comparableTypes = []*cel.Type{
 //	  Player { name: "baz", score: 1000 },
 //	].sortBy(e, e.score).map(e, e.name)
 //	== ["bar", "foo", "baz"]
+//
+// # SortBy (function value)
+//
+// Introduced in version: 4
+//
+// Sorts a list by the keys produced by applying a key function to each element. The key function
+// is a first-class function reference, either the name of a declared function or a variable of
+// function type, and its result type must be comparable.
+//
+//	<list(T)>.sortBy(<function(U, T)>) -> <list(T)>
+//	U in {int, uint, double, bool, duration, timestamp, string, bytes}
+//
+// Examples:
+//
+//	[[1, 2], [1], [1, 2, 3]].sortBy(size) // return [[1], [1, 2], [1, 2, 3]]
+//
+// # SortWith
+//
+// Introduced in version: 4
+//
+// Sorts a list using a comparator function which reports whether its first argument sorts before
+// its second. The sort is stable, so elements which the comparator does not order retain their
+// original relative order.
+//
+//	<list(T)>.sortWith(<function(bool, T, T)>) -> <list(T)>
+//
+// Examples:
+//
+//	[1, 3, 2].sortWith(greaterThan) // return [3, 2, 1] for a greaterThan of (int, int) -> bool
+//
+// Note, the cost of the function value invoked by map(), filter(), sortBy() and sortWith() is not
+// included in the cost estimate or the runtime cost of the call itself.
 func Lists(options ...ListsOption) cel.EnvOption {
 	l := &listsLib{version: math.MaxUint32}
 	for _, o := range options {
@@ -367,7 +428,68 @@ func (lib listsLib) CompileOptions() []cel.EnvOption {
 				),
 			)
 		}
+		if lib.version >= 4 {
+			estimators = append(estimators,
+				checker.OverloadCostEstimate("list_map_function", estimateListTraversal),
+				checker.OverloadCostEstimate("list_filter_function", estimateListTraversal),
+				checker.OverloadCostEstimate("list_sortWith_function", estimateListSortFunction(types.DynType)),
+			)
+			for _, t := range comparableTypes {
+				estimators = append(estimators,
+					checker.OverloadCostEstimate(
+						fmt.Sprintf("list_%s_sortBy_function", t.TypeName()),
+						estimateListSortFunction(t),
+					),
+				)
+			}
+		}
 		opts = append(opts, cel.CostEstimatorOptions(estimators...))
+	}
+	if lib.version >= 4 {
+		listU := cel.ListType(cel.TypeParamType("U"))
+		paramT := cel.TypeParamType("T")
+		paramU := cel.TypeParamType("U")
+		opts = append(opts, cel.Function("map",
+			cel.MemberOverload("list_map_function",
+				[]*cel.Type{listType, cel.FunctionType(paramU, paramT)}, listU,
+				cel.BinaryBinding(func(arg1, arg2 ref.Val) ref.Val {
+					return mapListWithFunction(arg1, arg2)
+				}),
+			),
+		))
+		opts = append(opts, cel.Function("filter",
+			cel.MemberOverload("list_filter_function",
+				[]*cel.Type{listType, cel.FunctionType(cel.BoolType, paramT)}, listType,
+				cel.BinaryBinding(func(arg1, arg2 ref.Val) ref.Val {
+					return filterListWithFunction(arg1, arg2)
+				}),
+			),
+		))
+		opts = append(opts, cel.Function("sortBy",
+			append(
+				templatedOverloads(comparableTypes, func(u *cel.Type) cel.FunctionOpt {
+					return cel.MemberOverload(
+						fmt.Sprintf("list_%s_sortBy_function", u.TypeName()),
+						[]*cel.Type{listType, cel.FunctionType(u, paramT)}, listType,
+					)
+				}),
+				cel.SingletonBinaryBinding(
+					func(arg1, arg2 ref.Val) ref.Val {
+						return sortListByKeyFunction(arg1, arg2)
+					},
+					// List traits
+					traits.ListerType,
+				),
+			)...,
+		))
+		opts = append(opts, cel.Function("sortWith",
+			cel.MemberOverload("list_sortWith_function",
+				[]*cel.Type{listType, cel.FunctionType(cel.BoolType, paramT, paramT)}, listType,
+				cel.BinaryBinding(func(arg1, arg2 ref.Val) ref.Val {
+					return sortListWithComparator(arg1, arg2)
+				}),
+			),
+		))
 	}
 
 	return opts
@@ -397,6 +519,21 @@ func (lib *listsLib) ProgramOptions() []cel.ProgramOption {
 					trackListSortBy,
 				),
 			)
+		}
+		if lib.version >= 4 {
+			trackers = append(trackers,
+				interpreter.OverloadCostTracker("list_map_function", trackListOutputSize),
+				interpreter.OverloadCostTracker("list_filter_function", trackListInputSize),
+				interpreter.OverloadCostTracker("list_sortWith_function", trackListSort),
+			)
+			for _, t := range comparableTypes {
+				trackers = append(trackers,
+					interpreter.OverloadCostTracker(
+						fmt.Sprintf("list_%s_sortBy_function", t.TypeName()),
+						trackListSort,
+					),
+				)
+			}
 		}
 		opts = append(opts, cel.CostTrackerOptions(trackers...))
 	}
@@ -467,6 +604,150 @@ func flatten(list traits.Lister, depth int64) ([]ref.Val, error) {
 	}
 
 	return newList, nil
+}
+
+// asListAndInvoker unpacks the receiver list and function value arguments common to the
+// higher-order list functions.
+//
+// The arguments are validated by the type-guards for the overload, so a failure here indicates
+// that type-guards were disabled or that the value was supplied by an unchecked expression.
+func asListAndInvoker(fnName string, listArg, fnArg ref.Val) (traits.Lister, traits.Invoker, ref.Val) {
+	list, ok := listArg.(traits.Lister)
+	if !ok {
+		return nil, nil, types.ValOrErr(listArg, "no such overload: %v.%s(%v)", listArg.Type(), fnName, fnArg.Type())
+	}
+	fn, ok := fnArg.(traits.Invoker)
+	if !ok {
+		return nil, nil, types.ValOrErr(fnArg, "no such overload: %v.%s(%v)", listArg.Type(), fnName, fnArg.Type())
+	}
+	return list, fn, nil
+}
+
+// mapListWithFunction applies a function value to every element of a list, returning the list of
+// results.
+//
+//	<list(T)>.map(<function(U, T)>) -> <list(U)>
+//
+// Example:
+//
+//	[1, 2, 3].map(double) // return [2, 4, 6] for a 'double' function of (int) -> int
+func mapListWithFunction(listArg, fnArg ref.Val) ref.Val {
+	list, fn, err := asListAndInvoker("map", listArg, fnArg)
+	if err != nil {
+		return err
+	}
+	mapped := make([]ref.Val, 0, list.Size().(types.Int))
+	for it := list.Iterator(); it.HasNext() == types.True; {
+		elem := fn.Invoke(it.Next())
+		if types.IsUnknownOrError(elem) {
+			return elem
+		}
+		mapped = append(mapped, elem)
+	}
+	return types.DefaultTypeAdapter.NativeToValue(mapped)
+}
+
+// filterListWithFunction retains the elements of a list for which the predicate function returns
+// true.
+//
+//	<list(T)>.filter(<function(bool, T)>) -> <list(T)>
+//
+// Example:
+//
+//	[1, 2, 3].filter(isOdd) // return [1, 3] for an 'isOdd' function of (int) -> bool
+func filterListWithFunction(listArg, fnArg ref.Val) ref.Val {
+	list, fn, err := asListAndInvoker("filter", listArg, fnArg)
+	if err != nil {
+		return err
+	}
+	filtered := []ref.Val{}
+	for it := list.Iterator(); it.HasNext() == types.True; {
+		elem := it.Next()
+		keep := fn.Invoke(elem)
+		if types.IsUnknownOrError(keep) {
+			return keep
+		}
+		matched, ok := keep.(types.Bool)
+		if !ok {
+			return types.NewErr("filter() predicate must return a bool, got %v", keep.Type())
+		}
+		if matched {
+			filtered = append(filtered, elem)
+		}
+	}
+	return types.DefaultTypeAdapter.NativeToValue(filtered)
+}
+
+// sortListByKeyFunction sorts a list according to the order of the keys produced by applying a
+// key function to each element.
+//
+//	<list(T)>.sortBy(<function(U, T)>) -> <list(T)>
+//	U in {int, uint, double, bool, duration, timestamp, string, bytes}
+//
+// Example:
+//
+//	["foo", "ba", "c"].sortBy(size) // return ["c", "ba", "foo"]
+func sortListByKeyFunction(listArg, fnArg ref.Val) ref.Val {
+	list, fn, err := asListAndInvoker("sortBy", listArg, fnArg)
+	if err != nil {
+		return err
+	}
+	keys := make([]ref.Val, 0, list.Size().(types.Int))
+	for it := list.Iterator(); it.HasNext() == types.True; {
+		key := fn.Invoke(it.Next())
+		if types.IsUnknownOrError(key) {
+			return key
+		}
+		keys = append(keys, key)
+	}
+	sorted, sortErr := sortListByAssociatedKeys(list, types.NewRefValList(types.DefaultTypeAdapter, keys))
+	if sortErr != nil {
+		return types.WrapErr(sortErr)
+	}
+	return sorted
+}
+
+// sortListWithComparator sorts a list using a comparator function which reports whether its first
+// argument sorts before its second.
+//
+// The sort is stable, and elements which the comparator does not order are left in their original
+// relative order.
+//
+//	<list(T)>.sortWith(<function(bool, T, T)>) -> <list(T)>
+//
+// Example:
+//
+//	[1, 3, 2].sortWith(greaterThan) // return [3, 2, 1]
+func sortListWithComparator(listArg, fnArg ref.Val) ref.Val {
+	list, cmp, err := asListAndInvoker("sortWith", listArg, fnArg)
+	if err != nil {
+		return err
+	}
+	elems := make([]ref.Val, 0, list.Size().(types.Int))
+	for it := list.Iterator(); it.HasNext() == types.True; {
+		elems = append(elems, it.Next())
+	}
+	var failure ref.Val
+	sort.SliceStable(elems, func(i, j int) bool {
+		if failure != nil {
+			return false
+		}
+		ordered := cmp.Invoke(elems[i], elems[j])
+		if types.IsUnknownOrError(ordered) {
+			failure = ordered
+			return false
+		}
+		less, ok := ordered.(types.Bool)
+		if !ok {
+			failure = types.NewErr("sortWith() comparator must return a bool, got %v", ordered.Type())
+			return false
+		}
+		return bool(less)
+	})
+	if failure != nil {
+		return failure
+	}
+	return types.DefaultTypeAdapter.NativeToValue(elems)
 }
 
 func sortList(list traits.Lister) (ref.Val, error) {
@@ -683,6 +964,19 @@ func estimateListSortBy(u *types.Type) checker.FunctionEstimator {
 	}
 }
 
+// estimateListSortFunction computes an O(n^2) sort operation over the target list for the sorts
+// which take a key or comparator function value as their single argument.
+//
+// Note, the cost of the function value itself is not known statically and is not included.
+func estimateListSortFunction(elemType *types.Type) checker.FunctionEstimator {
+	return func(estimator checker.CostEstimator, target *checker.AstNode, args []checker.AstNode) *checker.CallEstimate {
+		if target == nil || len(args) != 1 {
+			return nil
+		}
+		return estimateListSortCost(estimator, *target, elemType)
+	}
+}
+
 // estimateListSortCost estimates an O(n^2) sort operation with a cost factor of 2 for the equality
 // operations which occur during the sort computation.
 func estimateListSortCost(estimator checker.CostEstimator, node checker.AstNode, elemType *types.Type) *checker.CallEstimate {
@@ -693,6 +987,17 @@ func estimateListSortCost(estimator checker.CostEstimator, node checker.AstNode,
 		costFactor += common.StringTraversalCostFactor
 	}
 	return estimateAllocatingListCall(costFactor, sz.Multiply(sz))
+}
+
+// estimateListTraversal computes an O(n) traversal of the target list with a cost factor of 1.
+//
+// Note, the cost of the function value invoked for each element is not known statically and is
+// not included in the estimate.
+func estimateListTraversal(estimator checker.CostEstimator, target *checker.AstNode, args []checker.AstNode) *checker.CallEstimate {
+	if target == nil || len(args) != 1 {
+		return nil
+	}
+	return estimateAllocatingListCall(1, estimateSize(estimator, *target))
 }
 
 // estimateAllocatingListCall computes cost as a function of the size of the result list with a
@@ -725,6 +1030,11 @@ func trackListFlatten(args []ref.Val, _ ref.Val) *uint64 {
 	}
 	inputSize := actualSize(args[0])
 	return trackAllocatingListCall(depth, inputSize)
+}
+
+// trackListInputSize computes cost as a function of the size of the input list.
+func trackListInputSize(args []ref.Val, _ ref.Val) *uint64 {
+	return trackAllocatingListCall(1, actualSize(args[0]))
 }
 
 // trackListDistinct computes costs as a worst-case O(n^2) operation over the input list.

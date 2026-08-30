@@ -27,6 +27,7 @@ import (
 	"github.com/google/cel-go/common/containers"
 	"github.com/google/cel-go/common/decls"
 	"github.com/google/cel-go/common/operators"
+	"github.com/google/cel-go/common/overloads"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
 )
@@ -126,9 +127,94 @@ func (c *checker) checkIdent(e ast.Expr) {
 		e.SetKindCase(c.NewIdent(e.ID(), name))
 		return
 	}
+	// An identifier which does not resolve to a variable may still name a declared function, in
+	// which case the identifier refers to the function itself rather than to a call of it.
+	if fn := c.env.lookupFunction(identName); fn != nil {
+		c.checkFunctionRef(e, fn)
+		return
+	}
 
 	c.setType(e, types.ErrorType)
 	c.errors.undeclaredReference(e.ID(), c.location(e), c.env.container.Name(), identName)
+}
+
+// checkFunctionRef type-checks a reference to a declared function which is used as a value, e.g.
+// the `greaterThan` in `[1, 2, 3].sortWith(greaterThan)`.
+//
+// Only the global (non-receiver) overloads of a function may be referenced as a value, as a
+// receiver-style call has no operand to act as its target. When more than one global overload is
+// declared the reference dispatches over them at runtime, so the type of the reference is the
+// most general signature which describes them all.
+func (c *checker) checkFunctionRef(e ast.Expr, fn *decls.FunctionDecl) {
+	candidates := []*decls.OverloadDecl{}
+	for _, overload := range fn.OverloadDecls() {
+		if c.env.isOverloadDisabled(overload.ID()) || overload.IsMemberFunction() {
+			continue
+		}
+		candidates = append(candidates, overload)
+	}
+	if len(candidates) == 0 {
+		c.setType(e, types.ErrorType)
+		c.errors.noReferenceableOverload(e.ID(), c.location(e), fn.Name())
+		return
+	}
+	fnType, ok := c.functionRefType(candidates)
+	if !ok {
+		c.setType(e, types.ErrorType)
+		c.errors.ambiguousFunctionReference(e.ID(), c.location(e), fn.Name())
+		return
+	}
+	c.setType(e, fnType)
+	overloadIDs := make([]string, len(candidates))
+	for i, overload := range candidates {
+		overloadIDs[i] = overload.ID()
+	}
+	fnRef := ast.NewFunctionReference(overloadIDs...)
+	fnRef.Name = fn.Name()
+	c.setReference(e, fnRef)
+	// Overwrite the expression with an identifier for the fully-qualified function name. Select
+	// expressions which resolve to a namespaced function are rewritten in this same manner.
+	e.SetKindCase(c.NewIdent(e.ID(), fn.Name()))
+}
+
+// functionRefType computes the type of a function reference from the set of overloads it may
+// dispatch to, returning false if the overloads do not agree on an argument count.
+func (c *checker) functionRefType(candidates []*decls.OverloadDecl) (*types.Type, bool) {
+	first := candidates[0]
+	if len(candidates) == 1 {
+		fnType := newFunctionType(first.ResultType(), first.ArgTypes()...)
+		typeParams := first.TypeParams()
+		if len(typeParams) == 0 {
+			return fnType, true
+		}
+		// Instantiate the overload's type with fresh type variables so that a reference to a
+		// parameterized function may be unified with the signature expected at the use site.
+		substitutions := newMapping()
+		for _, typeParam := range typeParams {
+			substitutions.add(types.NewTypeParamType(typeParam), c.newTypeVar())
+		}
+		return substitute(substitutions, fnType, false), true
+	}
+	// Multiple overloads are resolved by runtime dispatch, so the reference is described by the
+	// least specific signature which accepts all of them. Type parameters are replaced with dyn
+	// as they cannot be unified consistently across independent overloads.
+	toDyn := newMapping()
+	resultType := substitute(toDyn, first.ResultType(), true)
+	argTypes := substituteParams(toDyn, first.ArgTypes(), true)
+	for _, overload := range candidates[1:] {
+		if len(overload.ArgTypes()) != len(argTypes) {
+			return nil, false
+		}
+		if overloadResult := substitute(toDyn, overload.ResultType(), true); !overloadResult.IsExactType(resultType) {
+			resultType = types.DynType
+		}
+		for i, argType := range substituteParams(toDyn, overload.ArgTypes(), true) {
+			if !argType.IsExactType(argTypes[i]) {
+				argTypes[i] = types.DynType
+			}
+		}
+	}
+	return newFunctionType(resultType, argTypes...), true
 }
 
 func (c *checker) checkSelect(e ast.Expr) {
@@ -150,6 +236,12 @@ func (c *checker) checkSelect(e ast.Expr) {
 			c.setType(e, ident.Type())
 			c.setReference(e, ast.NewIdentReference(name, ident.Value()))
 			e.SetKindCase(c.NewIdent(e.ID(), name))
+			return
+		}
+		// The qualified name may refer to a namespaced function, e.g. `math.least`, which is
+		// being used as a value rather than being called.
+		if fn := c.env.lookupFunction(strings.Join(qualifiers, ".")); fn != nil {
+			c.checkFunctionRef(e, fn)
 			return
 		}
 	}
@@ -278,6 +370,11 @@ func (c *checker) checkCall(e ast.Expr) {
 		// Check for the existence of the function.
 		fn := c.env.lookupFunction(fnName)
 		if fn == nil {
+			// The name may refer to a variable which holds a function value, in which case the
+			// call invokes the value rather than a declared function.
+			if c.checkInvoke(e, fnName, args) {
+				return
+			}
 			c.errors.undeclaredReference(e.ID(), c.location(e), c.env.container.Name(), fnName)
 			c.setType(e, types.ErrorType)
 			return
@@ -307,6 +404,10 @@ func (c *checker) checkCall(e ast.Expr) {
 			c.resolveOverloadOrError(e, fn, nil, args)
 			return
 		}
+		// The namespaced name may also refer to a variable which holds a function value.
+		if c.checkInvoke(e, maybeQualifiedName, args) {
+			return
+		}
 	}
 
 	// Regular instance call.
@@ -320,6 +421,50 @@ func (c *checker) checkCall(e ast.Expr) {
 	// Function name not declared, record error.
 	c.setType(e, types.ErrorType)
 	c.errors.undeclaredReference(e.ID(), c.location(e), c.env.container.Name(), fnName)
+}
+
+// checkInvoke type-checks a call whose name resolves to a variable of function type, e.g. a
+// function reference bound to a variable or to a comprehension variable.
+//
+// The call expression is rewritten as a global call to the fully-qualified variable name and is
+// annotated with the overloads.Invoke reference so that the planner knows to resolve the callee
+// as a value. Returns whether the call was resolved as an invocation.
+func (c *checker) checkInvoke(e ast.Expr, name string, args []ast.Expr) bool {
+	ident := c.env.resolveSimpleIdent(name)
+	if ident == nil {
+		return false
+	}
+	fnType := substitute(c.mappings, ident.Type(), false)
+	if !types.IsFunctionType(fnType) {
+		return false
+	}
+	identName := strings.TrimPrefix(ident.Name(), ".")
+	if ident.requiresDisambiguation {
+		identName = "." + identName
+	}
+
+	argTypes := make([]*types.Type, len(args))
+	for i, arg := range args {
+		argTypes[i] = c.getType(arg)
+	}
+	paramTypes := types.FunctionArgTypes(fnType)
+	if len(argTypes) != len(paramTypes) || !c.isAssignableList(argTypes, paramTypes) {
+		for i, argType := range argTypes {
+			argTypes[i] = substitute(c.mappings, argType, true)
+		}
+		c.errors.noMatchingOverload(e.ID(), c.location(e), identName, argTypes, false)
+		c.setType(e, types.ErrorType)
+		return true
+	}
+	// Rewrite the call so that it is always a global call on the resolved variable name. The
+	// receiver-style form `a.b(x)` is only reached here when `a.b` names a function-typed
+	// variable, in which case the target is not an operand of the call.
+	e.SetKindCase(c.NewCall(e.ID(), identName, args...))
+	c.setType(e, substitute(c.mappings, types.FunctionResultType(fnType), false))
+	invokeRef := ast.NewFunctionReference(overloads.Invoke)
+	invokeRef.Name = identName
+	c.setReference(e, invokeRef)
+	return true
 }
 
 func (c *checker) resolveOverloadOrError(

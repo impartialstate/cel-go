@@ -12,6 +12,7 @@ go_library(
         "container.go",
         "field_tester.go",
         "indexer.go",
+        "invoker.go",
         "iterator.go",
         "lister.go",
         "mapper.go",

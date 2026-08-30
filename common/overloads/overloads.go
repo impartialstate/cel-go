@@ -305,6 +305,10 @@ const (
 	Next     = "@next"
 )
 
+// Invoke is the overload id recorded by the type-checker for calls which invoke a function value
+// rather than a declared function, e.g. a variable declared with a function type.
+const Invoke = "@invoke"
+
 // IsTypeConversionFunction returns whether the input function is a standard library type
 // conversion function.
 func IsTypeConversionFunction(function string) bool {

@@ -41,6 +41,38 @@ func TestOverlappingMacro(t *testing.T) {
 	}
 }
 
+func TestOverlappingMacroReceiverArgCount(t *testing.T) {
+	// A receiver-style macro arg count does not include the target of the call, whereas the
+	// argument types of a member overload do, so a single-argument member function does not
+	// overlap with a two-argument receiver macro of the same name.
+	env := newStdEnv(t)
+	mapFn, err := decls.NewFunction("map",
+		decls.MemberOverload("list_map_function",
+			[]*types.Type{types.NewListType(types.NewTypeParamType("T")), types.DynType},
+			types.NewListType(types.DynType)))
+	if err != nil {
+		t.Fatalf("decls.NewFunction() failed: %v", err)
+	}
+	if err := env.AddFunctions(mapFn); err != nil {
+		t.Errorf("AddFunctions() failed: %v", err)
+	}
+	// Whereas a member overload which accepts two arguments beyond the target does overlap.
+	env = newStdEnv(t)
+	mapFn, err = decls.NewFunction("map",
+		decls.MemberOverload("list_map_overlap",
+			[]*types.Type{types.NewListType(types.NewTypeParamType("T")), types.DynType, types.DynType},
+			types.NewListType(types.DynType)))
+	if err != nil {
+		t.Fatalf("decls.NewFunction() failed: %v", err)
+	}
+	err = env.AddFunctions(mapFn)
+	if err == nil {
+		t.Error("Got nil, wanted error")
+	} else if !strings.Contains(err.Error(), "overlapping macro") {
+		t.Errorf("Got %v, wanted overlapping macro error", err)
+	}
+}
+
 func TestCopyDeclarations(t *testing.T) {
 	src := common.NewTextSource(`1 + 2 != 3 - 4`)
 	parsedAst, errors := parser.Parse(src)

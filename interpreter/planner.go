@@ -22,7 +22,9 @@ import (
 	"github.com/google/cel-go/common/containers"
 	"github.com/google/cel-go/common/functions"
 	"github.com/google/cel-go/common/operators"
+	"github.com/google/cel-go/common/overloads"
 	"github.com/google/cel-go/common/types"
+	"github.com/google/cel-go/common/types/ref"
 )
 
 // newPlanner creates an interpretablePlanner which references a Dispatcher, TypeProvider,
@@ -148,6 +150,11 @@ func (p *planBuilder) planCheckedIdent(id int64, identRef *ast.ReferenceInfo) (I
 		return NewConstValue(id, identRef.Value), nil
 	}
 
+	// An identifier annotated with an overload id refers to a declared function used as a value.
+	if len(identRef.OverloadIDs) != 0 {
+		return p.planFunctionRef(id, identRef)
+	}
+
 	// Check to see whether the type map indicates this is a type name. All types should be
 	// registered with the provider.
 	cType := p.typeMap[id]
@@ -164,6 +171,55 @@ func (p *planBuilder) planCheckedIdent(id int64, identRef *ast.ReferenceInfo) (I
 		adapter: p.adapter,
 		attr:    p.attrFactory.AbsoluteAttribute(id, identRef.Name),
 	}, nil
+}
+
+// planFunctionRef creates an Interpretable which resolves to the function value associated with a
+// declared function referenced by name, e.g. the `greaterThan` in `list.sortWith(greaterThan)`.
+func (p *planBuilder) planFunctionRef(id int64, identRef *ast.ReferenceInfo) (Interpretable, error) {
+	fnType := p.typeMap[id]
+	if !types.IsFunctionType(fnType) {
+		return nil, fmt.Errorf("reference to function %s is not a function value", identRef.Name)
+	}
+	// A reference to a single overload calls that overload directly, whereas a reference to a
+	// function with multiple overloads dispatches over them by argument type at runtime using the
+	// binding registered under the function name.
+	var impl *functions.Overload
+	var found bool
+	if len(identRef.OverloadIDs) == 1 {
+		impl, found = p.disp.FindOverload(identRef.OverloadIDs[0])
+	}
+	if !found {
+		impl, found = p.disp.FindOverload(identRef.Name)
+	}
+	if !found {
+		return nil, fmt.Errorf("no such overload: %s", identRef.Name)
+	}
+	fnVal := types.NewFunctionVal(identRef.Name, fnType, overloadInvoker(identRef.Name, impl))
+	return NewConstValue(id, fnVal), nil
+}
+
+// overloadInvoker adapts a dispatcher binding to the implementation signature used by function
+// values, preferring the most specific binding available for the argument count.
+func overloadInvoker(name string, impl *functions.Overload) func(args ...ref.Val) ref.Val {
+	return func(args ...ref.Val) ref.Val {
+		if impl.OperandTrait != 0 && len(args) != 0 && !args[0].Type().HasTrait(impl.OperandTrait) {
+			return types.MaybeNoSuchOverloadErr(args[0])
+		}
+		switch len(args) {
+		case 1:
+			if impl.Unary != nil {
+				return impl.Unary(args[0])
+			}
+		case 2:
+			if impl.Binary != nil {
+				return impl.Binary(args[0], args[1])
+			}
+		}
+		if impl.Function != nil {
+			return impl.Function(args...)
+		}
+		return types.NewErr("no such overload: %s", name)
+	}
 }
 
 // planSelect creates an Interpretable with either:
@@ -271,6 +327,12 @@ func (p *planBuilder) planCall(expr ast.Expr) (Interpretable, error) {
 		return p.planCallIndex(expr, args, true)
 	}
 
+	// Invocation of a function value, e.g. a variable declared with a function type, rather than
+	// a call of a declared function.
+	if oName == overloads.Invoke {
+		return p.planInvoke(expr, fnName, args)
+	}
+
 	// Otherwise, generate Interpretable calls specialized by argument count.
 	// Try to find the specific function by overload id.
 	var fnDef *functions.Overload
@@ -301,6 +363,21 @@ func (p *planBuilder) planCall(expr ast.Expr) (Interpretable, error) {
 	default:
 		return p.planCallVarArgs(expr, fnName, oName, fnDef, args)
 	}
+}
+
+// planInvoke generates an Interpretable which resolves a function value by name and calls it with
+// the planned arguments.
+func (p *planBuilder) planInvoke(expr ast.Expr, fnName string, args []Interpretable) (Interpretable, error) {
+	fn := &evalAttr{
+		adapter: p.adapter,
+		attr:    p.attrFactory.AbsoluteAttribute(expr.ID(), fnName),
+	}
+	return &evalInvoke{
+		id:   expr.ID(),
+		name: fnName,
+		fn:   fn,
+		args: args,
+	}, nil
 }
 
 // planCallZero generates a zero-arity callable Interpretable.

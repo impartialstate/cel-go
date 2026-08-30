@@ -428,6 +428,12 @@ func TestConfigAddVariableDecls(t *testing.T) {
 			out:  NewVariable("var", NewTypeDesc("bitvector")),
 		},
 		{
+			name: "function var decl",
+			in:   decls.NewVariable("var", types.NewFunctionType(types.BoolType, types.IntType, types.IntType)),
+			out: NewVariable("var",
+				NewTypeDesc("function", NewTypeDesc("bool"), NewTypeDesc("int"), NewTypeDesc("int"))),
+		},
+		{
 			name: "proto var decl",
 			in:   decls.NewVariable("var", types.NewObjectType("google.type.Expr")),
 			out:  NewVariable("var", NewTypeDesc("google.type.Expr")),
@@ -722,6 +728,17 @@ func TestVariableAsCELVariable(t *testing.T) {
 			want: decls.NewVariable("set_var", types.NewOpaqueType("set", types.StringType)),
 		},
 		{
+			name: "function type",
+			v: &Variable{
+				Name: "cmp",
+				TypeDesc: NewTypeDesc("function",
+					NewTypeDesc("bool"), NewTypeParam("T"), NewTypeParam("T")),
+			},
+			want: decls.NewVariable("cmp",
+				types.NewFunctionType(types.BoolType,
+					types.NewTypeParamType("T"), types.NewTypeParamType("T"))),
+		},
+		{
 			name: "string type - nested type precedence",
 			v: &Variable{
 				Name:     "hello",
@@ -1000,6 +1017,16 @@ func TestTypeDescAsCELTypeErrors(t *testing.T) {
 			name: "invalid list",
 			t:    &TypeDesc{TypeName: "list"},
 			want: errors.New("expects 1 parameter"),
+		},
+		{
+			name: "invalid function",
+			t:    &TypeDesc{TypeName: "function"},
+			want: errors.New("function expects at least 1 parameter"),
+		},
+		{
+			name: "invalid function param type",
+			t:    &TypeDesc{TypeName: "function", Params: []*TypeDesc{{}}},
+			want: errors.New("invalid type"),
 		},
 		{
 			name: "invalid list param type",

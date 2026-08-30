@@ -518,6 +518,67 @@ Examples:
 	].sortBy(e, e.score).map(e, e.name)
 	== ["bar", "foo", "baz"]
 
+### Map (function value)
+
+**Introduced in version 4**
+
+Returns a new list produced by applying a function value to every element of the
+list. The function is a first-class function reference: either the name of a
+declared function, or a variable declared with a function type.
+
+    <list(T)>.map(<function(U, T)>) -> <list(U)>
+
+Examples:
+
+    [[1], [1, 2]].map(size) // return [1, 2]
+
+The two-argument macro form, `list.map(e, e * 2)`, remains available and is
+unaffected.
+
+### Filter (function value)
+
+**Introduced in version 4**
+
+Returns the elements of the list for which the predicate function returns true.
+
+    <list(T)>.filter(<function(bool, T)>) -> <list(T)>
+
+Examples:
+
+    [1, 2, 3, 4].filter(isOdd) // return [1, 3] for an isOdd of (int) -> bool
+
+### SortBy (function value)
+
+**Introduced in version 4**
+
+Sorts a list by the keys produced by applying a key function to each element.
+The result type of the key function must be comparable.
+
+    <list(T)>.sortBy(<function(U, T)>) -> <list(T)>
+    U in {int, uint, double, bool, duration, timestamp, string, bytes}
+
+Examples:
+
+    [[1, 2], [1], [1, 2, 3]].sortBy(size) // return [[1], [1, 2], [1, 2, 3]]
+
+### SortWith
+
+**Introduced in version 4**
+
+Sorts a list using a comparator function which reports whether its first
+argument sorts before its second. The sort is stable, so elements which the
+comparator does not order retain their original relative order.
+
+    <list(T)>.sortWith(<function(bool, T, T)>) -> <list(T)>
+
+Examples:
+
+    [1, 3, 2].sortWith(greaterThan) // return [3, 2, 1] for a greaterThan of (int, int) -> bool
+
+Note, the cost of the function value invoked by `map()`, `filter()`, `sortBy()`
+and `sortWith()` is not included in the cost estimate or the runtime cost of the
+call itself.
+
 ### Last
 
 **Introduced in the OptionalTypes library version 2**

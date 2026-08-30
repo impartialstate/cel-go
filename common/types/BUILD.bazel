@@ -15,6 +15,7 @@ go_library(
         "double.go",
         "duration.go",
         "err.go",
+        "function.go",
         "int.go",
         "iterator.go",
         "json_value.go",
@@ -62,6 +63,7 @@ go_test(
         "bytes_test.go",
         "double_test.go",
         "duration_test.go",
+        "function_test.go",
         "int_test.go",
         "json_list_test.go",
         "json_struct_test.go",
@@ -81,6 +83,7 @@ go_test(
     embed = [":go_default_library"],
     deps = [
         "//common/types/ref:go_default_library",
+        "//common/types/traits:go_default_library",
         "//test:go_default_library",
         "//test/proto3pb:test_all_types_go_proto",
         "@org_golang_google_genproto_googleapis_api//expr/v1alpha1:go_default_library",

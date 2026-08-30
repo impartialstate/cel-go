@@ -402,6 +402,14 @@ func (t *Type) String() string {
 	if t.Kind() == TypeParamKind {
 		return fmt.Sprintf("<%s>", t.DeclaredTypeName())
 	}
+	if IsFunctionType(t) {
+		argTypes := FunctionArgTypes(t)
+		args := make([]string, len(argTypes))
+		for i, at := range argTypes {
+			args[i] = at.String()
+		}
+		return fmt.Sprintf("(%s) -> %s", strings.Join(args, ", "), FunctionResultType(t))
+	}
 	if len(t.Parameters()) == 0 {
 		return t.DeclaredTypeName()
 	}
@@ -528,10 +536,18 @@ func NewOptionalType(param *Type) *Type {
 
 // NewOpaqueType creates an abstract parameterized type with a given name.
 func NewOpaqueType(name string, params ...*Type) *Type {
+	traitMask := 0
+	if name == FunctionTypeName && len(params) >= 1 {
+		// Function types are opaque types with a well-known name whose values may be invoked,
+		// and are recognized here so that types created by conversion from other representations
+		// are indistinguishable from those created by NewFunctionType.
+		traitMask = traits.InvokerType
+	}
 	return &Type{
 		kind:            OpaqueKind,
 		parameters:      params,
 		runtimeTypeName: name,
+		traitMask:       traitMask,
 	}
 }
 

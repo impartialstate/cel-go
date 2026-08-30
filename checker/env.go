@@ -260,10 +260,16 @@ func (e *Env) setFunction(fn *decls.FunctionDecl) []errorMsg {
 		current = fn
 	}
 	for _, overload := range current.OverloadDecls() {
+		// Member overloads include the receiver as their first argument type, whereas the arg
+		// count of a receiver-style macro does not include the target of the call.
+		argCount := len(overload.ArgTypes())
+		if overload.IsMemberFunction() {
+			argCount--
+		}
 		for _, macro := range parser.AllMacros {
 			if macro.Function() == current.Name() &&
 				macro.IsReceiverStyle() == overload.IsMemberFunction() &&
-				macro.ArgCount() == len(overload.ArgTypes()) {
+				macro.ArgCount() == argCount {
 				errMsgs = append(errMsgs, overlappingMacroError(current.Name(), macro.ArgCount()))
 			}
 		}

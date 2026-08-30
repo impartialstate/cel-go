@@ -844,6 +844,15 @@ func (td *TypeDesc) Validate() error {
 			return fmt.Errorf("invalid type: type expects 0 or 1 parameters, got %d", len(td.Params))
 		}
 		return td.Params[0].Validate()
+	case types.FunctionTypeName:
+		if len(td.Params) == 0 {
+			return fmt.Errorf("invalid type: function expects at least 1 parameter, got %d", len(td.Params))
+		}
+		for _, p := range td.Params {
+			if err := p.Validate(); err != nil {
+				return err
+			}
+		}
 	default:
 	}
 	return nil
@@ -938,6 +947,17 @@ func (td *TypeDesc) AsCELType(tp types.Provider) (*types.Type, error) {
 			return nil, err
 		}
 		return types.NewTypeTypeWithParam(pt), nil
+	case types.FunctionTypeName:
+		// The first parameter of a function type is its result type, and the remainder are its
+		// argument types in declaration order.
+		params := make([]*types.Type, len(td.Params))
+		for i, p := range td.Params {
+			params[i], err = p.AsCELType(tp)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return types.NewFunctionType(params[0], params[1:]...), nil
 	default:
 		if td.IsTypeParam {
 			return types.NewTypeParamType(td.TypeName), nil

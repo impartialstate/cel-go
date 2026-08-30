@@ -64,6 +64,9 @@ const (
 
 	// FoldableType types support comprehensions v2 macros which iterate over (key, value) pairs.
 	FoldableType
+
+	// InvokerType types may be called as functions via the Invoker interface.
+	InvokerType
 )
 
 const (

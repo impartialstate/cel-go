@@ -123,6 +123,15 @@ var (
 	OptionalType = types.NewOptionalType
 	// OpaqueType creates an abstract parameterized type with a given name.
 	OpaqueType = types.NewOpaqueType
+	// FunctionType creates a function type whose first type parameter is the function result and
+	// whose remaining type parameters are the function arguments, in order.
+	//
+	// Values of a function type are produced by referencing a declared function by name within an
+	// expression, or by binding a variable of a function type to a FunctionVal at evaluation time.
+	FunctionType = types.NewFunctionType
+	// FunctionVal creates a function value with a name, function type, and implementation which
+	// may be bound to a variable declared with a function type.
+	FunctionVal = types.NewFunctionVal
 	// ObjectType creates a type references to an externally defined type, e.g. a protobuf message type.
 	ObjectType = types.NewObjectType
 	// TypeParamType creates a parameterized type instance.
