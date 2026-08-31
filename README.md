@@ -193,6 +193,34 @@ value's declared cost against the evaluation's budget, so a cost limit also
 covers work done inside a higher-order call. Values which declare
 `cel.UnknownCallEstimate()` are charged a baseline cost of one per invocation.
 
+##### Function values from expressions
+
+A function value does not have to be implemented in Go. `Env.FunctionValue`
+turns a checked expression into one, taking the variables which become its
+parameters:
+
+```go
+lambdas, _ := cel.NewEnv(cel.Variable("a", cel.IntType), cel.Variable("b", cel.IntType))
+ast, _ := lambdas.Compile(`a > b`)
+descending, _ := lambdas.FunctionValue("descending", ast, []string{"a", "b"})
+// descending has the type (int, int) -> bool, and sorts a list when bound to a
+// variable of that type:
+//     [1, 3, 2].sortWith(descending)  // [3, 2, 1]
+```
+
+A checked expression is fully specified, so its parameters have to account for
+every variable it references; a reference to any other variable is an error
+here rather than a value the function would have no way to supply. The
+expression is evaluated against its arguments alone, which is what lets the
+same value be called from any evaluation.
+
+The cost declared for a call is the estimated cost of the expression, charged
+against the calling evaluation's budget on each invocation, so a cost limit
+reaches inside a higher-order call. Pass `cel.FunctionValueCostEstimator` to
+bound the size of the parameters and tighten that estimate, or
+`cel.FunctionValueCallEstimate` to declare it outright when the cost of the
+expression cannot be bounded statically.
+
 ##### Writing a higher-order function
 
 An implementation which invokes a function value needs the execution frame of

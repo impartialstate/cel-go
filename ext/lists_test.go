@@ -224,6 +224,117 @@ func TestListsHigherOrderFunctionsSealCallee(t *testing.T) {
 	}
 }
 
+func TestListsHigherOrderFunctionsWithCompiledExpressions(t *testing.T) {
+	// The function values passed to the higher-order list functions are compiled expressions
+	// rather than Go implementations.
+	lambdas, err := cel.NewEnv(
+		cel.Variable("a", cel.IntType),
+		cel.Variable("b", cel.IntType),
+		cel.Variable("e", cel.IntType),
+	)
+	if err != nil {
+		t.Fatalf("cel.NewEnv() failed: %v", err)
+	}
+	fnVal := func(name, expr string, params ...string) *types.Function {
+		t.Helper()
+		ast, iss := lambdas.Compile(expr)
+		if iss.Err() != nil {
+			t.Fatalf("lambdas.Compile(%q) failed: %v", expr, iss.Err())
+		}
+		fn, err := lambdas.FunctionValue(name, ast, params)
+		if err != nil {
+			t.Fatalf("lambdas.FunctionValue(%q) failed: %v", expr, err)
+		}
+		return fn
+	}
+	descending := fnVal("descending", `a > b`, "a", "b")
+	negate := fnVal("negate", `-e`, "e")
+	odd := fnVal("odd", `e % 2 != 0`, "e")
+
+	env := testListsEnv(t,
+		cel.Variable("descending", descending.Signature()),
+		cel.Variable("negate", negate.Signature()),
+		cel.Variable("odd", odd.Signature()))
+	vars := map[string]any{"descending": descending, "negate": negate, "odd": odd}
+	tests := []string{
+		`[1, 3, 2].sortWith(descending) == [3, 2, 1]`,
+		`[1, 2, 3].map(negate) == [-1, -2, -3]`,
+		`[1, 2, 3, 4].filter(odd) == [1, 3]`,
+		`[-1, 3, -2].sortBy(negate) == [3, -1, -2]`,
+	}
+	for _, tst := range tests {
+		expr := tst
+		t.Run(expr, func(t *testing.T) {
+			ast, iss := env.Compile(expr)
+			if iss.Err() != nil {
+				t.Fatalf("env.Compile(%v) failed: %v", expr, iss.Err())
+			}
+			prg, err := env.Program(ast)
+			if err != nil {
+				t.Fatalf("env.Program() failed: %v", err)
+			}
+			out, _, err := prg.Eval(vars)
+			if err != nil {
+				t.Fatalf("prg.Eval() failed: %v", err)
+			}
+			if out != types.True {
+				t.Errorf("prg.Eval() got %v, wanted true for expr: %s", out, expr)
+			}
+		})
+	}
+}
+
+func TestListsHigherOrderFunctionCompiledExpressionCost(t *testing.T) {
+	// The cost declared by a function value built from an expression is the estimated cost of
+	// that expression, and is charged once per element of the list it is applied to.
+	lambdas, err := cel.NewEnv(cel.Variable("e", cel.IntType))
+	if err != nil {
+		t.Fatalf("cel.NewEnv() failed: %v", err)
+	}
+	ast, iss := lambdas.Compile(`e * 2 + 1`)
+	if iss.Err() != nil {
+		t.Fatalf("lambdas.Compile() failed: %v", iss.Err())
+	}
+	fn, err := lambdas.FunctionValue("calc", ast, []string{"e"})
+	if err != nil {
+		t.Fatalf("lambdas.FunctionValue() failed: %v", err)
+	}
+	perCall := fn.CallCost()
+	if perCall == 0 {
+		t.Fatalf("CallCost() got 0, wanted the estimated cost of the expression")
+	}
+	env := testListsEnv(t, cel.Variable("calc", fn.Signature()))
+	callAst, iss := env.Compile(`[1, 2, 3].map(calc)`)
+	if iss.Err() != nil {
+		t.Fatalf("env.Compile() failed: %v", iss.Err())
+	}
+	prg, err := env.Program(callAst, cel.CostTracking(nil))
+	if err != nil {
+		t.Fatalf("env.Program() failed: %v", err)
+	}
+	out, det, err := prg.Eval(map[string]any{"calc": fn})
+	if err != nil {
+		t.Fatalf("prg.Eval() failed: %v", err)
+	}
+	want := types.DefaultTypeAdapter.NativeToValue([]int64{3, 5, 7})
+	if out.Equal(want) != types.True {
+		t.Errorf("prg.Eval() got %v, wanted %v", out, want)
+	}
+	if det.ActualCost() == nil || *det.ActualCost() < 3*perCall {
+		t.Errorf("ActualCost() got %v, wanted at least %d for three calls", det.ActualCost(), 3*perCall)
+	}
+
+	// A cost limit therefore reaches into the expression the function value was built from.
+	prg, err = env.Program(callAst, cel.CostTracking(nil), cel.CostLimit(perCall))
+	if err != nil {
+		t.Fatalf("env.Program() failed: %v", err)
+	}
+	_, _, err = prg.Eval(map[string]any{"calc": fn})
+	if err == nil || !strings.Contains(err.Error(), "actual cost limit exceeded") {
+		t.Errorf("prg.Eval() got %v, wanted a cost limit error", err)
+	}
+}
+
 func TestListsHigherOrderFunctionCompileErrors(t *testing.T) {
 	listsTests := []struct {
 		expr string
