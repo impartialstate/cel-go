@@ -104,6 +104,11 @@ func FunctionCallEstimate(t *Type) common.CallEstimate {
 // Function values are produced by referencing a declared function by name within an expression,
 // or by binding a variable declared with a function type to a Function instance at evaluation
 // time.
+//
+// A call receives exactly the arguments declared by the function's type: the frame passed to the
+// implementation accounts for the cost of the call but carries no access to the variable bindings
+// of the expression which made it, and an invocation with any other number of arguments is an
+// error. An implementation therefore cannot read the state of its caller.
 type Function struct {
 	name     string
 	fnType   *Type
@@ -130,7 +135,9 @@ var (
 // declare an unknown estimate are charged DefaultCallCost per invocation.
 //
 // The implementation receives the execution frame of the evaluation which invoked it as its first
-// argument. The frame is nil when the value is invoked outside of an evaluation.
+// argument, which accounts for the cost of the call and is nil when the value is invoked outside
+// of an evaluation. The frame provides no access to the caller's variable bindings, so the
+// arguments are the only inputs to the implementation.
 func NewFunctionVal(name string,
 	fnType *Type, estimate common.CallEstimate, impl functions.FrameOp) *Function {
 	return &Function{name: name, fnType: fnType, estimate: estimate, impl: impl}
@@ -170,6 +177,9 @@ func (f *Function) Arity() int {
 }
 
 // Invoke implements the traits.Invoker interface method.
+//
+// The arguments are the only inputs to the call, and must match the arity declared by the
+// function's type exactly.
 //
 // The frame is charged the function's declared cost before the implementation is called, and an
 // error is returned if that exceeds the evaluation's cost limit. A nil frame skips cost

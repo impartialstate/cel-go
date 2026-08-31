@@ -303,6 +303,15 @@ func TestFunctionRefCompileErrors(t *testing.T) {
 			err:  "found no matching overload for 'cmp' applied to '(string, string)'",
 		},
 		{
+			// A call passes exactly the arguments the function type declares.
+			expr: `cmp(1, 2, 3)`,
+			err:  "found no matching overload for 'cmp' applied to '(int, int, int)'",
+		},
+		{
+			expr: `cmp()`,
+			err:  "found no matching overload for 'cmp' applied to '()'",
+		},
+		{
 			expr: `notAFunction(1)`,
 			err:  "undeclared reference to 'notAFunction'",
 		},
@@ -572,7 +581,6 @@ func costlyCmpVal() *types.Function {
 
 func TestFrameBinding(t *testing.T) {
 	env, err := NewEnv(
-		Variable("budget", IntType),
 		// An extension which reports what the evaluation has cost so far, and which charges for
 		// the work it performs itself.
 		Function("costSoFar",
@@ -582,16 +590,6 @@ func TestFrameBinding(t *testing.T) {
 						return types.WrapErr(err)
 					}
 					return types.Int(frame.Cost())
-				}))),
-		// An extension which reads a variable from the frame rather than from its arguments.
-		Function("budgetRemaining",
-			Overload("budget_remaining", []*Type{}, IntType,
-				FrameBinding(func(frame ExecutionFrame, args ...ref.Val) ref.Val {
-					budget, found := frame.ResolveName("budget")
-					if !found {
-						return types.NewErr("no budget")
-					}
-					return types.DefaultTypeAdapter.NativeToValue(budget)
 				}))),
 		// A frame-bound function with more than one overload dispatches over them at runtime.
 		Function("describe",
@@ -611,7 +609,6 @@ func TestFrameBinding(t *testing.T) {
 		expr string
 		out  ref.Val
 	}{
-		{expr: `budgetRemaining()`, out: types.Int(42)},
 		{expr: `[describe(1), describe('a')]`,
 			out: types.DefaultTypeAdapter.NativeToValue([]string{"int", "string"})},
 	}
@@ -626,7 +623,7 @@ func TestFrameBinding(t *testing.T) {
 			if err != nil {
 				t.Fatalf("env.Program() failed: %v", err)
 			}
-			out, _, err := prg.Eval(map[string]any{"budget": 42})
+			out, _, err := prg.Eval(NoVars())
 			if err != nil {
 				t.Fatalf("prg.Eval() failed: %v", err)
 			}

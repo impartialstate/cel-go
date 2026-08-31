@@ -37,12 +37,15 @@ var (
 
 // testFrame is a minimal ExecutionFrame which records the cost charged to it and fails charges
 // beyond an optional limit.
+//
+// The assertion below also pins the contract that a frame carries nothing but cost accounting: a
+// function value receives its arguments and no access to the state of its caller.
 type testFrame struct {
 	cost  uint64
 	limit *uint64
 }
 
-func (f *testFrame) ResolveName(name string) (any, bool) { return nil, false }
+var _ functions.ExecutionFrame = &testFrame{}
 
 func (f *testFrame) ChargeCost(cost uint64) error {
 	f.cost += cost

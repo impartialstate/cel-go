@@ -18,10 +18,12 @@ import (
 	"github.com/google/cel-go/common/functions"
 )
 
-// execFrame exposes the state of an in-progress evaluation to function implementations which
-// declare a frame binding.
+// execFrame accounts for the work performed by function implementations which declare a frame
+// binding, and by the function values they invoke.
+//
+// The frame holds the cost tracker of the evaluation rather than its activation, so that a call
+// has no way to reach the variable bindings of the expression which made it.
 type execFrame struct {
-	vars    Activation
 	tracker *CostTracker
 }
 
@@ -31,12 +33,7 @@ var _ functions.ExecutionFrame = &execFrame{}
 // tracker for the evaluation when cost tracking is enabled.
 func newExecFrame(vars Activation) *execFrame {
 	tracker, _ := asCostTracker(vars)
-	return &execFrame{vars: vars, tracker: tracker}
-}
-
-// ResolveName implements the functions.ExecutionFrame interface method.
-func (f *execFrame) ResolveName(name string) (any, bool) {
-	return f.vars.ResolveName(name)
+	return &execFrame{tracker: tracker}
 }
 
 // ChargeCost implements the functions.ExecutionFrame interface method.
