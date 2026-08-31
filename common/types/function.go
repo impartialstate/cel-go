@@ -106,9 +106,10 @@ func FunctionCallEstimate(t *Type) common.CallEstimate {
 // time.
 //
 // A call receives exactly the arguments declared by the function's type: the frame passed to the
-// implementation accounts for the cost of the call but carries no access to the variable bindings
-// of the expression which made it, and an invocation with any other number of arguments is an
-// error. An implementation therefore cannot read the state of its caller.
+// implementation is rebound away from the variables of the expression which made the call, and an
+// invocation with any other number of arguments is an error. An implementation therefore cannot
+// read the state of its caller, and may narrow the frame further to evaluate against inputs of
+// its own.
 type Function struct {
 	name     string
 	fnType   *Type
@@ -134,10 +135,10 @@ var (
 // work is proportional to its input should declare a cost which reflects that. Values which
 // declare an unknown estimate are charged DefaultCallCost per invocation.
 //
-// The implementation receives the execution frame of the evaluation which invoked it as its first
-// argument, which accounts for the cost of the call and is nil when the value is invoked outside
-// of an evaluation. The frame provides no access to the caller's variable bindings, so the
-// arguments are the only inputs to the implementation.
+// The implementation receives an execution frame as its first argument, which charges the cost of
+// the call against the invoking evaluation and is nil when the value is invoked outside of one.
+// The frame resolves no variables of the caller, so the arguments are the only inputs to the
+// implementation.
 func NewFunctionVal(name string,
 	fnType *Type, estimate common.CallEstimate, impl functions.FrameOp) *Function {
 	return &Function{name: name, fnType: fnType, estimate: estimate, impl: impl}
@@ -211,6 +212,9 @@ func (f *Function) Invoke(frame functions.ExecutionFrame, args ...ref.Val) ref.V
 		if err := frame.ChargeCost(f.CallCost()); err != nil {
 			return WrapErr(err)
 		}
+		// The call runs on a frame which shares the evaluation's cost budget but not its
+		// variables, so the arguments are the only inputs the implementation receives.
+		frame = frame.WithBindings(nil)
 	}
 	return f.impl(frame, args...)
 }

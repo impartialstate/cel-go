@@ -35,27 +35,48 @@ var (
 		})
 )
 
-// testFrame is a minimal ExecutionFrame which records the cost charged to it and fails charges
-// beyond an optional limit.
-//
-// The assertion below also pins the contract that a frame carries nothing but cost accounting: a
-// function value receives its arguments and no access to the state of its caller.
+// testFrame is a minimal ExecutionFrame whose copies share the cost charged to them, and which
+// fails charges beyond an optional limit.
 type testFrame struct {
-	cost  uint64
+	cost  *uint64
 	limit *uint64
+	vars  functions.Bindings
 }
 
 var _ functions.ExecutionFrame = &testFrame{}
 
+func newTestFrame(vars functions.Bindings, limit *uint64) *testFrame {
+	return &testFrame{cost: new(uint64), limit: limit, vars: vars}
+}
+
+func (f *testFrame) ResolveName(name string) (any, bool) {
+	if f.vars == nil {
+		return nil, false
+	}
+	return f.vars.ResolveName(name)
+}
+
+func (f *testFrame) WithBindings(vars functions.Bindings) functions.ExecutionFrame {
+	return &testFrame{cost: f.cost, limit: f.limit, vars: vars}
+}
+
 func (f *testFrame) ChargeCost(cost uint64) error {
-	f.cost += cost
-	if f.limit != nil && f.cost > *f.limit {
+	*f.cost += cost
+	if f.limit != nil && *f.cost > *f.limit {
 		return fmt.Errorf("cost limit exceeded")
 	}
 	return nil
 }
 
-func (f *testFrame) Cost() uint64 { return f.cost }
+func (f *testFrame) Cost() uint64 { return *f.cost }
+
+// testBindings is a fixed set of variable bindings.
+type testBindings map[string]any
+
+func (b testBindings) ResolveName(name string) (any, bool) {
+	v, found := b[name]
+	return v, found
+}
 
 func TestFunctionType(t *testing.T) {
 	if !IsFunctionType(lessThanType) {
@@ -170,37 +191,78 @@ func TestFunctionCallEstimate(t *testing.T) {
 }
 
 func TestFunctionInvokeChargesCost(t *testing.T) {
-	frame := &testFrame{}
+	frame := newTestFrame(nil, nil)
 	if got := lessThanFn.Invoke(frame, Int(1), Int(2)); got != True {
 		t.Errorf("Invoke() got %v, wanted true", got)
 	}
-	if frame.cost != 2 {
-		t.Errorf("frame cost got %d, wanted 2", frame.cost)
+	if frame.Cost() != 2 {
+		t.Errorf("frame cost got %d, wanted 2", frame.Cost())
 	}
 	if got := lessThanFn.Invoke(frame, Int(1), Int(2)); got != True {
 		t.Errorf("Invoke() got %v, wanted true", got)
 	}
-	if frame.cost != 4 {
-		t.Errorf("frame cost got %d, wanted 4", frame.cost)
+	if frame.Cost() != 4 {
+		t.Errorf("frame cost got %d, wanted 4", frame.Cost())
 	}
 	// Arguments which are not evaluated do not incur a cost.
 	if got := lessThanFn.Invoke(frame, NewErr("boom")); !IsError(got) {
 		t.Errorf("Invoke() got %v, wanted error", got)
 	}
-	if frame.cost != 4 {
-		t.Errorf("frame cost got %d, wanted 4", frame.cost)
+	if frame.Cost() != 4 {
+		t.Errorf("frame cost got %d, wanted 4", frame.Cost())
 	}
 }
 
 func TestFunctionInvokeCostLimit(t *testing.T) {
 	limit := uint64(3)
-	frame := &testFrame{limit: &limit}
+	frame := newTestFrame(nil, &limit)
 	if got := lessThanFn.Invoke(frame, Int(1), Int(2)); got != True {
 		t.Errorf("Invoke() got %v, wanted true", got)
 	}
 	got := lessThanFn.Invoke(frame, Int(1), Int(2))
 	if !IsError(got) || !strings.Contains(got.(*Err).String(), "cost limit exceeded") {
 		t.Errorf("Invoke() got %v, wanted a cost limit error", got)
+	}
+}
+
+func TestFunctionInvokeRebindsFrame(t *testing.T) {
+	// The caller's variables are visible on the frame it holds.
+	caller := newTestFrame(testBindings{"secret": Int(42)}, nil)
+	if _, found := caller.ResolveName("secret"); !found {
+		t.Fatal("ResolveName() got false for the caller's own frame, wanted true")
+	}
+	// They are not visible on the frame the implementation is called with, and neither is
+	// rebinding able to recover them.
+	var called bool
+	fn := NewFunctionVal("peek", NewFunctionType(lessThanEstimate, BoolType, IntType),
+		lessThanEstimate,
+		func(frame functions.ExecutionFrame, args ...ref.Val) ref.Val {
+			called = true
+			if _, found := frame.ResolveName("secret"); found {
+				t.Error("ResolveName() got true within a call, wanted false")
+			}
+			rebound := frame.WithBindings(testBindings{"arg": args[0]})
+			if _, found := rebound.ResolveName("secret"); found {
+				t.Error("ResolveName() got true after rebinding, wanted false")
+			}
+			if v, found := rebound.ResolveName("arg"); !found || v != Int(1) {
+				t.Errorf("ResolveName() got (%v, %t), wanted the rebound argument", v, found)
+			}
+			// Cost is charged against the same budget across both frames.
+			if err := rebound.ChargeCost(5); err != nil {
+				t.Errorf("ChargeCost() failed: %v", err)
+			}
+			return True
+		})
+	if got := fn.Invoke(caller, Int(1)); got != True {
+		t.Errorf("Invoke() got %v, wanted true", got)
+	}
+	if !called {
+		t.Error("Invoke() did not call the implementation")
+	}
+	// 2 for the declared cost of the call, 5 charged from within it.
+	if caller.Cost() != 7 {
+		t.Errorf("frame cost got %d, wanted 7", caller.Cost())
 	}
 }
 

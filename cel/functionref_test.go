@@ -581,6 +581,17 @@ func costlyCmpVal() *types.Function {
 
 func TestFrameBinding(t *testing.T) {
 	env, err := NewEnv(
+		Variable("budget", IntType),
+		// An extension which reads a variable of the evaluation rather than of its arguments.
+		Function("budgetRemaining",
+			Overload("budget_remaining", []*Type{}, IntType,
+				FrameBinding(func(frame ExecutionFrame, args ...ref.Val) ref.Val {
+					budget, found := frame.ResolveName("budget")
+					if !found {
+						return types.NewErr("no budget")
+					}
+					return types.DefaultTypeAdapter.NativeToValue(budget)
+				}))),
 		// An extension which reports what the evaluation has cost so far, and which charges for
 		// the work it performs itself.
 		Function("costSoFar",
@@ -609,6 +620,7 @@ func TestFrameBinding(t *testing.T) {
 		expr string
 		out  ref.Val
 	}{
+		{expr: `budgetRemaining()`, out: types.Int(42)},
 		{expr: `[describe(1), describe('a')]`,
 			out: types.DefaultTypeAdapter.NativeToValue([]string{"int", "string"})},
 	}
@@ -623,7 +635,7 @@ func TestFrameBinding(t *testing.T) {
 			if err != nil {
 				t.Fatalf("env.Program() failed: %v", err)
 			}
-			out, _, err := prg.Eval(NoVars())
+			out, _, err := prg.Eval(map[string]any{"budget": 42})
 			if err != nil {
 				t.Fatalf("prg.Eval() failed: %v", err)
 			}
@@ -719,6 +731,62 @@ func TestFunctionRefOptimize(t *testing.T) {
 			}
 			if out.Type() != types.BoolType {
 				t.Errorf("prg.Eval() got %v, wanted a bool result", out)
+			}
+		})
+	}
+}
+
+func TestFunctionValueIsSealedFromCaller(t *testing.T) {
+	// A function value which reports whether it can see the variables of the expression which
+	// called it. The same value is invoked through a higher-order function in the lists
+	// extension tests, which cannot be exercised here as ext depends on this package.
+	probeType := FunctionType(FixedCallEstimate(1), BoolType, IntType)
+	probe := FunctionVal("probe", probeType, FixedCallEstimate(1),
+		func(frame ExecutionFrame, args ...ref.Val) ref.Val {
+			_, found := frame.ResolveName("secret")
+			return types.Bool(found)
+		})
+	env, err := NewEnv(
+		Variable("secret", IntType),
+		Variable("probe", probeType),
+		// By contrast, an extension declared with a frame binding evaluates on the frame of its
+		// caller and can read the same variable.
+		Function("secretVisible",
+			Overload("secret_visible", []*Type{}, BoolType,
+				FrameBinding(func(frame ExecutionFrame, args ...ref.Val) ref.Val {
+					_, found := frame.ResolveName("secret")
+					return types.Bool(found)
+				}))),
+	)
+	if err != nil {
+		t.Fatalf("NewEnv() failed: %v", err)
+	}
+	tests := []struct {
+		expr string
+		out  ref.Val
+	}{
+		{expr: `secretVisible()`, out: types.True},
+		{expr: `probe(1)`, out: types.False},
+		{expr: `[probe(1), probe(2)]`,
+			out: types.DefaultTypeAdapter.NativeToValue([]bool{false, false})},
+	}
+	for _, tst := range tests {
+		tc := tst
+		t.Run(tc.expr, func(t *testing.T) {
+			ast, iss := env.Compile(tc.expr)
+			if iss.Err() != nil {
+				t.Fatalf("env.Compile(%q) failed: %v", tc.expr, iss.Err())
+			}
+			prg, err := env.Program(ast)
+			if err != nil {
+				t.Fatalf("env.Program() failed: %v", err)
+			}
+			out, _, err := prg.Eval(map[string]any{"secret": 42, "probe": probe})
+			if err != nil {
+				t.Fatalf("prg.Eval() failed: %v", err)
+			}
+			if out.Equal(tc.out) != types.True {
+				t.Errorf("prg.Eval() got %v, wanted %v", out, tc.out)
 			}
 		})
 	}

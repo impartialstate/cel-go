@@ -18,12 +18,10 @@ import (
 	"github.com/google/cel-go/common/functions"
 )
 
-// execFrame accounts for the work performed by function implementations which declare a frame
-// binding, and by the function values they invoke.
-//
-// The frame holds the cost tracker of the evaluation rather than its activation, so that a call
-// has no way to reach the variable bindings of the expression which made it.
+// execFrame exposes the variables and cost budget of an in-progress evaluation to function
+// implementations which declare a frame binding.
 type execFrame struct {
+	vars    Activation
 	tracker *CostTracker
 }
 
@@ -33,7 +31,44 @@ var _ functions.ExecutionFrame = &execFrame{}
 // tracker for the evaluation when cost tracking is enabled.
 func newExecFrame(vars Activation) *execFrame {
 	tracker, _ := asCostTracker(vars)
-	return &execFrame{tracker: tracker}
+	return &execFrame{vars: vars, tracker: tracker}
+}
+
+// ResolveName implements the functions.ExecutionFrame interface method.
+func (f *execFrame) ResolveName(name string) (any, bool) {
+	return f.vars.ResolveName(name)
+}
+
+// WithBindings implements the functions.ExecutionFrame interface method.
+//
+// The copy shares the cost tracker of the frame it was derived from, so work performed against it
+// is charged to the same budget, but it resolves names only from the given bindings.
+func (f *execFrame) WithBindings(bindings functions.Bindings) functions.ExecutionFrame {
+	return &execFrame{vars: bindingActivation(bindings), tracker: f.tracker}
+}
+
+// bindingActivation adapts a set of bindings to the Activation used throughout evaluation.
+func bindingActivation(bindings functions.Bindings) Activation {
+	switch b := bindings.(type) {
+	case nil:
+		return EmptyActivation()
+	case Activation:
+		// Activations are already scoped, and may have a parent worth preserving.
+		return b
+	default:
+		return &boundActivation{Bindings: b}
+	}
+}
+
+// boundActivation is a leaf Activation over a set of bindings.
+type boundActivation struct {
+	functions.Bindings
+}
+
+// Parent implements the Activation interface method, and is always nil as bindings have no scope
+// beyond themselves.
+func (*boundActivation) Parent() Activation {
+	return nil
 }
 
 // ChargeCost implements the functions.ExecutionFrame interface method.

@@ -213,11 +213,17 @@ cel.Function("applyTwice",
         })))
 ```
 
-The frame lets an implementation charge for its own work with `ChargeCost`,
-and report the cost accrued so far with `Cost`. It carries nothing else: a call
-to a function value receives exactly the arguments its type declares, with no
-access to the variable bindings of the expression which made the call, so a
-function value cannot read the state of its caller.
+The frame carries the variables in scope for the call, reachable with
+`ResolveName`, and the cost budget the call is charged against, through
+`ChargeCost` and `Cost`.
+
+Which variables a call can reach is decided by the frame it is given, not by
+the frame of its caller. A function value is always invoked on a frame rebound
+to the arguments of the call, so it receives exactly the inputs its type
+declares and cannot read the state of the expression which called it. An
+implementation may narrow the frame further with `WithBindings` — to evaluate a
+sub-expression against inputs of its own, say — but rebinding never recovers
+the variables a frame was created with, so a sealed frame stays sealed.
 
 ### Evaluate
 

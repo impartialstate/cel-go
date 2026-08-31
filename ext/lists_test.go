@@ -182,6 +182,48 @@ func TestListsHigherOrderFunctions(t *testing.T) {
 	}
 }
 
+func TestListsHigherOrderFunctionsSealCallee(t *testing.T) {
+	// A function value invoked by a higher-order function cannot read the variables of the
+	// expression which called it, even though the higher-order function itself can.
+	probeType := cel.FunctionType(cel.FixedCallEstimate(1), cel.BoolType, cel.IntType)
+	probe := cel.FunctionVal("probe", probeType, cel.FixedCallEstimate(1),
+		func(frame cel.ExecutionFrame, args ...ref.Val) ref.Val {
+			_, found := frame.ResolveName("secret")
+			return types.Bool(found)
+		})
+	env := testListsEnv(t,
+		cel.Variable("secret", cel.IntType),
+		cel.Variable("probe", probeType))
+	tests := []struct {
+		expr string
+		out  any
+	}{
+		{expr: `[1, 2].map(probe)`, out: []bool{false, false}},
+		{expr: `[1, 2].filter(probe)`, out: []int64{}},
+	}
+	for _, tst := range tests {
+		tc := tst
+		t.Run(tc.expr, func(t *testing.T) {
+			ast, iss := env.Compile(tc.expr)
+			if iss.Err() != nil {
+				t.Fatalf("env.Compile(%v) failed: %v", tc.expr, iss.Err())
+			}
+			prg, err := env.Program(ast)
+			if err != nil {
+				t.Fatalf("env.Program() failed: %v", err)
+			}
+			out, _, err := prg.Eval(map[string]any{"secret": 42, "probe": probe})
+			if err != nil {
+				t.Fatalf("prg.Eval() failed: %v", err)
+			}
+			want := types.DefaultTypeAdapter.NativeToValue(tc.out)
+			if out.Equal(want) != types.True {
+				t.Errorf("prg.Eval() got %v, wanted %v", out, want)
+			}
+		})
+	}
+}
+
 func TestListsHigherOrderFunctionCompileErrors(t *testing.T) {
 	listsTests := []struct {
 		expr string
