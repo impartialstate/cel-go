@@ -30,6 +30,7 @@ go_library(
         "env.go",
         "k8slib.go",
         "schema.go",
+        "schematypes.go",
         "static.go",
         "suite.go",
         "template.go",
@@ -44,6 +45,7 @@ go_library(
         "//ext:go_default_library",
         "//policy:go_default_library",
         "@in_yaml_go_yaml_v3//:go_default_library",
+        "@org_golang_google_protobuf//reflect/protoreflect:go_default_library",
     ],
 )
 
@@ -56,12 +58,14 @@ go_test(
         "data_test.go",
         "k8slib_test.go",
         "schema_test.go",
+        "schematypes_test.go",
         "suite_test.go",
     ],
     data = glob(["testdata/**"]),
     embed = [":go_default_library"],
     deps = [
         "//cel:go_default_library",
+        "//policy:go_default_library",
         "//tools/celtest:go_default_library",
         "//tools/compiler:go_default_library",
         "@in_yaml_go_yaml_v3//:go_default_library",

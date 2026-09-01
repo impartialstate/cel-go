@@ -1,0 +1,12 @@
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: DatabaseBackups
+metadata:
+  name: databases-need-backups
+spec:
+  match:
+    kinds:
+      - apiGroups: ["example.com"]
+        kinds: ["Database"]
+  parameters:
+    minReplicas: 3
+    exemptEngines: ["mysql"]

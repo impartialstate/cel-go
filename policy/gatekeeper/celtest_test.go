@@ -29,11 +29,16 @@ import (
 // checks that a Gatekeeper template compiles through the standard compiler as
 // well as through this package's own entry point.
 func TestTemplateWithCELTestRunner(t *testing.T) {
+	// The environment and the template's own declarations are configured
+	// separately here, so they share one registry of schema types: the types a
+	// template derives from its schemas must be known to the environment its
+	// programs are planned against.
+	opts := []gatekeeper.Option{gatekeeper.WithSchemaTypes(gatekeeper.NewSchemaTypes(nil))}
 	compilerOpts := []any{
-		gatekeeper.ParserOption(),
-		compiler.PolicyMetadataEnvOption(gatekeeper.EnvOptionFromMetadata()),
+		gatekeeper.ParserOption(opts...),
+		compiler.PolicyMetadataEnvOption(gatekeeper.EnvOptionFromMetadata(opts...)),
 	}
-	for _, opt := range gatekeeper.EnvironmentOptions() {
+	for _, opt := range gatekeeper.EnvironmentOptions(opts...) {
 		compilerOpts = append(compilerOpts, opt)
 	}
 	celtest.TriggerTests(t,

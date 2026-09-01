@@ -16,6 +16,7 @@ package gatekeeper
 
 import (
 	"github.com/google/cel-go/cel"
+	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/ext"
 )
 
@@ -65,7 +66,8 @@ const (
 // config carries the options which shape the CEL environment of a template and
 // the reviews evaluated against it.
 type config struct {
-	typedParams  bool
+	objectSchema map[string]any
+	schemas      *SchemaTypes
 	extraOptions []cel.EnvOption
 	provider     DataProvider
 	maxRounds    int
@@ -80,17 +82,35 @@ const defaultMaxRounds = 10
 // Option configures how a ConstraintTemplate is compiled.
 type Option func(*config)
 
-// TypedParams declares `variables.params` with the type derived from the
-// template's openAPIV3Schema, rather than as an untyped value.
+// WithObjectSchema types the object under review from an OpenAPI schema, such
+// as the one a CustomResourceDefinition declares for its resource.
 //
-// Typed parameters catch mistakes which are otherwise only visible at
-// evaluation time, such as comparing a parameter to the wrong type. The cost is
-// that a template may no longer compare `variables.params` against null, since
-// CEL has no nullable map type; templates which do so should be compiled
-// without this option.
-func TypedParams() Option {
+// A policy which reads a field the schema does not declare then fails to
+// compile, rather than reading an absent value in a cluster. Without a schema
+// the object is untyped, since a template may match kinds whose schemas are not
+// known here.
+//
+// ReadCRDSchema reads the schema of a version from a CustomResourceDefinition:
+//
+//	schema, err := gatekeeper.ReadCRDSchema("crd.yaml", "v1")
+//	tmpl, err := gatekeeper.CompileFile("template.yaml",
+//	    gatekeeper.WithObjectSchema(schema))
+func WithObjectSchema(schema map[string]any) Option {
 	return func(c *config) {
-		c.typedParams = true
+		c.objectSchema = schema
+	}
+}
+
+// WithSchemaTypes shares one registry of schema types across the environments a
+// tool builds, so that the types a template declares are known to the
+// environment its programs are planned against.
+//
+// It is needed when the environment and the template's own declarations are
+// configured separately, as they are when compiling through the CEL compiler
+// tool. Compiling through this package shares a registry already.
+func WithSchemaTypes(schemas *SchemaTypes) Option {
+	return func(c *config) {
+		c.schemas = schemas
 	}
 }
 
@@ -131,52 +151,142 @@ func newConfig(opts ...Option) *config {
 	for _, opt := range opts {
 		opt(c)
 	}
+	if c.schemas == nil {
+		c.schemas = NewSchemaTypes(baseTypeProvider())
+	}
 	return c
 }
 
-// EnvironmentOptions returns the CEL environment of the Gatekeeper
-// K8sNativeValidation engine: the variables it binds, the extension libraries
-// it enables, and the functions which read referential data.
+// baseTypeProvider is the registry the schema types fall back to, which holds
+// the standard types a CEL environment knows.
+func baseTypeProvider() types.Provider {
+	registry, err := types.NewRegistry()
+	if err != nil {
+		return types.NewEmptyRegistry()
+	}
+	return registry
+}
+
+// EnvironmentOptions returns the part of a template's CEL environment which
+// does not depend on the template: the extension libraries a cluster enables,
+// the functions which read referential data, the schema types, and the inputs
+// whose type is the same for every template.
 //
-// It is the environment a ConstraintTemplate is compiled against, and is
-// exported for tools which build their own compiler:
+// The inputs a template's own schemas describe — the object under review and
+// the constraint which parameterizes it — are declared by EnvOptionFromMetadata,
+// so a tool which builds its own compiler uses both, sharing one registry of
+// schema types between them:
 //
-//	compilerOpts := []any{gatekeeper.ParserOption()}
-//	for _, opt := range gatekeeper.EnvironmentOptions() {
+//	schemas := gatekeeper.NewSchemaTypes(nil)
+//	opts := []gatekeeper.Option{gatekeeper.WithSchemaTypes(schemas)}
+//	compilerOpts := []any{
+//	    gatekeeper.ParserOption(opts...),
+//	    compiler.PolicyMetadataEnvOption(gatekeeper.EnvOptionFromMetadata(opts...)),
+//	}
+//	for _, opt := range gatekeeper.EnvironmentOptions(opts...) {
 //	    compilerOpts = append(compilerOpts, opt)
 //	}
-//	celtest.TriggerTests(t, celtest.TestCompiler(compilerOpts...), ...)
 func EnvironmentOptions(opts ...Option) []cel.EnvOption {
 	return environmentOptions(newConfig(opts...))
 }
 
-// EnvOptionFromMetadata returns a function which declares what a template's own
-// schema adds to the environment, from the metadata collected while parsing it.
+// EnvOptionFromMetadata returns a function which declares the inputs whose
+// types come from the template being compiled, using the metadata collected
+// while parsing it.
 //
 // The signature matches the policy metadata hook of the CEL compiler tool,
 // which supplies the metadata of the policy being compiled. It complements
-// EnvironmentOptions rather than replacing it, and contributes nothing unless
-// the TypedParams option is set, since the type of a template's parameters is
-// the only part of its environment which the template itself determines.
+// EnvironmentOptions rather than replacing it.
 func EnvOptionFromMetadata(opts ...Option) func(map[string]any) cel.EnvOption {
 	c := newConfig(opts...)
 	return func(metadata map[string]any) cel.EnvOption {
 		schema, _ := metadata[MetadataParamsSchema].(map[string]any)
-		return envOption(schemaOptions(schema, c))
+		name, _ := metadata[MetadataTemplateName].(string)
+		return envOption(inputOptions(c, name, schema))
 	}
 }
 
-// schemaOptions returns the declarations derived from the openAPIV3Schema of a
-// template's constraint.
-func schemaOptions(schema map[string]any, c *config) []cel.EnvOption {
-	if !c.typedParams {
-		return nil
+// inputOptions declares the object under review and the constraint which
+// parameterizes it, typed from the schemas which describe them.
+//
+// Both are declared as object types where a schema is available. An object type
+// is nullable, so a policy may still compare an input against null, which is
+// how Kubernetes reports an input the request does not carry.
+func inputOptions(c *config, templateName string, paramsSchema map[string]any) []cel.EnvOption {
+	if templateName == "" {
+		templateName = "template"
 	}
-	return []cel.EnvOption{cel.Variable(variablePrefix+ParamsVariable, ParamsType(schema))}
+	prefix := "gatekeeper." + templateName
+	objectType := cel.DynType
+	if len(c.objectSchema) != 0 {
+		objectType = c.schemas.Declare(prefix+".Object", resourceSchema(c.objectSchema))
+	}
+	constraintType := c.schemas.Declare(prefix+".Constraint", constraintSchema(paramsSchema))
+	return []cel.EnvOption{
+		cel.Variable(ObjectVar, objectType),
+		cel.Variable(OldObjectVar, objectType),
+		cel.Variable(ParamsVar, constraintType),
+	}
 }
 
-// environmentOptions returns the variables the admission engine binds, the
-// libraries it enables, and the functions which read referential data.
+// constraintSchema describes the constraint resource bound to `params`, whose
+// spec.parameters is what a template's own schema describes and what
+// `variables.params` holds.
+func constraintSchema(paramsSchema map[string]any) map[string]any {
+	unstructured := map[string]any{"type": "object"}
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"apiVersion": map[string]any{"type": "string"},
+			"kind":       map[string]any{"type": "string"},
+			"metadata":   unstructured,
+			"status":     unstructured,
+			"spec": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"match":                    unstructured,
+					"enforcementAction":        map[string]any{"type": "string"},
+					"scopedEnforcementActions": map[string]any{"type": "array", "items": unstructured},
+					"parameters":               paramsSchema,
+				},
+			},
+		},
+	}
+}
+
+// resourceSchema adds the fields every Kubernetes object carries to the schema
+// of a resource, which a CustomResourceDefinition leaves for the API server to
+// supply.
+func resourceSchema(schema map[string]any) map[string]any {
+	properties, found := schema["properties"].(map[string]any)
+	if !found {
+		return schema
+	}
+	standard := map[string]any{
+		"apiVersion": map[string]any{"type": "string"},
+		"kind":       map[string]any{"type": "string"},
+		"metadata":   map[string]any{"type": "object"},
+	}
+	merged := make(map[string]any, len(properties)+len(standard))
+	for name, property := range properties {
+		merged[name] = property
+	}
+	for name, property := range standard {
+		if _, found := merged[name]; !found {
+			merged[name] = property
+		}
+	}
+	resource := make(map[string]any, len(schema))
+	for key, value := range schema {
+		resource[key] = value
+	}
+	resource["properties"] = merged
+	return resource
+}
+
+// environmentOptions returns the libraries the admission engine enables, the
+// functions which read referential data, and the inputs whose type is the same
+// for every template.
 func environmentOptions(c *config) []cel.EnvOption {
 	// The admission inputs are declared as untyped values because Kubernetes
 	// binds them from unstructured objects and leaves them null when they do
@@ -187,10 +297,8 @@ func environmentOptions(c *config) []cel.EnvOption {
 		// template into a single expression held together by cel.@block.
 		ext.Bindings(),
 		cel.EnableMacroCallTracking(),
-		cel.Variable(ObjectVar, cel.DynType),
-		cel.Variable(OldObjectVar, cel.DynType),
+		c.schemas.EnvOption(),
 		cel.Variable(RequestVar, cel.DynType),
-		cel.Variable(ParamsVar, cel.DynType),
 		cel.Variable(NamespaceObjectVar, cel.DynType),
 	}
 	opts = append(opts, Libraries()...)

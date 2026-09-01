@@ -111,6 +111,10 @@ const (
 
 	// MetadataFailurePolicy holds the source's failurePolicy setting, if present.
 	MetadataFailurePolicy = "gatekeeper.failurePolicy"
+
+	// MetadataTemplateName holds the template's metadata.name, which names the
+	// types derived from the schemas it declares.
+	MetadataTemplateName = "gatekeeper.templateName"
 )
 
 // defaultMessage is the placeholder output assigned to a validation while it is
@@ -190,7 +194,9 @@ func (h *templateTagHandler) parseMetadata(ctx policy.ParserContext, node *yaml.
 	rangeMap(ctx, node, func(fieldName string, keyID int64, val *yaml.Node) {
 		switch fieldName {
 		case "name":
-			p.SetName(ctx.NewString(val))
+			name := ctx.NewString(val)
+			p.SetName(name)
+			p.SetMetadata(MetadataTemplateName, name.Value)
 		case "annotations":
 			rangeMap(ctx, val, func(annotation string, _ int64, val *yaml.Node) {
 				if annotation == "description" {
@@ -390,9 +396,7 @@ func (h *templateTagHandler) parseMatchConditions(ctx policy.ParserContext, id i
 // reported against its own position within the template.
 func (h *templateTagHandler) ruleWithPrelude(ctx policy.ParserContext, sourceID int64, r *policy.Rule) *policy.Rule {
 	prelude := policy.NewRule(sourceID)
-	if !h.config.typedParams {
-		prelude.AddVariable(syntheticVariable(sourceID, ParamsVariable, paramsExpr))
-	}
+	prelude.AddVariable(syntheticVariable(sourceID, ParamsVariable, paramsExpr))
 	prelude.AddVariable(syntheticVariable(sourceID, AnyObjectVariable, anyObjectExpr))
 	guards := make([]string, 0, len(h.matchConditions))
 	for i, cond := range h.matchConditions {

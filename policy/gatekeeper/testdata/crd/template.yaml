@@ -1,0 +1,57 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# A policy over a custom resource, reviewed against the schema its
+# CustomResourceDefinition declares.
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: databasebackups
+spec:
+  crd:
+    spec:
+      names:
+        kind: DatabaseBackups
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            minReplicas:
+              type: integer
+            exemptEngines:
+              type: array
+              items:
+                type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      code:
+        - engine: K8sNativeValidation
+          source:
+            variables:
+              - name: exempt
+                expression: >-
+                  variables.params != null && has(variables.params.exemptEngines)
+                    ? variables.params.exemptEngines : []
+            validations:
+              - expression: >-
+                  variables.anyObject.spec.engine in variables.exempt ||
+                  (has(variables.anyObject.spec.backup) && variables.anyObject.spec.backup.enabled)
+                messageExpression: >-
+                  "database " + variables.anyObject.metadata.name +
+                  " runs " + variables.anyObject.spec.engine + " without backups enabled"
+              - expression: >-
+                  !has(variables.anyObject.spec.replicas) ||
+                  variables.anyObject.spec.replicas >= variables.params.minReplicas
+                messageExpression: >-
+                  "database needs at least " + string(variables.params.minReplicas) + " replicas"

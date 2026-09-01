@@ -32,7 +32,7 @@ func schemaOf(t testing.TB, source string) map[string]any {
 	return schema
 }
 
-func TestParamsType(t *testing.T) {
+func TestSchemaTypes(t *testing.T) {
 	tests := []struct {
 		name   string
 		schema string
@@ -49,22 +49,27 @@ func TestParamsType(t *testing.T) {
 			want:   cel.ListType(cel.StringType),
 		},
 		{
-			name: "an object whose properties share a type is that map",
+			name: "an object with properties is a type whose fields are checked",
 			schema: `
 type: object
 properties:
   key: {type: string}
   allowedRegex: {type: string}`,
-			want: cel.MapType(cel.StringType, cel.StringType),
+			want: cel.ObjectType("test.Params"),
 		},
 		{
-			name: "an object of mixed properties holds untyped values",
+			name: "an object which keeps undeclared fields is a map",
 			schema: `
 type: object
+x-kubernetes-preserve-unknown-fields: true
 properties:
-  key: {type: string}
-  count: {type: integer}`,
+  key: {type: string}`,
 			want: cel.MapType(cel.StringType, cel.DynType),
+		},
+		{
+			name:   "an object with no properties is a map",
+			schema: "type: object",
+			want:   cel.MapType(cel.StringType, cel.DynType),
 		},
 		{
 			name:   "additionalProperties gives the value type",
@@ -80,7 +85,7 @@ items:
   properties:
     min: {type: integer}
     max: {type: integer}`,
-			want: cel.ListType(cel.MapType(cel.StringType, cel.IntType)),
+			want: cel.ListType(cel.ObjectType("test.Params.item")),
 		},
 		{
 			name:   "a value which may be an integer or a string is untyped",
@@ -95,7 +100,7 @@ items:
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := ParamsType(schemaOf(t, tc.schema))
+			got := NewSchemaTypes(nil).Declare("test.Params", schemaOf(t, tc.schema))
 			if !got.IsExactType(tc.want) {
 				t.Errorf("ParamsType() got %v, wanted %v", got, tc.want)
 			}

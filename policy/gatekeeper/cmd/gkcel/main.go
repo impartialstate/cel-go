@@ -39,9 +39,13 @@ import (
 const usage = `gkcel compiles and tests the CEL within Gatekeeper ConstraintTemplates.
 
 Usage:
-  gkcel check <template.yaml>...            compile the templates and report mistakes
+  gkcel check [flags] <template.yaml>...    compile the templates and report mistakes
   gkcel test <suite.yaml>...                run gator test suites against the templates
   gkcel review [flags]                      review one object against a template
+
+Check flags:
+  -crd          a CustomResourceDefinition whose schema types the object under review
+  -crd-version  the version of the definition to read; defaults to the stored version
 
 Review flags:
   -template     the ConstraintTemplate to review against (required)
@@ -50,6 +54,8 @@ Review flags:
   -old-object   the object as it exists in the cluster, for an update or delete
   -namespace-object the namespace of the object under review
   -inventory    a file of objects the policy may read; repeatable
+  -crd          a CustomResourceDefinition whose schema types the object under review
+  -crd-version  the version of the definition to read; defaults to the stored version
 `
 
 func main() {
@@ -83,13 +89,24 @@ func main() {
 }
 
 // check compiles each template and reports the mistakes within it.
-func check(paths []string) (bool, error) {
+func check(args []string) (bool, error) {
+	flags := flag.NewFlagSet("check", flag.ContinueOnError)
+	crdPath := flags.String("crd", "", "a CustomResourceDefinition whose schema types the object under review")
+	crdVersion := flags.String("crd-version", "", "the version of the definition to read; defaults to the stored version")
+	if err := flags.Parse(args); err != nil {
+		return false, err
+	}
+	paths := flags.Args()
 	if len(paths) == 0 {
 		return false, fmt.Errorf("check needs at least one template")
 	}
+	opts, err := schemaOptions(*crdPath, *crdVersion)
+	if err != nil {
+		return false, err
+	}
 	failed := false
 	for _, path := range expand(paths) {
-		tmpl, err := gatekeeper.CompileFile(path)
+		tmpl, err := gatekeeper.CompileFile(path, opts...)
 		if err != nil {
 			failed = true
 			fmt.Printf("FAIL %s\n%s\n", path, indent(err.Error()))
@@ -131,6 +148,8 @@ func review(args []string) (bool, error) {
 	objectPath := flags.String("object", "", "the object under review, or an AdmissionReview")
 	oldObjectPath := flags.String("old-object", "", "the object as it exists in the cluster")
 	namespacePath := flags.String("namespace-object", "", "the namespace of the object under review")
+	crdPath := flags.String("crd", "", "a CustomResourceDefinition whose schema types the object under review")
+	crdVersion := flags.String("crd-version", "", "the version of the definition to read; defaults to the stored version")
 	var inventoryPaths pathList
 	flags.Var(&inventoryPaths, "inventory", "a file of objects the policy may read; repeatable")
 	if err := flags.Parse(args); err != nil {
@@ -147,8 +166,12 @@ func review(args []string) (bool, error) {
 		}
 		inventory = append(inventory, objects...)
 	}
-	tmpl, err := gatekeeper.CompileFile(*templatePath,
-		gatekeeper.WithDataProvider(&gatekeeper.StaticProvider{Objects: inventory}))
+	opts, err := schemaOptions(*crdPath, *crdVersion)
+	if err != nil {
+		return false, err
+	}
+	opts = append(opts, gatekeeper.WithDataProvider(&gatekeeper.StaticProvider{Objects: inventory}))
+	tmpl, err := gatekeeper.CompileFile(*templatePath, opts...)
 	if err != nil {
 		return false, err
 	}
@@ -186,6 +209,19 @@ func review(args []string) (bool, error) {
 		fmt.Printf("  - %s\n", violation.Message)
 	}
 	return true, nil
+}
+
+// schemaOptions reads the definition of the resource under review, so that the
+// fields a policy reads from it are checked against its schema.
+func schemaOptions(crdPath, version string) ([]gatekeeper.Option, error) {
+	if crdPath == "" {
+		return nil, nil
+	}
+	schema, err := gatekeeper.ReadCRDSchema(crdPath, version)
+	if err != nil {
+		return nil, err
+	}
+	return []gatekeeper.Option{gatekeeper.WithObjectSchema(schema)}, nil
 }
 
 func readSingleObject(path string) (any, error) {

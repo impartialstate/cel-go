@@ -16,10 +16,8 @@ package gatekeeper
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 
-	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/policy"
 )
 
@@ -39,68 +37,63 @@ func ParamsSchema(p *policy.Policy) (map[string]any, bool) {
 	return schema, ok
 }
 
-// ParamsType converts an openAPIV3Schema into the CEL type of the values it
-// describes.
+// ReadCRDSchema reads the schema a CustomResourceDefinition declares for one
+// version of its resource, for typing the object a policy reviews.
 //
-// CEL has no anonymous struct type, so an object is represented as a map. When
-// the properties of an object all share a type, that type is used as the map's
-// value type; otherwise the value type is `dyn`, which type-checks like an
-// untyped value.
-func ParamsType(schema map[string]any) *cel.Type {
-	if len(schema) == 0 {
-		return cel.DynType
+// An empty version reads the version marked for storage, or the only version
+// when the definition declares one.
+func ReadCRDSchema(path, version string) (map[string]any, error) {
+	objects, err := ReadObjects(path)
+	if err != nil {
+		return nil, err
 	}
-	// A field which may hold either an integer or a string has no single CEL
-	// type, and neither does a field with no declared type.
-	if intOrString, found := schema["x-kubernetes-int-or-string"]; found && intOrString == true {
-		return cel.DynType
-	}
-	typeName, _ := schema["type"].(string)
-	switch typeName {
-	case "string":
-		return cel.StringType
-	case "integer":
-		return cel.IntType
-	case "number":
-		return cel.DoubleType
-	case "boolean":
-		return cel.BoolType
-	case "array":
-		items, _ := schema["items"].(map[string]any)
-		return cel.ListType(ParamsType(items))
-	case "object":
-		return cel.MapType(cel.StringType, objectValueType(schema))
-	default:
-		return cel.DynType
-	}
-}
-
-// objectValueType determines the value type of the map which represents an
-// object schema.
-func objectValueType(schema map[string]any) *cel.Type {
-	if additional, found := schema["additionalProperties"].(map[string]any); found {
-		return ParamsType(additional)
-	}
-	properties, found := schema["properties"].(map[string]any)
-	if !found || len(properties) == 0 {
-		return cel.DynType
-	}
-	var common *cel.Type
-	for _, name := range sortedKeys(properties) {
-		prop, ok := properties[name].(map[string]any)
+	for _, object := range objects {
+		crd, ok := toStringMap(object)
 		if !ok {
-			return cel.DynType
-		}
-		propType := ParamsType(prop)
-		if common == nil {
-			common = propType
 			continue
 		}
-		if !common.IsExactType(propType) {
-			return cel.DynType
+		if kind, _ := crd["kind"].(string); kind != "CustomResourceDefinition" {
+			continue
 		}
+		return crdVersionSchema(path, crd, version)
 	}
-	return common
+	return nil, fmt.Errorf("%s: holds no CustomResourceDefinition", path)
+}
+
+// crdVersionSchema selects the version of a definition and returns its schema.
+func crdVersionSchema(path string, crd map[string]any, version string) (map[string]any, error) {
+	spec, _ := toStringMap(crd["spec"])
+	versions, _ := spec["versions"].([]any)
+	if len(versions) == 0 {
+		return nil, fmt.Errorf("%s: the definition declares no versions", path)
+	}
+	var names []string
+	for _, entry := range versions {
+		declared, ok := toStringMap(entry)
+		if !ok {
+			continue
+		}
+		name, _ := declared["name"].(string)
+		names = append(names, name)
+		switch {
+		case version != "" && name != version:
+			continue
+		case version == "" && len(versions) > 1 && declared["storage"] != true:
+			continue
+		}
+		schema, _ := toStringMap(declared["schema"])
+		openAPI, ok := toStringMap(schema["openAPIV3Schema"])
+		if !ok {
+			return nil, fmt.Errorf("%s: version %s declares no openAPIV3Schema", path, name)
+		}
+		return openAPI, nil
+	}
+	if version == "" {
+		return nil, fmt.Errorf("%s: no version is marked for storage, name one of: %s",
+			path, strings.Join(names, ", "))
+	}
+	return nil, fmt.Errorf("%s: no version named %s, the definition declares: %s",
+		path, version, strings.Join(names, ", "))
 }
 
 // ValidateParams checks a set of constraint parameters against the
@@ -266,13 +259,4 @@ func toStringMap(value any) (map[string]any, bool) {
 	default:
 		return nil, false
 	}
-}
-
-func sortedKeys[V any](m map[string]V) []string {
-	keys := make([]string, 0, len(m))
-	for key := range m {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
 }

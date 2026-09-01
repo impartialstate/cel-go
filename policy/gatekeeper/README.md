@@ -147,10 +147,47 @@ and CIDR, format, semver, the authorizer, and two-variable comprehensions. A
 policy which uses one can declare it with `gatekeeper.EnvOptions(...)`; a
 policy which uses `quantity` or the authorizer needs an implementation first.
 
-The constraint's `openAPIV3Schema` is read as well. `Template.ValidateParams`
-checks a constraint's parameters against it, which catches the fixture that
-does not match the schema its constraint declares — the usual reason a policy
-under test does not behave as its author expects.
+### Inputs are typed from their schemas
+
+The `openAPIV3Schema` a template declares for its constraint becomes a CEL type,
+so a policy which reads a parameter the schema does not declare does not
+compile:
+
+```
+ERROR: template.yaml:29:48: undefined field 'lables'
+ |               - expression: "variables.params.lables.all(e, e.key in object.metadata.labels)"
+ | ...............................................^
+ERROR: template.yaml:30:83: undefined field 'kee'
+ |                 messageExpression: "'missing: ' + variables.params.labels.map(e, e.kee).join(', ')"
+ | ..................................................................................^
+```
+
+The object under review is typed the same way when its definition is supplied,
+which is how a policy over a custom resource is checked against the resource it
+governs:
+
+```
+gkcel check -crd databases.crd.yaml template.yaml
+```
+
+```go
+schema, err := gatekeeper.ReadCRDSchema("databases.crd.yaml", "v1")
+tmpl, err := gatekeeper.CompileFile("template.yaml",
+    gatekeeper.WithObjectSchema(schema))
+```
+
+Without a definition the object stays untyped, since a template may match kinds
+whose schemas are not known here. Typing never costs a policy the null checks it
+needs: a schema type is nullable, so `object == null` on a delete and
+`variables.params == null` for a constraint which sets no parameters both still
+compile. A schema which allows fields it does not declare — `additionalProperties`
+or `x-kubernetes-preserve-unknown-fields` — is read as a map, since there is
+nothing to check a field name against.
+
+`Template.ValidateParams` checks a constraint's parameters against the same
+schema, which catches the fixture that does not match the schema its constraint
+declares — the usual reason a policy under test does not behave as its author
+expects.
 
 ## Referential policies
 
