@@ -221,6 +221,32 @@ An `externalData` response has the shape Rego's `external_data` builtin
 returns — `responses`, `errors`, `status_code`, `system_error` — so a policy
 ported from Rego reads it the same way.
 
+### Reading it the way Rego does
+
+A constraint being ported from Rego can keep the paths its Rego implementation
+used:
+
+```yaml
+variables:
+  - name: services
+    expression: 'data.inventory.namespace[variables.anyObject.metadata.namespace]["v1"]["Service"]'
+  - name: namespaceObj
+    expression: 'data.inventory.cluster["v1"]["Namespace"][variables.anyObject.metadata.namespace]'
+  - name: signatures
+    expression: 'external_data({"provider": variables.params.provider, "keys": variables.images})'
+```
+
+Indexing a kind yields every object of that kind keyed by name — the map a Rego
+rule iterates — and `external_data` takes and returns exactly what the builtin
+does. Both go to the same provider as the functions above.
+
+Two differences from Rego are worth knowing. The path is read by key rather than
+enumerated: the api versions and namespaces which exist cannot be listed, so a
+rule which iterates them names them here instead, and one which tries is told
+so. And reading a kind reads all of it, where `inventory.get` reads one object,
+so a policy written for CEL rather than ported to it should prefer the
+functions.
+
 ### Lookups are asynchronous
 
 CEL expressions must be side-effect free and fast, so a lookup does not block
@@ -232,7 +258,9 @@ answers.
 
 The consequences are worth stating plainly:
 
-* Independent lookups are fetched **together**, not one round trip at a time.
+* Independent lookups are fetched **together**, not one round trip at a time —
+  across the whole policy, since every validation is evaluated before anything
+  is fetched.
 * A lookup the policy short-circuits past is **never fetched**.
 * A lookup which depends on an earlier result resolves in a later round.
 * Answers are shared by the validations of one review, so an object read from

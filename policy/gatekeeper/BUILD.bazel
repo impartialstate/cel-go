@@ -29,6 +29,7 @@ go_library(
         "data.go",
         "env.go",
         "k8slib.go",
+        "rego.go",
         "schema.go",
         "schematypes.go",
         "static.go",
@@ -39,6 +40,7 @@ go_library(
     importpath = "github.com/google/cel-go/policy/gatekeeper",
     deps = [
         "//cel:go_default_library",
+        "//common/ast:go_default_library",
         "//common/types:go_default_library",
         "//common/types/ref:go_default_library",
         "//common/types/traits:go_default_library",
@@ -57,6 +59,7 @@ go_test(
         "compile_test.go",
         "data_test.go",
         "k8slib_test.go",
+        "rego_test.go",
         "schema_test.go",
         "schematypes_test.go",
         "suite_test.go",

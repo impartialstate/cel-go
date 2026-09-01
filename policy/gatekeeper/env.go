@@ -303,8 +303,9 @@ func environmentOptions(c *config) []cel.EnvOption {
 	}
 	opts = append(opts, Libraries()...)
 	// Referential data has no equivalent in a ValidatingAdmissionPolicy, so the
-	// functions which read it are declared alongside the admission variables.
-	opts = append(opts, DataFunctions())
+	// functions which read it are declared alongside the admission variables,
+	// as are the reads a policy ported from Rego makes.
+	opts = append(opts, DataFunctions(), RegoCompatibility())
 	return append(opts, c.extraOptions...)
 }
 

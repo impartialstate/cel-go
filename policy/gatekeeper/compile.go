@@ -243,12 +243,13 @@ func (t *Template) Review(ctx context.Context, r Review) ([]Violation, error) {
 	vars := r.activation()
 	vars[InventoryVar] = &inventoryValue{resolver: data}
 	vars[ExternalDataVar] = &externalDataValue{resolver: data}
+	vars[DataVar] = newDataValue(data)
+	results, err := t.evaluate(ctx, data, vars)
+	if err != nil {
+		return nil, err
+	}
 	var violations []Violation
-	for i, v := range t.validations {
-		out, err := t.evaluate(ctx, v.program, data, vars)
-		if err != nil {
-			return nil, fmt.Errorf("validation %d: %w", i, err)
-		}
+	for i, out := range results {
 		message, violated, err := violationMessage(out)
 		if err != nil {
 			return nil, fmt.Errorf("validation %d: %w", i, err)
@@ -260,33 +261,49 @@ func (t *Template) Review(ctx context.Context, r Review) ([]Violation, error) {
 	return violations, nil
 }
 
-// evaluate runs a validation, resolving the referential data it reads.
+// evaluate runs the validations of a template, resolving the referential data
+// they read.
 //
 // A lookup which has not been answered evaluates to an unknown value, which CEL
-// propagates without failing the expression. The lookups the expression reached
-// are then fetched together and the expression is evaluated again, so that
-// independent lookups are fetched in one batch, and a lookup the expression
-// short-circuits past is never fetched at all.
-func (t *Template) evaluate(ctx context.Context, prg cel.Program, data *resolver, vars map[string]any) (ref.Val, error) {
+// propagates without failing the expression. Every validation is evaluated
+// before anything is fetched, so a round gathers the lookups the whole policy
+// can reach and fetches them together: a policy whose validations each read the
+// cluster makes one call to the provider, not one per validation. A lookup an
+// expression short-circuits past is never fetched, and a lookup which depends
+// on an earlier result resolves in a later round.
+func (t *Template) evaluate(ctx context.Context, data *resolver, vars map[string]any) ([]ref.Val, error) {
+	results := make([]ref.Val, len(t.validations))
 	for round := 0; round < t.config.maxRounds; round++ {
-		out, _, err := prg.ContextEval(ctx, vars)
-		if err != nil {
-			return nil, err
+		unresolved := 0
+		for i, v := range t.validations {
+			if results[i] != nil {
+				continue
+			}
+			out, _, err := v.program.ContextEval(ctx, vars)
+			if err != nil {
+				return nil, fmt.Errorf("validation %d: %w", i, err)
+			}
+			if types.IsUnknown(out) {
+				unresolved++
+				continue
+			}
+			results[i] = out
 		}
-		if !types.IsUnknown(out) {
-			return out, nil
+		if unresolved == 0 {
+			return results, nil
 		}
 		if !data.hasPending() {
-			// The expression cannot make progress: an unknown reached the
-			// result without a lookup to resolve it.
-			return nil, fmt.Errorf("evaluation produced an unresolved value: %v", out)
+			// The policy cannot make progress: an unknown reached the result of
+			// a validation without a lookup to resolve it.
+			return nil, fmt.Errorf("evaluation produced an unresolved value")
 		}
 		if err := data.fetch(ctx); err != nil {
 			return nil, err
 		}
 	}
 	return nil, fmt.Errorf("referential data did not resolve after %d rounds, "+
-		"which means the policy's lookups depend on each other more deeply than MaxDataRounds allows", t.config.maxRounds)
+		"which means the policy's lookups depend on each other more deeply than MaxDataRounds allows",
+		t.config.maxRounds)
 }
 
 // activation binds the variables of the Gatekeeper admission engine. Inputs

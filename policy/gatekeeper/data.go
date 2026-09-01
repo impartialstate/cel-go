@@ -24,6 +24,7 @@ import (
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
+	"github.com/google/cel-go/common/types/traits"
 )
 
 // Variables which carry referential data into a policy. They have no equivalent
@@ -205,6 +206,7 @@ func (f DataProviderFunc) Resolve(ctx context.Context, request Request) (any, er
 type resolver struct {
 	provider DataProvider
 	answers  map[string]ref.Val
+	keyed    map[string]ref.Val
 	pending  map[string]Request
 	order    []string
 }
@@ -213,8 +215,63 @@ func newResolver(provider DataProvider) *resolver {
 	return &resolver{
 		provider: provider,
 		answers:  map[string]ref.Val{},
+		keyed:    map[string]ref.Val{},
 		pending:  map[string]Request{},
 	}
+}
+
+// listByName answers a list lookup as a map from object name to object, which
+// is the shape a Rego policy reads the inventory in.
+func (r *resolver) listByName(req Request) ref.Val {
+	key := requestKey(req)
+	if keyed, found := r.keyed[key]; found {
+		return keyed
+	}
+	answer := r.lookup(req)
+	if types.IsUnknown(answer) || types.IsError(answer) {
+		return answer
+	}
+	list, ok := answer.(traits.Lister)
+	if !ok {
+		return types.NewErr("%s: expected a list of objects, got %s", describeRequest(req), answer.Type())
+	}
+	objects := map[ref.Val]ref.Val{}
+	size, ok := list.Size().(types.Int)
+	if !ok {
+		return types.MaybeNoSuchOverloadErr(list.Size())
+	}
+	for i := types.Int(0); i < size; i++ {
+		object := list.Get(i)
+		name, err := objectName(object)
+		if err != nil {
+			return err
+		}
+		objects[name] = object
+	}
+	keyed := types.NewRefValMap(types.DefaultTypeAdapter, objects)
+	r.keyed[key] = keyed
+	return keyed
+}
+
+// objectName reads metadata.name from an object of the inventory.
+func objectName(object ref.Val) (ref.Val, ref.Val) {
+	mapper, ok := object.(traits.Mapper)
+	if !ok {
+		return nil, types.NewErr("inventory holds a %s, expected an object", object.Type())
+	}
+	metadata, found := mapper.Find(types.String("metadata"))
+	if !found {
+		return nil, types.NewErr("inventory holds an object with no metadata")
+	}
+	metaMapper, ok := metadata.(traits.Mapper)
+	if !ok {
+		return nil, types.NewErr("inventory holds an object whose metadata is a %s", metadata.Type())
+	}
+	name, found := metaMapper.Find(types.String("name"))
+	if !found {
+		return nil, types.NewErr("inventory holds an object with no name")
+	}
+	return name, nil
 }
 
 // lookup returns the answer to a request, recording it as pending and returning
@@ -331,7 +388,11 @@ func DataFunctions() cel.EnvOption {
 				cel.MemberOverload("external_data_get",
 					[]*cel.Type{ExternalDataType, cel.StringType, cel.ListType(cel.StringType)},
 					cel.MapType(cel.StringType, cel.DynType),
-					cel.FunctionBinding(externalDataGet))),
+					cel.FunctionBinding(externalDataGet)),
+				cel.MemberOverload("external_data_get_request",
+					[]*cel.Type{ExternalDataType, cel.MapType(cel.StringType, cel.DynType)},
+					cel.MapType(cel.StringType, cel.DynType),
+					cel.BinaryBinding(externalDataRequest))),
 			cel.Function("list",
 				cel.MemberOverload("inventory_list_cluster",
 					[]*cel.Type{InventoryType, cel.StringType, cel.StringType}, cel.ListType(cel.DynType),
@@ -395,6 +456,26 @@ func externalDataGet(args ...ref.Val) ref.Val {
 		Provider: string(provider),
 		Keys:     keys.([]string),
 	})
+}
+
+// externalDataRequest answers the Rego form of the call, whose single argument
+// names the provider and the keys to send it:
+//
+//	external_data({"provider": "my-provider", "keys": ["key"]})
+func externalDataRequest(receiver, request ref.Val) ref.Val {
+	mapper, ok := request.(traits.Mapper)
+	if !ok {
+		return types.MaybeNoSuchOverloadErr(request)
+	}
+	provider, found := mapper.Find(types.String("provider"))
+	if !found {
+		return types.NewErr("%s request names no provider", ExternalDataFunc)
+	}
+	keys, found := mapper.Find(types.String("keys"))
+	if !found {
+		return types.NewErr("%s request holds no keys", ExternalDataFunc)
+	}
+	return externalDataGet(receiver, provider, keys)
 }
 
 func stringArgs(args []ref.Val) ([]string, ref.Val) {

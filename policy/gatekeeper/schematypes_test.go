@@ -224,7 +224,8 @@ spec:
         - engine: K8sNativeValidation
           source:
             validations:
-              - expression: "`+expression+`"
+              - expression: |-
+                  `+expression+`
                 message: "violation"
 `), "template.yaml")
 }
