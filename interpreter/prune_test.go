@@ -17,17 +17,17 @@ package interpreter
 import (
 	"testing"
 
-	"github.com/google/cel-go/common"
-	"github.com/google/cel-go/common/ast"
-	"github.com/google/cel-go/common/containers"
-	"github.com/google/cel-go/common/decls"
-	"github.com/google/cel-go/common/types"
-	"github.com/google/cel-go/common/types/ref"
-	"github.com/google/cel-go/common/types/traits"
-	"github.com/google/cel-go/parser"
-	"github.com/google/cel-go/test"
+	"cel.dev/cel-go/common"
+	"cel.dev/cel-go/common/ast"
+	"cel.dev/cel-go/common/containers"
+	"cel.dev/cel-go/common/decls"
+	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/common/types/ref"
+	"cel.dev/cel-go/common/types/traits"
+	"cel.dev/cel-go/parser"
+	"cel.dev/cel-go/test"
 
-	proto3pb "github.com/google/cel-go/test/proto3pb"
+	proto3pb "cel.dev/cel-go/test/proto3pb"
 )
 
 type testInfo struct {
@@ -310,7 +310,7 @@ var testCases = []testInfo{
 	{
 		in:   unknownActivation("x"),
 		expr: `[x, timestamp(0)]`,
-		out:  `[x, timestamp(0)]`,
+		out:  `[x, timestamp("1970-01-01T00:00:00Z")]`,
 	},
 	{
 		expr: `[timestamp(0), timestamp(1)]`,
@@ -364,25 +364,49 @@ var testCases = []testInfo{
 		expr: `[1+3, 2+2, 3+1, four]`,
 		out:  `[4, 4, 4, four]`,
 	},
+	// Since `undef` is not actually declared, these prune calls early exit
+	// as there is no logical operator available to absorb the error.
 	{
 		in:   unknownActivation(),
-		expr: `test == {'a': 1, 'field': 2}.field`,
-		out:  `test == 2`,
+		expr: `undef == {'a': 1, 'field': 2}.field`,
+		out:  `undef == {"a": 1, "field": 2}.field`,
 	},
 	{
 		in:   unknownActivation(),
-		expr: `test in {'a': 1, 'field': [2, 3]}.field`,
-		out:  `test in [2, 3]`,
+		expr: `undef in {'a': 1, 'field': [2, 3]}.field`,
+		out:  `undef in {"a": 1, "field": [2, 3]}.field`,
 	},
 	{
 		in:   unknownActivation(),
-		expr: `test == {'field': [1 + 2, 2 + 3]}`,
-		out:  `test == {"field": [3, 5]}`,
+		expr: `undef == {'field': [1 + 2, 2 + 3]}`,
+		out:  `undef == {"field": [1 + 2, 2 + 3]}`,
 	},
 	{
 		in:   unknownActivation(),
-		expr: `test in {'a': 1, 'field': [test, 3]}.field`,
-		out:  `test in {"a": 1, "field": [test, 3]}.field`,
+		expr: `undef in {'a': 1, 'field': [undef, 3]}.field`,
+		out:  `undef in {"a": 1, "field": [undef, 3]}.field`,
+	},
+	// These expressions are effectively identical to the ones above,
+	// but use a declared variable 'def'
+	{
+		in:   unknownActivation("def"),
+		expr: `def == {'a': 1, 'field': 2}.field`,
+		out:  `def == 2`,
+	},
+	{
+		in:   unknownActivation("def"),
+		expr: `def in {'a': 1, 'field': [2, 3]}.field`,
+		out:  `def in [2, 3]`,
+	},
+	{
+		in:   unknownActivation("def"),
+		expr: `def == {'field': [1 + 2, 2 + 3]}`,
+		out:  `def == {"field": [3, 5]}`,
+	},
+	{
+		in:   unknownActivation("def"),
+		expr: `def in {'a': 1, 'field': [def, 3]}.field`,
+		out:  `def in {"a": 1, "field": [def, 3]}.field`,
 	},
 	{
 		in:   partialActivation(map[string]any{"foo": "bar"}, "r.attr"),

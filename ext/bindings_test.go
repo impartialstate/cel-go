@@ -17,14 +17,17 @@ package ext
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
-	"github.com/google/cel-go/cel"
-	"github.com/google/cel-go/checker"
-	"github.com/google/cel-go/common/ast"
-	"github.com/google/cel-go/common/operators"
-	"github.com/google/cel-go/common/types"
-	"github.com/google/cel-go/common/types/ref"
+	"cel.dev/cel-go/cel"
+	"cel.dev/cel-go/checker"
+	"cel.dev/cel-go/common/ast"
+	"cel.dev/cel-go/common/operators"
+	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/common/types/ref"
+	"cel.dev/cel-go/interpreter"
+	"cel.dev/cel-go/test"
 )
 
 var bindingTests = []struct {
@@ -216,12 +219,13 @@ func TestBindingsInvalidIdent(t *testing.T) {
 }
 
 func BenchmarkBindings(b *testing.B) {
-	env, err := cel.NewEnv(Bindings(), Strings())
-	if err != nil {
-		b.Fatalf("cel.NewEnv(Bindings(), Strings()) failed: %v", err)
-	}
 	for i, tst := range bindingTests {
 		tc := tst
+		opts := append([]cel.EnvOption{Bindings(), Strings()}, tc.vars...)
+		env, err := cel.NewEnv(opts...)
+		if err != nil {
+			b.Fatalf("cel.NewEnv() failed: %v", err)
+		}
 		ast, iss := env.Compile(tc.expr)
 		if iss.Err() != nil {
 			b.Fatalf("env.Compile(%q) failed: %v", tc.expr, iss.Err())
@@ -234,8 +238,12 @@ func BenchmarkBindings(b *testing.B) {
 		b.Run(fmt.Sprintf("[%d]", i), func(b *testing.B) {
 			b.ResetTimer()
 			b.ReportAllocs()
+			var input any = cel.NoVars()
+			if tc.in != nil {
+				input = tc.in
+			}
 			for i := 0; i < b.N; i++ {
-				prg.Eval(cel.NoVars())
+				prg.Eval(input)
 			}
 		})
 	}
@@ -491,6 +499,131 @@ func TestBlockEval_RuntimeErrors(t *testing.T) {
 			_, _, err = prg.Eval(map[string]any{"x": "hello"})
 			if !strings.Contains(err.Error(), "no such attribute") {
 				t.Fatalf("prg.Eval() got %v, expected no such attribute error", err)
+			}
+		})
+	}
+}
+
+func TestDynamicBlockEval(t *testing.T) {
+	db := &dynamicBlock{
+		expr: interpreter.NewConstValue(1, types.IntOne),
+		slotActivationPool: &sync.Pool{
+			New: func() any {
+				return &dynamicSlotActivation{}
+			},
+		},
+	}
+	res := db.Eval(cel.NoVars())
+	if res.Equal(types.IntOne) != types.True {
+		t.Errorf("db.Eval() = %v, wanted 1", res)
+	}
+}
+
+func TestConstantBlockEval(t *testing.T) {
+	cb := &constantBlock{
+		expr: interpreter.NewConstValue(2, types.IntOne),
+	}
+	res := cb.Eval(cel.NoVars())
+	if res.Equal(types.IntOne) != types.True {
+		t.Errorf("cb.Eval() = %v, wanted 1", res)
+	}
+}
+
+func BenchmarkBlockEval(b *testing.B) {
+	fac := ast.NewExprFactory()
+	expr := fac.NewCall(
+		1, "cel.@block",
+		fac.NewList(2, []ast.Expr{
+			fac.NewIdent(3, "x"),
+			fac.NewIdent(4, "@index0"),
+			fac.NewIdent(5, "@index1"),
+		}, []int32{}),
+		fac.NewCall(9, operators.Add,
+			fac.NewCall(6, operators.Add,
+				fac.NewIdent(7, "@index2"),
+				fac.NewIdent(8, "@index1")),
+			fac.NewIdent(10, "@index0"),
+		),
+	)
+	blockAST := ast.NewAST(expr, nil)
+	env, err := cel.NewEnv(
+		Bindings(),
+		cel.Variable("x", cel.StringType),
+	)
+	if err != nil {
+		b.Fatalf("cel.NewEnv(Bindings()) failed: %v", err)
+	}
+	prg, err := env.PlanProgram(blockAST, cel.EvalOptions(cel.OptOptimize))
+	if err != nil {
+		b.Fatalf("PlanProgram() failed: %v", err)
+	}
+	input := map[string]any{"x": "hello"}
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		prg.Eval(input)
+	}
+}
+
+func TestValidateBindNestingLimit(t *testing.T) {
+	env, err := cel.NewEnv(
+		Bindings(),
+		cel.ASTValidators(cel.ValidateBindNestingLimit(2)),
+	)
+	if err != nil {
+		t.Fatalf("cel.NewEnv() failed: %v", err)
+	}
+	tests := []struct {
+		expr string
+		iss  string
+	}{
+		{
+			expr: `cel.bind(a, 1, a + 1)`,
+		},
+		{
+			expr: `cel.bind(a, 1, cel.bind(b, 2, a + b))`,
+		},
+		{
+			// two cel.binds, but in separate branches
+			expr: `cel.bind(a, 1, a) + cel.bind(b, 2, b)`,
+		},
+		{
+			// empty iteration range comprehension (e.g. cel.bind) does not count against comprehension limit,
+			// but counts against cel.bind nesting limit.
+			expr: `[1, 2, 3].exists(i, cel.bind(a, i, cel.bind(b, a, a + b) > 0))`,
+		},
+		{
+			// three cel.binds, three levels deep
+			expr: `cel.bind(a, 1, cel.bind(b, 2, cel.bind(c, 3, a + b + c)))`,
+			iss: `
+			ERROR: <input>:1:39: cel.bind exceeds nesting limit
+             | cel.bind(a, 1, cel.bind(b, 2, cel.bind(c, 3, a + b + c)))
+             | ......................................^`,
+		},
+		{
+			// three cel.binds, three levels deep with non-comprehension ancestor (+)
+			expr: `cel.bind(a, 1, cel.bind(b, 2, 1 + cel.bind(c, 3, a + b + c)))`,
+			iss: `
+			ERROR: <input>:1:43: cel.bind exceeds nesting limit
+             | cel.bind(a, 1, cel.bind(b, 2, 1 + cel.bind(c, 3, a + b + c)))
+             | ..........................................^`,
+		},
+	}
+	for _, tst := range tests {
+		tc := tst
+		t.Run(tc.expr, func(t *testing.T) {
+			_, iss := env.Compile(tc.expr)
+			if tc.iss != "" {
+				if iss.Err() == nil {
+					t.Fatalf("env.Compile(%v) returned ast, expected error: %v", tc.expr, tc.iss)
+				}
+				if !test.Compare(iss.Err().Error(), tc.iss) {
+					t.Fatalf("env.Compile(%v) returned %v, expected error: %v", tc.expr, iss.Err(), tc.iss)
+				}
+				return
+			}
+			if iss.Err() != nil {
+				t.Fatalf("env.Compile(%v) failed: %v", tc.expr, iss.Err())
 			}
 		})
 	}

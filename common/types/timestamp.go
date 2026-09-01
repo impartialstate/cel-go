@@ -15,14 +15,18 @@
 package types
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
-	"github.com/google/cel-go/common/overloads"
-	"github.com/google/cel-go/common/types/ref"
+	"cel.dev/cel-go/common/overloads"
+	"cel.dev/cel-go/common/types/ref"
 
 	anypb "google.golang.org/protobuf/types/known/anypb"
 	structpb "google.golang.org/protobuf/types/known/structpb"
@@ -51,6 +55,79 @@ const (
 	// Number of seconds between `9999-12-31T23:59:59.999999999Z` and the Unix epoch.
 	maxUnixTime int64 = 253402300799
 )
+
+// strictRFC3339Pattern gates the strings accepted by the `timestamp()` overload.
+// time.Parse accepts inputs that RFC 3339 forbids: a ',' fractional-second
+// separator, single-digit time fields, and numeric offsets whose hours exceed
+// 23 or minutes exceed 59. Those slip past unnoticed and shift the parsed
+// instant, so they are rejected before time.Parse runs. Month and day are held
+// to the grammar ranges 01-12 and 01-31; the remaining calendar validation
+// (day-of-month vs. month, leap years) is left to time.Parse.
+//
+// isStrictRFC3339 is the implementation used on the conversion path; the pattern
+// is retained as the reference the scan is conformance tested against.
+var strictRFC3339Pattern = regexp.MustCompile(
+	`^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])[Tt]([01]\d|2[0-3]):[0-5]\d:([0-5]\d|60)(\.\d+)?([Zz]|[+-]([01]\d|2[0-3]):[0-5]\d)$`)
+
+// isStrictRFC3339 reports whether s matches strictRFC3339Pattern, hand-rolled to
+// keep the conversion path off the regexp engine and its per-call cost.
+func isStrictRFC3339(s string) bool {
+	// Shortest accepted form is "2006-01-02T15:04:05Z" (20 bytes): a 19-byte
+	// fixed-width date-time followed by at least a 'Z'/'z' zone.
+	if len(s) < 20 {
+		return false
+	}
+	// full-date "T" partial-time
+	if !isYear(s[0:4]) || !isChar(s[4], '-') || !isMonth(s[5:7]) || !isChar(s[7], '-') || !isDay(s[8:10]) ||
+		!isChar(s[10], 't') ||
+		!isHour(s[11:13]) || !isChar(s[13], ':') || !isMinute(s[14:16]) || !isChar(s[16], ':') || !isSecond(s[17:19]) {
+		return false
+	}
+	rest := s[19:]
+	// optional fractional seconds: "." 1*DIGIT
+	if rest[0] == '.' {
+		rest = rest[1:]
+		n := 0
+		for n < len(rest) && isDigit(rest[n]) {
+			n++
+		}
+		if n == 0 {
+			return false
+		}
+		rest = rest[n:]
+	}
+	// time-offset: "Z" or ("+" / "-") time-hour ":" time-minute
+	if len(rest) == 1 {
+		return isChar(rest[0], 'z')
+	}
+	if len(rest) == 6 && (rest[0] == '+' || rest[0] == '-') {
+		return isHour(rest[1:3]) && isChar(rest[3], ':') && isMinute(rest[4:6])
+	}
+	return false
+}
+
+func isDigit(c byte) bool { return c >= '0' && c <= '9' }
+
+// isChar reports whether got is want, case-insensitively; want must be lower case.
+func isChar(got, want byte) bool {
+	g, w := rune(got), rune(want)
+	return g == w || unicode.ToLower(g) == w
+}
+
+// inRange reports whether s is all decimal digits and its value lies in [lo, hi].
+func inRange(s string, lo, hi uint64) bool {
+	u, err := strconv.ParseUint(s, 10, 64)
+	return err == nil && u >= lo && u <= hi
+}
+
+func isYear(s string) bool   { return inRange(s, 0, 9999) }
+func isMonth(s string) bool  { return inRange(s, 1, 12) }
+func isDay(s string) bool    { return inRange(s, 1, 31) }
+func isHour(s string) bool   { return inRange(s, 0, 23) }
+func isMinute(s string) bool { return inRange(s, 0, 59) }
+
+// isSecond permits 60 for a leap second.
+func isSecond(s string) bool { return inRange(s, 0, 60) }
 
 // Add implements traits.Adder.Add.
 func (t Timestamp) Add(other ref.Val) ref.Val {
@@ -183,6 +260,90 @@ func (t Timestamp) format(sb *strings.Builder) {
 	fmt.Fprintf(sb, `timestamp("%s")`, t.Time.UTC().Format(time.RFC3339Nano))
 }
 
+// ParseTimestamp attempts to parse a timestamp from various supported types and representations:
+// - time.Time, Timestamp, *timestamppb.Timestamp
+// - RFC 3339 and RFC 3339Nano formatted strings (e.g. "2023-01-01T00:00:00Z")
+// - Unix epoch integers (int, int32, int64)
+// - Unix epoch floating-point seconds (float32, float64)
+// - json.Number
+// - String representations of integers or floating-point epoch seconds
+//
+// If the parsed timestamp falls outside the supported range [minUnixTime, maxUnixTime], an error is returned.
+func ParseTimestamp(val any) (time.Time, error) {
+	if val == nil {
+		return time.Time{}, errors.New("invalid timestamp: nil value")
+	}
+	switch v := val.(type) {
+	case time.Time:
+		return validateTimestampRange(v.UTC())
+	case Timestamp:
+		return validateTimestampRange(v.Time.UTC())
+	case *tpb.Timestamp:
+		if v == nil {
+			return time.Time{}, nil
+		}
+		return validateTimestampRange(v.AsTime().UTC())
+	case int:
+		return validateTimestampRange(time.Unix(int64(v), 0).UTC())
+	case int32:
+		return validateTimestampRange(time.Unix(int64(v), 0).UTC())
+	case int64:
+		return validateTimestampRange(time.Unix(v, 0).UTC())
+	case float32:
+		return unixTimeFromFloat(float64(v))
+	case float64:
+		return unixTimeFromFloat(v)
+	case json.Number:
+		if i, err := v.Int64(); err == nil {
+			return validateTimestampRange(time.Unix(i, 0).UTC())
+		}
+		if f, err := v.Float64(); err == nil {
+			return unixTimeFromFloat(f)
+		}
+		return ParseTimestamp(v.String())
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "" {
+			return time.Time{}, errors.New("invalid RFC 3339 timestamp: ''")
+		}
+		if isStrictRFC3339(s) {
+			t, err := time.Parse(time.RFC3339, s)
+			if err != nil {
+				return time.Time{}, fmt.Errorf("invalid RFC 3339 timestamp %q", s)
+			}
+			return validateTimestampRange(t.UTC())
+		}
+		if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return validateTimestampRange(time.Unix(i, 0).UTC())
+		}
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return unixTimeFromFloat(f)
+		}
+		return time.Time{}, fmt.Errorf("unsupported timestamp format: %q", s)
+	default:
+		return time.Time{}, fmt.Errorf("unsupported timestamp type: %T", val)
+	}
+}
+
+func unixTimeFromFloat(f float64) (time.Time, error) {
+	sec, err := doubleToInt64Checked(f)
+	if err != nil {
+		return time.Time{}, err
+	}
+	nsec := int64((f - float64(sec)) * 1e9)
+	return validateTimestampRange(time.Unix(sec, nsec).UTC())
+}
+
+func validateTimestampRange(t time.Time) (time.Time, error) {
+	if t.IsZero() {
+		return t, nil
+	}
+	if t.Unix() < minUnixTime || t.Unix() > maxUnixTime {
+		return time.Time{}, fmt.Errorf("timestamp overflow: %v", t)
+	}
+	return t, nil
+}
+
 var (
 	timestampValueType = reflect.TypeOf(&tpb.Timestamp{})
 
@@ -293,7 +454,7 @@ func timeZone(tz ref.Val, visitor timestampVisitor) timestampVisitor {
 		}
 
 		// If the input is not the name of a timezone (for example, 'US/Central'), it should be a numerical offset from UTC
-		// in the format ^(+|-)(0[0-9]|1[0-4]):[0-5][0-9]$. The numerical input is parsed in terms of hours and minutes.
+		// in the format ^(+|-)([01]\d|2[0-3]):[0-5][0-9]$. The numerical input is parsed in terms of hours and minutes.
 		hr, err := strconv.Atoi(string(val[0:ind]))
 		if err != nil {
 			return WrapErr(err)
@@ -301,6 +462,12 @@ func timeZone(tz ref.Val, visitor timestampVisitor) timestampVisitor {
 		min, err := strconv.Atoi(string(val[ind+1:]))
 		if err != nil {
 			return WrapErr(err)
+		}
+		if hr < -23 || hr > 23 {
+			return WrapErr(fmt.Errorf("timezone offset hours out of range [-23, 23]: %s", val))
+		}
+		if min < 0 || min > 59 {
+			return WrapErr(fmt.Errorf("timezone offset minutes out of range [0, 59]: %s", val))
 		}
 		var offset int
 		if string(val[0]) == "-" {

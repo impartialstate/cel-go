@@ -22,7 +22,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/google/cel-go/common/types/ref"
+	"cel.dev/cel-go/common/types/ref"
 
 	anypb "google.golang.org/protobuf/types/known/anypb"
 	structpb "google.golang.org/protobuf/types/known/structpb"
@@ -44,7 +44,10 @@ func (b Bytes) Add(other ref.Val) ref.Val {
 	if !ok {
 		return ValOrErr(other, "no such overload")
 	}
-	return append(b, otherBytes...)
+	sum := make([]byte, 0, len(b)+len(otherBytes))
+	sum = append(sum, b...)
+	sum = append(sum, otherBytes...)
+	return Bytes(sum)
 }
 
 // Compare implements traits.Comparer interface method by lexicographic ordering.

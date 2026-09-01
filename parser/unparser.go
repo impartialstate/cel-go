@@ -21,10 +21,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/google/cel-go/common/ast"
-	"github.com/google/cel-go/common/operators"
-	"github.com/google/cel-go/common/types"
-	"github.com/google/cel-go/common/types/ref"
+	"cel.dev/cel-go/common/ast"
+	"cel.dev/cel-go/common/operators"
+	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/common/types/ref"
 )
 
 // Unparse takes an input expression and source position information and generates a human-readable
@@ -297,7 +297,7 @@ func (un *unparser) visitConstVal(val ref.Val) error {
 		// represent the float using the minimum required digits
 		d := strconv.FormatFloat(float64(val), 'g', -1, 64)
 		un.str.WriteString(d)
-		if !strings.Contains(d, ".") {
+		if !strings.ContainsAny(d, ".eE") {
 			un.str.WriteString(".0")
 		}
 	case types.Int:

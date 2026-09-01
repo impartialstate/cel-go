@@ -23,16 +23,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/cel-go/checker"
-	"github.com/google/cel-go/common"
-	"github.com/google/cel-go/common/containers"
-	"github.com/google/cel-go/common/decls"
-	"github.com/google/cel-go/common/overloads"
-	"github.com/google/cel-go/common/types"
-	"github.com/google/cel-go/common/types/ref"
-	"github.com/google/cel-go/parser"
+	"cel.dev/cel-go/checker"
+	"cel.dev/cel-go/common"
+	"cel.dev/cel-go/common/containers"
+	"cel.dev/cel-go/common/decls"
+	"cel.dev/cel-go/common/overloads"
+	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/common/types/ref"
+	"cel.dev/cel-go/parser"
 
-	proto3pb "github.com/google/cel-go/test/proto3pb"
+	proto3pb "cel.dev/cel-go/test/proto3pb"
 )
 
 func TestTrackCostAdvanced(t *testing.T) {
@@ -134,6 +134,10 @@ func computeCost(t *testing.T, expr string, vars []*decls.VariableDecl, ctx Acti
 	if err != nil {
 		t.Fatalf("NewCostTracker() failed: %v", err)
 	}
+	costTracker, err = costTracker.Clone()
+	if err != nil {
+		t.Fatalf("checker.Clone() failed: %v", err)
+	}
 	checked, errs := checker.Check(parsed, s, env)
 	if len(errs.GetErrors()) != 0 {
 		t.Fatalf(`Failed to check expression "%s", error: %v`, expr, errs.GetErrors())
@@ -161,7 +165,8 @@ func computeCost(t *testing.T, expr string, vars []*decls.VariableDecl, ctx Acti
 			}
 		}
 	}()
-	prg.Eval(ctx)
+	frame := AsFrame(ctx)
+	prg.Exec(frame)
 	// TODO: enable this once all attributes are properly pushed and popped from stack.
 	//if len(costTracker.stack) != 1 {
 	//	t.Fatalf(`Expected resulting stack size to be 1 but got %d: %#+v`, len(costTracker.stack), costTracker.stack)
@@ -606,13 +611,22 @@ func TestRuntimeCost(t *testing.T) {
 			in:   map[string]any{"input": string(randSeq(500)), "arg1": string(randSeq(500))},
 		},
 		{
+			name: "matches global",
+			expr: `matches(input, '\\d+a\\d+b')`,
+			vars: []*decls.VariableDecl{
+				decls.NewVariable("input", types.StringType),
+			},
+			want: 103,
+			in:   map[string]any{"input": string(randSeq(500))},
+		},
+		{
 			name: "startsWith",
 			expr: `input.startsWith(arg1)`,
 			vars: []*decls.VariableDecl{
 				decls.NewVariable("input", types.StringType),
 				decls.NewVariable("arg1", types.StringType),
 			},
-			want: 3,
+			want: 52,
 			in:   map[string]any{"input": "idc", "arg1": string(randSeq(500))},
 		},
 		{
@@ -622,7 +636,7 @@ func TestRuntimeCost(t *testing.T) {
 				decls.NewVariable("input", types.StringType),
 				decls.NewVariable("arg1", types.StringType),
 			},
-			want: 3,
+			want: 52,
 			in:   map[string]any{"input": "idc", "arg1": string(randSeq(500))},
 		},
 		{

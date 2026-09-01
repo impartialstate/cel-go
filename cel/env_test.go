@@ -23,17 +23,17 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/google/cel-go/common"
-	"github.com/google/cel-go/common/ast"
-	"github.com/google/cel-go/common/decls"
-	"github.com/google/cel-go/common/env"
-	"github.com/google/cel-go/common/operators"
-	"github.com/google/cel-go/common/types"
-	"github.com/google/cel-go/common/types/ref"
+	"cel.dev/cel-go/common"
+	"cel.dev/cel-go/common/ast"
+	"cel.dev/cel-go/common/decls"
+	"cel.dev/cel-go/common/env"
+	"cel.dev/cel-go/common/operators"
+	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/common/types/ref"
 
 	"google.golang.org/protobuf/proto"
 
-	proto3pb "github.com/google/cel-go/test/proto3pb"
+	proto3pb "cel.dev/cel-go/test/proto3pb"
 	exprpb "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
 )
 
@@ -164,6 +164,37 @@ func TestFormatCELTypeEquivalence(t *testing.T) {
 	}
 }
 
+func TestEnvExtendDisableDeclaration(t *testing.T) {
+	baseEnv, err := NewCustomEnv(
+		Function("foo",
+			Overload("foo_bool", []*Type{BoolType}, BoolType),
+		),
+	)
+	if err != nil {
+		t.Fatalf("NewCustomEnv() failed: %v", err)
+	}
+	_, iss := baseEnv.Compile("foo(true)")
+	if iss.Err() != nil {
+		t.Fatalf("baseEnv.Compile(foo(true)) failed: %v", iss.Err())
+	}
+
+	childEnv, err := baseEnv.Extend(
+		Function("foo",
+			DisableDeclaration(true),
+			Overload("foo_bool", []*Type{BoolType}, BoolType),
+		),
+	)
+	if err != nil {
+		t.Fatalf("baseEnv.Extend() failed: %v", err)
+	}
+
+	_, iss = childEnv.Compile("foo(true)")
+	if iss.Err() == nil {
+		t.Errorf("childEnv.Compile(foo(true)) succeeded, wanted error")
+	}
+}
+
+
 func TestEnvCheckExtendRace(t *testing.T) {
 	t.Parallel()
 	for i := 0; i < 500; i++ {
@@ -189,6 +220,116 @@ func TestEnvCheckExtendRace(t *testing.T) {
 	}
 }
 
+func TestEnvConcurrentExtend(t *testing.T) {
+	t.Parallel()
+	baseEnv, err := NewCustomEnv(StdLib())
+	if err != nil {
+		t.Fatalf("NewCustomEnv() failed: %v", err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			_, err := baseEnv.Extend(Variable(fmt.Sprintf("v%d", id), StringType))
+			if err != nil {
+				t.Errorf("Extend() failed: %v", err)
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+func TestEnvConcurrentExtendAndCompile(t *testing.T) {
+	t.Parallel()
+	baseEnv, err := NewCustomEnv(StdLib())
+	if err != nil {
+		t.Fatalf("NewCustomEnv() failed: %v", err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			varName := fmt.Sprintf("v%d", id)
+			extEnv, err := baseEnv.Extend(Variable(varName, IntType))
+			if err != nil {
+				t.Errorf("Extend() failed: %v", err)
+				return
+			}
+			ast, iss := extEnv.Compile(fmt.Sprintf("%s > 0", varName))
+			if iss.Err() != nil {
+				t.Errorf("Compile() failed: %v", iss.Err())
+				return
+			}
+			prg, err := extEnv.Program(ast)
+			if err != nil {
+				t.Errorf("Program() failed: %v", err)
+				return
+			}
+			out, _, err := prg.Eval(map[string]any{varName: 10})
+			if err != nil {
+				t.Errorf("Eval() failed: %v", err)
+				return
+			}
+			if out.Value() != true {
+				t.Errorf("got %v, wanted true", out.Value())
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+func TestEnvConcurrentExtendWithMutation(t *testing.T) {
+	t.Parallel()
+	baseEnv, err := NewCustomEnv(StdLib())
+	if err != nil {
+		t.Fatalf("NewCustomEnv() failed: %v", err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			fnName := fmt.Sprintf("custom_func_%d", id)
+			extEnv, err := baseEnv.Extend(
+				Function(fnName,
+					Overload(fnName+"_int", []*Type{IntType}, IntType,
+						UnaryBinding(func(val ref.Val) ref.Val {
+							return val
+						}),
+					),
+				),
+			)
+			if err != nil {
+				t.Errorf("Extend() failed: %v", err)
+				return
+			}
+			ast, iss := extEnv.Compile(fmt.Sprintf("%s(42) == 42", fnName))
+			if iss.Err() != nil {
+				t.Errorf("Compile() failed: %v", iss.Err())
+				return
+			}
+			prg, err := extEnv.Program(ast)
+			if err != nil {
+				t.Errorf("Program() failed: %v", err)
+				return
+			}
+			out, _, err := prg.Eval(NoVars())
+			if err != nil {
+				t.Errorf("Eval() failed: %v", err)
+				return
+			}
+			if out.Value() != true {
+				t.Errorf("got %v, wanted true", out.Value())
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+
+
 func TestEnvPartialVarsError(t *testing.T) {
 	env := testEnv(t)
 	_, err := env.PartialVars(10)
@@ -198,9 +339,9 @@ func TestEnvPartialVarsError(t *testing.T) {
 }
 
 func TestTypeProviderInterop(t *testing.T) {
-	reg, err := types.NewProtoRegistry(types.ProtoTypeDefs(&proto3pb.TestAllTypes{}))
+	reg, err := types.NewRegistry(&proto3pb.TestAllTypes{})
 	if err != nil {
-		t.Fatalf("types.NewProtoRegistry() failed: %v", err)
+		t.Fatalf("types.NewRegistry() failed: %v", err)
 	}
 	tests := []struct {
 		name     string
@@ -439,8 +580,10 @@ func TestEnvToConfig(t *testing.T) {
 			opts: []EnvOption{
 				ExtendedValidations(),
 				ASTValidators(ValidateComprehensionNestingLimit(1)),
+				ASTValidators(ValidateBindNestingLimit(2)),
 			},
 			want: env.NewConfig("validators").AddValidators(
+				env.NewValidator("cel.validator.bind_nesting_limit").SetConfig(map[string]any{"limit": 2}),
 				env.NewValidator("cel.validator.comprehension_nesting_limit").SetConfig(map[string]any{"limit": 1}),
 				env.NewValidator("cel.validator.duration"),
 				env.NewValidator("cel.validator.homogeneous_literals"),
@@ -1023,6 +1166,24 @@ func TestEnvFromConfigErrors(t *testing.T) {
 				AddValidators(env.NewValidator("cel.validator.comprehension_nesting_limit").SetConfig(map[string]any{"limit": 2.5})),
 			want: errors.New("invalid validator: cel.validator.comprehension_nesting_limit, limit value is not a whole number: 2.5"),
 		},
+		{
+			name: "invalid cel_bind validator config",
+			conf: env.NewConfig("invalid validator config").
+				AddValidators(env.NewValidator("cel.validator.bind_nesting_limit")),
+			want: errors.New("invalid validator"),
+		},
+		{
+			name: "invalid cel_bind validator config type - unsupported type",
+			conf: env.NewConfig("invalid validator config").
+				AddValidators(env.NewValidator("cel.validator.bind_nesting_limit").SetConfig(map[string]any{"limit": "2"})),
+			want: errors.New("invalid validator"),
+		},
+		{
+			name: "invalid cel_bind validator config type - fractional",
+			conf: env.NewConfig("invalid validator config").
+				AddValidators(env.NewValidator("cel.validator.bind_nesting_limit").SetConfig(map[string]any{"limit": 2.5})),
+			want: errors.New("invalid validator: cel.validator.bind_nesting_limit, limit value is not a whole number: 2.5"),
+		},
 	}
 	for _, tst := range tests {
 		tc := tst
@@ -1279,4 +1440,66 @@ func (p *customCELProvider) FindStructFieldType(structType, fieldName string) (*
 
 func (p *customCELProvider) NewValue(structType string, fields map[string]ref.Val) ref.Val {
 	return p.provider.NewValue(structType, fields)
+}
+
+func TestCELTypeAdapter(t *testing.T) {
+	env, err := NewEnv()
+	if err != nil {
+		t.Fatalf("NewEnv() failed: %v", err)
+	}
+	adapter := env.CELTypeAdapter()
+	if adapter == nil {
+		t.Error("CELTypeAdapter() returned nil")
+	}
+}
+
+type mockTypeProvider struct {
+	ref.TypeProvider
+}
+
+func TestMaybeInteropProvider_Error(t *testing.T) {
+	_, err := maybeInteropProvider(123)
+	if err == nil {
+		t.Error("maybeInteropProvider(int) should return error")
+	}
+}
+
+func TestMaybeInteropProvider_LegacyTypeProvider(t *testing.T) {
+	tp := &mockTypeProvider{}
+	p, err := maybeInteropProvider(tp)
+	if err != nil {
+		t.Fatalf("maybeInteropProvider(mockTypeProvider) failed: %v", err)
+	}
+	if _, ok := p.(*interopCELTypeProvider); !ok {
+		t.Errorf("expected *interopCELTypeProvider, got %T", p)
+	}
+}
+
+func TestParserErrorRecoveryLimit(t *testing.T) {
+	env, err := NewEnv(ParserErrorRecoveryLimit(10))
+	if err != nil {
+		t.Fatalf("NewEnv(ParserErrorRecoveryLimit(10)) failed: %v", err)
+	}
+	if env.limits[limitParseErrorRecovery] != 10 {
+		t.Errorf("limitParseErrorRecovery = %d, want 10", env.limits[limitParseErrorRecovery])
+	}
+}
+
+func TestEnableHiddenAccumulatorName(t *testing.T) {
+	_, err := NewEnv(EnableHiddenAccumulatorName(true))
+	if err != nil {
+		t.Fatalf("NewEnv(EnableHiddenAccumulatorName(true)) failed: %v", err)
+	}
+}
+
+func TestDeclareContextProto_Duplicate(t *testing.T) {
+	desc := (&proto3pb.TestAllTypes{}).ProtoReflect().Descriptor()
+	env, err := NewEnv(DeclareContextProto(desc))
+	if err != nil {
+		t.Fatalf("NewEnv(DeclareContextProto()) failed: %v", err)
+	}
+	_, err = DeclareContextProto(desc)(env)
+	if err == nil {
+		t.Error("DeclareContextProto() twice should fail")
+	}
 }

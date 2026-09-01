@@ -20,19 +20,19 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/google/cel-go/checker"
-	"github.com/google/cel-go/common"
-	"github.com/google/cel-go/common/containers"
-	"github.com/google/cel-go/common/decls"
-	"github.com/google/cel-go/common/stdlib"
-	"github.com/google/cel-go/common/types"
-	"github.com/google/cel-go/common/types/ref"
-	"github.com/google/cel-go/parser"
+	"cel.dev/cel-go/checker"
+	"cel.dev/cel-go/common"
+	"cel.dev/cel-go/common/containers"
+	"cel.dev/cel-go/common/decls"
+	"cel.dev/cel-go/common/stdlib"
+	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/common/types/ref"
+	"cel.dev/cel-go/parser"
 
 	exprpb "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
 	anypb "google.golang.org/protobuf/types/known/anypb"
 
-	proto3pb "github.com/google/cel-go/test/proto3pb"
+	proto3pb "cel.dev/cel-go/test/proto3pb"
 )
 
 func TestAttributesAbsoluteAttr(t *testing.T) {
@@ -393,6 +393,54 @@ func TestAttributesConditionalAttrFalseBranch(t *testing.T) {
 	}
 	if out != uint(42) {
 		t.Errorf("Got %v (%T), wanted 42", out, out)
+	}
+}
+
+func TestAttributesNarrowMapKeyQualifier(t *testing.T) {
+	reg := newTestRegistry(t)
+	attrs := NewAttributeFactory(containers.DefaultContainer, reg, reg)
+	vars, err := NewActivation(map[string]any{
+		"i32": map[int32]any{0: "zero"},
+		"u32": map[uint32]any{0: "zero"},
+	})
+	if err != nil {
+		t.Fatalf("NewActivation() failed: %v", err)
+	}
+	// An index outside the key type's range must not be truncated into a
+	// matching key. int32(1<<32) and uint32(1<<32) both wrap to 0.
+	tests := []struct {
+		varName string
+		qual    any
+		out     any
+		err     error
+	}{
+		{varName: "i32", qual: int64(1) << 32, err: errors.New("no such key: 4294967296")},
+		{varName: "u32", qual: uint64(1) << 32, err: errors.New("no such key: 4294967296")},
+		{varName: "i32", qual: int64(0), out: "zero"},
+		{varName: "u32", qual: uint64(0), out: "zero"},
+	}
+	for i, tst := range tests {
+		tc := tst
+		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			attr := attrs.AbsoluteAttribute(1, tc.varName)
+			attr.AddQualifier(makeQualifier(t, attrs, nil, 2, tc.qual))
+			out, err := attr.Resolve(vars)
+			if err != nil {
+				if tc.err == nil {
+					t.Fatalf("attr.Resolve() failed: %v", err)
+				}
+				if tc.err.Error() != err.Error() {
+					t.Fatalf("attr.Resolve() errored with %v, wanted error %v", err, tc.err)
+				}
+				return
+			}
+			if tc.err != nil {
+				t.Fatalf("attr.Resolve() got %v, wanted error %v", out, tc.err)
+			}
+			if out != tc.out {
+				t.Errorf("attr.Resolve() got %v, wanted %v", out, tc.out)
+			}
+		})
 	}
 }
 
@@ -1177,9 +1225,6 @@ func TestAttributeStateTracking(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err != nil {
-				t.Fatal(err)
-			}
 			out := i.Eval(in)
 			if types.IsUnknown(tc.out) && types.IsUnknown(out) {
 				if !reflect.DeepEqual(tc.out, out) {
@@ -1323,4 +1368,144 @@ func testExprTypeToType(t testing.TB, fieldType *exprpb.Type) *types.Type {
 		t.Fatalf("types.ExprTypeToType() failed: %v", err)
 	}
 	return ft
+}
+
+func TestConditionalAttributeQualify(t *testing.T) {
+	reg, _ := types.NewRegistry()
+	cont := containers.DefaultContainer
+	fac := NewAttributeFactory(cont, reg, reg)
+
+	truthy := fac.AbsoluteAttribute(1, "a")
+	falsy := fac.AbsoluteAttribute(2, "b")
+	cond := &conditionalAttribute{
+		id:      3,
+		expr:    NewConstValue(4, types.True),
+		truthy:  truthy,
+		falsy:   falsy,
+		adapter: reg,
+		fac:     fac,
+	}
+
+	activation, _ := NewActivation(map[string]any{"a": "key", "b": "other"})
+	obj := map[string]any{"key": 100}
+
+	// Test Qualify
+	res, err := cond.Qualify(activation, obj)
+	if err != nil {
+		t.Fatalf("Qualify() failed: %v", err)
+	}
+	if res != 100 {
+		t.Errorf("Qualify() returned %v, wanted 100", res)
+	}
+
+	// Test QualifyIfPresent
+	res, found, err := cond.QualifyIfPresent(activation, obj, false)
+	if err != nil {
+		t.Fatalf("QualifyIfPresent() failed: %v", err)
+	}
+	if !found || res != 100 {
+		t.Errorf("QualifyIfPresent() returned (%v, %v), wanted (100, true)", res, found)
+	}
+}
+
+func TestQualifyIfPresent(t *testing.T) {
+	reg := newTestRegistry(t)
+	cont := containers.DefaultContainer
+	fac := NewAttributeFactory(cont, reg, reg)
+	activation, _ := NewActivation(map[string]any{
+		"a": "b",
+		"c": int64(1),
+	})
+
+	tests := []struct {
+		name string
+		qual Qualifier
+		obj  any
+		out  any
+	}{
+		{
+			name: "absolute_attribute",
+			qual: fac.AbsoluteAttribute(1, "a"),
+			obj:  map[string]any{"b": 100},
+			out:  100,
+		},
+		{
+			name: "maybe_attribute",
+			qual: fac.MaybeAttribute(1, "a"),
+			obj:  map[string]any{"b": 100},
+			out:  100,
+		},
+		{
+			name: "relative_attribute",
+			qual: fac.RelativeAttribute(2, NewConstValue(1, types.String("b"))),
+			obj:  map[string]any{"b": 200},
+			out:  200,
+		},
+		{
+			name: "string_qualifier",
+			qual: makeOptQualifier(t, fac, nil, 1, "b"),
+			obj:  map[string]any{"b": 300},
+			out:  300,
+		},
+		{
+			name: "int_qualifier",
+			qual: makeOptQualifier(t, fac, nil, 1, int64(1)),
+			obj:  map[int64]any{int64(1): "value"},
+			out:  "value",
+		},
+		{
+			name: "uint_qualifier",
+			qual: makeOptQualifier(t, fac, nil, 1, uint64(1)),
+			obj:  map[uint64]any{uint64(1): "uvalue"},
+			out:  "uvalue",
+		},
+		{
+			name: "bool_qualifier",
+			qual: makeOptQualifier(t, fac, nil, 1, true),
+			obj:  map[bool]any{true: "bvalue"},
+			out:  "bvalue",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			res, found, err := tc.qual.QualifyIfPresent(activation, tc.obj, false)
+			if err != nil {
+				t.Fatalf("QualifyIfPresent() failed: %v", err)
+			}
+			if !found || !reflect.DeepEqual(res, tc.out) {
+				t.Errorf("QualifyIfPresent() returned (%v, %v), wanted (%v, true)", res, found, tc.out)
+			}
+		})
+	}
+}
+
+func TestAttribute_StringRepresentation(t *testing.T) {
+	reg := newTestRegistry(t)
+	cont := containers.DefaultContainer
+	fac := NewAttributeFactory(cont, reg, reg)
+
+	abs := fac.AbsoluteAttribute(1, "a.b")
+	maybe := fac.MaybeAttribute(2, "c")
+	rel := fac.RelativeAttribute(3, NewConstValue(1, types.String("d")))
+	cond := fac.ConditionalAttribute(4, NewConstValue(1, types.True), abs, maybe)
+	trail := types.NewAttributeTrail("x")
+
+	tests := []struct {
+		name     string
+		stringer fmt.Stringer
+	}{
+		{name: "absoluteAttribute", stringer: abs.(fmt.Stringer)},
+		{name: "maybeAttribute", stringer: maybe.(fmt.Stringer)},
+		{name: "relativeAttribute", stringer: rel.(fmt.Stringer)},
+		{name: "conditionalAttribute", stringer: cond.(fmt.Stringer)},
+		{name: "AttributeTrail", stringer: trail},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if str := tc.stringer.String(); str == "" {
+				t.Errorf("%s.String() returned empty string", tc.name)
+			}
+		})
+	}
 }

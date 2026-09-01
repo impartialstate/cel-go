@@ -16,6 +16,7 @@
 package common
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -134,4 +135,25 @@ func TestStringSource_SnippetSingleline(t *testing.T) {
 func TestNewInfoSource_NoPanicOnNil(t *testing.T) {
 	// Ensure there is no panic when passing nil, NewInfoSource should use proto v2 style accessors.
 	_ = NewInfoSource(nil)
+}
+
+func TestNewTextSourceWithLimit_Exceeded(t *testing.T) {
+	_, err := NewTextSourceWithLimit("greetings", 5)
+	if err == nil {
+		t.Fatalf("expected size limit error, got nil")
+	}
+	if !strings.Contains(err.Error(), "size exceeds limit") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestNewTextSourceWithLimit_MultibyteWithinLimit(t *testing.T) {
+	data := "🙂🙂"
+	src, err := NewTextSourceWithLimit(data, 2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got, want := src.Content(), data; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
 }

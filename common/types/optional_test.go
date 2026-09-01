@@ -19,13 +19,38 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/google/cel-go/common/types/ref"
+	"cel.dev/cel-go/common/types/ref"
 )
 
 func TestOptionalOptionalOf(t *testing.T) {
 	opt := OptionalOf(IntOne)
 	if !opt.HasValue() {
 		t.Error("OptionalOf(1) returned result with a value")
+	}
+}
+
+func TestOptionalOptionalFormat(t *testing.T) {
+	tests := []struct {
+		val  ref.Val
+		want string
+	}{
+		{
+			val:  OptionalNone,
+			want: "optional.none()",
+		},
+		{
+			val:  OptionalOf(True),
+			want: "optional.of(true)",
+		},
+		{
+			val:  OptionalOf(OptionalOf(False)),
+			want: "optional.of(optional.of(false))",
+		},
+	}
+	for _, tc := range tests {
+		if Format(tc.val) != tc.want {
+			t.Errorf("got %v, wanted %v", Format(tc.val), tc.want)
+		}
 	}
 }
 
@@ -114,6 +139,26 @@ func TestOptionalEqual(t *testing.T) {
 			b:   OptionalOf(Double(1.0)),
 			out: True,
 		},
+		{
+			a:   OptionalOf(OptionalOf(IntOne)),
+			b:   OptionalOf(Double(1.0)),
+			out: False,
+		},
+		{
+			a:   OptionalOf(OptionalOf(IntOne)),
+			b:   OptionalOf(OptionalOf(OptionalOf(Double(1.0)))),
+			out: False,
+		},
+		{
+			a:   OptionalOf(Double(1.0)),
+			b:   OptionalOf(OptionalOf(IntOne)),
+			out: False,
+		},
+		{
+			a:   OptionalOf(OptionalOf(OptionalOf(Double(1.0)))),
+			b:   OptionalOf(OptionalOf(IntOne)),
+			out: False,
+		},
 	}
 
 	for i, tst := range tests {
@@ -138,5 +183,24 @@ func TestOptionalValue(t *testing.T) {
 	}
 	if OptionalNone.Value() != nil {
 		t.Errorf("OptionalNone.Value() got %v, wanted nil", OptionalNone.Value())
+	}
+}
+
+func TestOptionalCalculateSize(t *testing.T) {
+	calc := NewSizeCalculator()
+	none := OptionalNone
+	if sizer, ok := any(none).(AggregateSizeVisitor); !ok || sizer.AggregateSize(calc) != 0 {
+		t.Errorf("expected 0 for OptionalNone")
+	}
+
+	someScalar := OptionalOf(Int(42))
+	if sizer, ok := any(someScalar).(AggregateSizeVisitor); !ok || sizer.AggregateSize(calc) != 2 {
+		t.Errorf("got %d for OptionalOf(scalar), want 2", sizer.AggregateSize(calc))
+	}
+
+	l := NewRefValList(DefaultTypeAdapter, []ref.Val{Int(1), Int(2)})
+	someList := OptionalOf(l)
+	if sizer, ok := any(someList).(AggregateSizeVisitor); !ok || sizer.AggregateSize(calc) != 4 {
+		t.Errorf("got %d for OptionalOf(list of 2), want 4", sizer.AggregateSize(calc))
 	}
 }

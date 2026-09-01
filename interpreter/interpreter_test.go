@@ -25,26 +25,26 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/cel-go/checker"
-	"github.com/google/cel-go/common"
-	"github.com/google/cel-go/common/ast"
-	"github.com/google/cel-go/common/containers"
-	"github.com/google/cel-go/common/decls"
-	"github.com/google/cel-go/common/functions"
-	"github.com/google/cel-go/common/operators"
-	"github.com/google/cel-go/common/stdlib"
-	"github.com/google/cel-go/common/types"
-	"github.com/google/cel-go/common/types/ref"
-	"github.com/google/cel-go/common/types/traits"
-	"github.com/google/cel-go/parser"
+	"cel.dev/cel-go/checker"
+	"cel.dev/cel-go/common"
+	"cel.dev/cel-go/common/ast"
+	"cel.dev/cel-go/common/containers"
+	"cel.dev/cel-go/common/decls"
+	"cel.dev/cel-go/common/functions"
+	"cel.dev/cel-go/common/operators"
+	"cel.dev/cel-go/common/stdlib"
+	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/common/types/ref"
+	"cel.dev/cel-go/common/types/traits"
+	"cel.dev/cel-go/parser"
 
 	exprpb "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
 	structpb "google.golang.org/protobuf/types/known/structpb"
 	tpb "google.golang.org/protobuf/types/known/timestamppb"
 	wrapperspb "google.golang.org/protobuf/types/known/wrapperspb"
 
-	proto2pb "github.com/google/cel-go/test/proto2pb"
-	proto3pb "github.com/google/cel-go/test/proto3pb"
+	proto2pb "cel.dev/cel-go/test/proto2pb"
+	proto3pb "cel.dev/cel-go/test/proto3pb"
 )
 
 type testCase struct {
@@ -70,6 +70,36 @@ func testData(t testing.TB) []testCase {
 		{
 			name: "double_ne_nan",
 			expr: `0.0/0.0 == 0.0/0.0`,
+			out:  types.False,
+		},
+		{
+			name: "double_lt_nan",
+			expr: `0.0/0.0 < 1.0`,
+			out:  types.False,
+		},
+		{
+			name: "double_nan_lt",
+			expr: `1.0 < 0.0/0.0`,
+			out:  types.False,
+		},
+		{
+			name: "double_nan_le_nan",
+			expr: `0.0/0.0 <= 0.0/0.0`,
+			out:  types.False,
+		},
+		{
+			name: "double_gt_nan",
+			expr: `0.0/0.0 > 1.0`,
+			out:  types.False,
+		},
+		{
+			name: "double_nan_gt",
+			expr: `1.0 > 0.0/0.0`,
+			out:  types.False,
+		},
+		{
+			name: "double_nan_ge_nan",
+			expr: `0.0/0.0 >= 0.0/0.0`,
 			out:  types.False,
 		},
 		{
@@ -1509,6 +1539,163 @@ func testData(t testing.TB) []testCase {
 			err:       `cannot initialize optional list element from non-optional value 123`,
 		},
 		{
+			name: "unknown_optional_map",
+			expr: `{?'hi': a}`,
+			vars: []*decls.VariableDecl{
+				decls.NewVariable("a", types.NewOptionalType(types.IntType)),
+			},
+			attrs: NewPartialAttributeFactory(testContainer(""), types.DefaultTypeAdapter, types.NewEmptyRegistry()),
+			in:    newTestPartialActivation(t, map[string]any{}, NewAttributePattern("a")),
+			out:   types.NewUnknown(4, types.NewAttributeTrail("a")),
+		},
+		{
+			name:      "unknown_optional_pb",
+			expr:      `TestAllTypes{?single_int32: a}`,
+			container: "google.expr.proto3.test",
+			typeOpts:  []types.RegistryOption{types.ProtoTypeDefs(&proto3pb.TestAllTypes{})},
+			vars: []*decls.VariableDecl{
+				decls.NewVariable("a", types.NewOptionalType(types.IntType)),
+			},
+			attrs: NewPartialAttributeFactory(testContainer("google.expr.proto3.test"), types.DefaultTypeAdapter, types.NewEmptyRegistry()),
+			in:    newTestPartialActivation(t, map[string]any{}, NewAttributePattern("a")),
+			out:   types.NewUnknown(3, types.NewAttributeTrail("a")),
+		},
+		{
+			name: "unknown_optional_list",
+			expr: `[?a]`,
+			vars: []*decls.VariableDecl{
+				decls.NewVariable("a", types.NewOptionalType(types.IntType)),
+			},
+			attrs: NewPartialAttributeFactory(testContainer(""), types.DefaultTypeAdapter, types.NewEmptyRegistry()),
+			in:    newTestPartialActivation(t, map[string]any{}, NewAttributePattern("a")),
+			out:   types.NewUnknown(2, types.NewAttributeTrail("a")),
+		},
+		{
+			name: "unknown_optional_list_multiple",
+			expr: `[?a, ?b]`,
+			vars: []*decls.VariableDecl{
+				decls.NewVariable("a", types.NewOptionalType(types.IntType)),
+				decls.NewVariable("b", types.NewOptionalType(types.IntType)),
+			},
+			attrs: NewPartialAttributeFactory(testContainer(""), types.DefaultTypeAdapter, types.NewEmptyRegistry()),
+			in:    newTestPartialActivation(t, map[string]any{}, NewAttributePattern("a"), NewAttributePattern("b")),
+			out:   types.MergeUnknowns(types.NewUnknown(2, types.NewAttributeTrail("a")), types.NewUnknown(3, types.NewAttributeTrail("b"))),
+		},
+		{
+			name: "unknown_eq_multiple",
+			expr: `a == b`,
+			vars: []*decls.VariableDecl{
+				decls.NewVariable("a", types.IntType),
+				decls.NewVariable("b", types.IntType),
+			},
+			attrs: NewPartialAttributeFactory(testContainer(""), types.DefaultTypeAdapter, types.NewEmptyRegistry()),
+			in:    newTestPartialActivation(t, map[string]any{}, NewAttributePattern("a"), NewAttributePattern("b")),
+			out:   types.MergeUnknowns(types.NewUnknown(1, types.NewAttributeTrail("a")), types.NewUnknown(3, types.NewAttributeTrail("b"))),
+		},
+		{
+			name: "unknown_ne_multiple",
+			expr: `a != b`,
+			vars: []*decls.VariableDecl{
+				decls.NewVariable("a", types.IntType),
+				decls.NewVariable("b", types.IntType),
+			},
+			attrs: NewPartialAttributeFactory(testContainer(""), types.DefaultTypeAdapter, types.NewEmptyRegistry()),
+			in:    newTestPartialActivation(t, map[string]any{}, NewAttributePattern("a"), NewAttributePattern("b")),
+			out:   types.MergeUnknowns(types.NewUnknown(1, types.NewAttributeTrail("a")), types.NewUnknown(3, types.NewAttributeTrail("b"))),
+		},
+		{
+			name: "unknown_eq_error_precedence",
+			expr: `a == (1/0)`,
+			vars: []*decls.VariableDecl{
+				decls.NewVariable("a", types.IntType),
+			},
+			attrs: NewPartialAttributeFactory(testContainer(""), types.DefaultTypeAdapter, types.NewEmptyRegistry()),
+			in:    newTestPartialActivation(t, map[string]any{}, NewAttributePattern("a")),
+			err:   "division by zero",
+		},
+		{
+			name: "unknown_ne_error_precedence",
+			expr: `a != (1/0)`,
+			vars: []*decls.VariableDecl{
+				decls.NewVariable("a", types.IntType),
+			},
+			attrs: NewPartialAttributeFactory(testContainer(""), types.DefaultTypeAdapter, types.NewEmptyRegistry()),
+			in:    newTestPartialActivation(t, map[string]any{}, NewAttributePattern("a")),
+			err:   "division by zero",
+		},
+		{
+			name:      "unknown_optional_nested_aggregate",
+			expr:      `TestAllTypes{?single_int32: a, repeated_int32: [?b], map_string_string: {?'key': c}}`,
+			container: "google.expr.proto3.test",
+			typeOpts:  []types.RegistryOption{types.ProtoTypeDefs(&proto3pb.TestAllTypes{})},
+			vars: []*decls.VariableDecl{
+				decls.NewVariable("a", types.NewOptionalType(types.IntType)),
+				decls.NewVariable("b", types.NewOptionalType(types.IntType)),
+				decls.NewVariable("c", types.NewOptionalType(types.StringType)),
+			},
+			attrs: NewPartialAttributeFactory(testContainer("google.expr.proto3.test"), types.DefaultTypeAdapter, types.NewEmptyRegistry()),
+			in:    newTestPartialActivation(t, map[string]any{}, NewAttributePattern("a"), NewAttributePattern("b"), NewAttributePattern("c")),
+			out:   types.MergeUnknowns(types.NewUnknown(3, types.NewAttributeTrail("a")), types.MergeUnknowns(types.NewUnknown(6, types.NewAttributeTrail("b")), types.NewUnknown(11, types.NewAttributeTrail("c")))),
+		},
+		{
+			name: "unknown_optional_map_multiple",
+			expr: `{?'hi': a, ?'world': b}`,
+			vars: []*decls.VariableDecl{
+				decls.NewVariable("a", types.NewOptionalType(types.IntType)),
+				decls.NewVariable("b", types.NewOptionalType(types.IntType)),
+			},
+			attrs: NewPartialAttributeFactory(testContainer(""), types.DefaultTypeAdapter, types.NewEmptyRegistry()),
+			in:    newTestPartialActivation(t, map[string]any{}, NewAttributePattern("a"), NewAttributePattern("b")),
+			out:   types.MergeUnknowns(types.NewUnknown(4, types.NewAttributeTrail("a")), types.NewUnknown(7, types.NewAttributeTrail("b"))),
+		},
+		{
+			name:      "unknown_optional_pb_multiple",
+			expr:      `TestAllTypes{?single_int32: a, ?single_int64: b}`,
+			container: "google.expr.proto3.test",
+			typeOpts:  []types.RegistryOption{types.ProtoTypeDefs(&proto3pb.TestAllTypes{})},
+			vars: []*decls.VariableDecl{
+				decls.NewVariable("a", types.NewOptionalType(types.IntType)),
+				decls.NewVariable("b", types.NewOptionalType(types.IntType)),
+			},
+			attrs: NewPartialAttributeFactory(testContainer("google.expr.proto3.test"), types.DefaultTypeAdapter, types.NewEmptyRegistry()),
+			in:    newTestPartialActivation(t, map[string]any{}, NewAttributePattern("a"), NewAttributePattern("b")),
+			out:   types.MergeUnknowns(types.NewUnknown(3, types.NewAttributeTrail("a")), types.NewUnknown(5, types.NewAttributeTrail("b"))),
+		},
+		{
+			name: "unknown_optional_map_error_precedence",
+			expr: `{?'hi': a, ?'world': {'x': 1/0}.?missing}`,
+			vars: []*decls.VariableDecl{
+				decls.NewVariable("a", types.NewOptionalType(types.IntType)),
+			},
+			attrs: NewPartialAttributeFactory(testContainer(""), types.DefaultTypeAdapter, types.NewEmptyRegistry()),
+			in:    newTestPartialActivation(t, map[string]any{}, NewAttributePattern("a")),
+			err:   "division by zero",
+		},
+		{
+			name:      "unknown_optional_map_invalid_type_precedence",
+			expr:      `{?'hi': a, ?'world': 'not-optional'}`,
+			unchecked: true,
+			vars: []*decls.VariableDecl{
+				decls.NewVariable("a", types.NewOptionalType(types.IntType)),
+			},
+			attrs: NewPartialAttributeFactory(testContainer(""), types.DefaultTypeAdapter, types.NewEmptyRegistry()),
+			in:    newTestPartialActivation(t, map[string]any{}, NewAttributePattern("a")),
+			err:   "cannot initialize optional entry 'world' from non-optional value not-optional",
+		},
+		{
+			name:      "unknown_optional_pb_invalid_type_precedence",
+			expr:      `TestAllTypes{?single_int32: a, ?single_int64: 1}`,
+			unchecked: true,
+			container: "google.expr.proto3.test",
+			typeOpts:  []types.RegistryOption{types.ProtoTypeDefs(&proto3pb.TestAllTypes{})},
+			vars: []*decls.VariableDecl{
+				decls.NewVariable("a", types.NewOptionalType(types.IntType)),
+			},
+			attrs: NewPartialAttributeFactory(testContainer("google.expr.proto3.test"), types.DefaultTypeAdapter, types.NewEmptyRegistry()),
+			in:    newTestPartialActivation(t, map[string]any{}, NewAttributePattern("a")),
+			err:   "cannot initialize optional entry 'single_int64' from non-optional value 1",
+		},
+		{
 			name: "bad_argument_in_optimized_list",
 			expr: `1/0 in [1, 2, 3]`,
 			err:  `division by zero`,
@@ -1540,6 +1727,16 @@ func testData(t testing.TB) []testCase {
 				},
 			}, NewAttributePattern("a").QualInt(0)),
 			out: types.NewUnknown(2, types.QualifyAttribute[int64](types.NewAttributeTrail("a"), 0)),
+		},
+		{
+			name: "macro_has_map_key_unknown_propagates",
+			expr: `has(a.b)`,
+			vars: []*decls.VariableDecl{
+				decls.NewVariable("a", types.NewMapType(types.StringType, types.BoolType)),
+			},
+			attrs: NewPartialAttributeFactory(testContainer(""), types.DefaultTypeAdapter, types.NewEmptyRegistry()),
+			in:    newTestPartialActivation(t, map[string]any{}, NewAttributePattern("a")),
+			out:   types.NewUnknown(4, types.NewAttributeTrail("a")),
 		},
 		{
 			name: "unknown_attribute_mixed_qualifier",
@@ -1685,7 +1882,7 @@ func BenchmarkInterpreter(b *testing.B) {
 		if tst.err != "" || tst.progErr != "" {
 			continue
 		}
-		prg, vars, err := program(b, &tst, Optimize(), CompileRegexConstants(MatchesRegexOptimization))
+		prg, frame, err := program(b, &tst, Optimize(), CompileRegexConstants(MatchesRegexOptimization))
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -1694,7 +1891,7 @@ func BenchmarkInterpreter(b *testing.B) {
 			b.ResetTimer()
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				prg.Eval(vars)
+				prg.Exec(frame)
 			}
 		})
 	}
@@ -1884,26 +2081,6 @@ func TestInterpreter_ExhaustiveConditionalExpr(t *testing.T) {
 	}
 }
 
-func TestInterpreter_WrappedActivationEvalState(t *testing.T) {
-	vars, _ := NewActivation(map[string]any{
-		"a": types.True,
-		"b": types.True,
-		"c": types.False,
-		"d": types.False,
-	})
-	state := NewEvalState()
-	esa := &evalStateActivation{vars: vars, state: state}
-	wrappedVars := &testActivationWrapper{esa, "test_activation_wrapper"}
-	ac, _ := NewActivation(wrappedVars)
-	es, found := asEvalState(ac)
-	if !found {
-		t.Errorf("asEvalState(%v) failed to find EvalState", ac)
-	}
-	if es != state {
-		t.Errorf("asEvalState(%v) returned %v, wanted %v", ac, es, state)
-	}
-}
-
 func TestInterpreter_InterruptableEval(t *testing.T) {
 	items := make([]int64, 5000)
 	for i := int64(0); i < 5000; i++ {
@@ -1919,7 +2096,7 @@ func TestInterpreter_InterruptableEval(t *testing.T) {
 		},
 		out: true,
 	}
-	prg, vars, err := program(t, &tc, InterruptableEval())
+	prg, frame, err := program(t, &tc, InterruptableEval())
 	if err != nil {
 		t.Fatalf("program(%s) failed: %v", tc.expr, err)
 	}
@@ -1928,35 +2105,78 @@ func TestInterpreter_InterruptableEval(t *testing.T) {
 	evalCtx, cancel := context.WithTimeout(ctx, 10*time.Microsecond)
 	defer cancel()
 
-	ctxVars := &contextActivation{
-		Activation: vars,
-		interrupt: func() bool {
-			select {
-			case <-evalCtx.Done():
-				return true
-			default:
-				return false
-			}
-		},
-	}
-	out := prg.Eval(ctxVars)
+	frame.SetContext(evalCtx, 100)
+	out := prg.Exec(frame)
+	frame.Close()
 	if !types.IsError(out) || out.(*types.Err).String() != "operation interrupted" {
 		t.Errorf("Got %v, wanted operation interrupted error", out)
 	}
 }
 
-type contextActivation struct {
-	Activation
-	interruptCount int
-	interrupt      func() bool
-}
-
-func (ca *contextActivation) ResolveName(name string) (any, bool) {
-	if name == "#interrupted" {
-		ca.interruptCount++
-		return ca.interruptCount%100 == 0 && ca.interrupt(), true
+func TestInterpreter_RegexProgramSizeLimit(t *testing.T) {
+	tcConst := testCase{
+		expr: `'hello'.matches('(a|b)*[0-9]+')`,
 	}
-	return ca.Activation.ResolveName(name)
+	_, _, err := program(t, &tcConst, RegexProgramSizeLimit(5))
+	if err == nil {
+		t.Fatalf("expected program creation error for constant regex exceeding limit")
+	}
+	if !strings.Contains(err.Error(), "regex program size 8 exceeds limit of 5") {
+		t.Errorf("got error %v, wanted error containing 'regex program size 8 exceeds limit of 5'", err)
+	}
+
+	tcDyn := testCase{
+		expr: `'hello'.matches(pattern)`,
+		vars: []*decls.VariableDecl{
+			decls.NewVariable("pattern", types.StringType),
+		},
+		in: map[string]any{
+			"pattern": "(a|b)*[0-9]+",
+		},
+	}
+	prg, frame, err := program(t, &tcDyn, RegexProgramSizeLimit(5))
+	if err != nil {
+		t.Fatalf("program() failed: %v", err)
+	}
+	out := prg.Exec(frame)
+	frame.Close()
+	if !types.IsError(out) || !strings.Contains(out.(*types.Err).String(), "regex program size 8 exceeds limit of 5") {
+		t.Errorf("got %v, wanted regex program size limit error", out)
+	}
+
+	tcValid := testCase{
+		expr: `'hello'.matches(pattern)`,
+		vars: []*decls.VariableDecl{
+			decls.NewVariable("pattern", types.StringType),
+		},
+		in: map[string]any{
+			"pattern": "el*",
+		},
+		out: true,
+	}
+	prgValid, frameValid, err := program(t, &tcValid, RegexProgramSizeLimit(5))
+	if err != nil {
+		t.Fatalf("program() failed: %v", err)
+	}
+	outValid := prgValid.Exec(frameValid)
+	frameValid.Close()
+	if outValid != types.True {
+		t.Errorf("got %v, wanted true", outValid)
+	}
+
+	// Non-regex function should not be modified by RegexProgramSizeLimit decorator
+	tcOther := testCase{
+		expr: `'hello'.contains('e')`,
+	}
+	prgOther, frameOther, err := program(t, &tcOther, RegexProgramSizeLimit(5))
+	if err != nil {
+		t.Fatalf("program() failed: %v", err)
+	}
+	outOther := prgOther.Exec(frameOther)
+	frameOther.Close()
+	if outOther != types.True {
+		t.Errorf("got %v, wanted true", outOther)
+	}
 }
 
 func TestInterpreter_ExhaustiveLogicalOrEquals(t *testing.T) {
@@ -2267,7 +2487,7 @@ func testContainer(name string) *containers.Container {
 	return cont
 }
 
-func program(t testing.TB, tst *testCase, opts ...PlannerOption) (Interpretable, Activation, error) {
+func program(t testing.TB, tst *testCase, opts ...PlannerOption) (InterpretableV2, *ExecutionFrame, error) {
 	// Configure the package.
 	cont := containers.DefaultContainer
 	if tst.container != "" {
@@ -2343,7 +2563,7 @@ func program(t testing.TB, tst *testCase, opts ...PlannerOption) (Interpretable,
 		if err != nil {
 			return nil, nil, err
 		}
-		return prg, vars, nil
+		return prg, AsFrame(vars), nil
 	}
 	// Check the expression.
 	checked, errs := checker.Check(parsed, s, env)
@@ -2355,7 +2575,7 @@ func program(t testing.TB, tst *testCase, opts ...PlannerOption) (Interpretable,
 	if err != nil {
 		return nil, nil, err
 	}
-	return prg, vars, nil
+	return prg, AsFrame(vars), nil
 }
 
 func base64Encode(val ref.Val) ref.Val {
@@ -2419,9 +2639,13 @@ func newTestEnv(t testing.TB, cont *containers.Container, reg *types.Registry) *
 
 func newTestRegistry(t testing.TB, opts ...types.RegistryOption) *types.Registry {
 	t.Helper()
-	reg, err := types.NewProtoRegistry(opts...)
+	var o []any
+	for _, opt := range opts {
+		o = append(o, opt)
+	}
+	reg, err := types.NewRegistry(o...)
 	if err != nil {
-		t.Fatalf("types.NewProtoRegistry() failed: %v", err)
+		t.Fatalf("types.NewRegistry() failed: %v", err)
 	}
 	return reg
 }
@@ -2502,4 +2726,238 @@ type testActivationWrapper struct {
 
 func (tw *testActivationWrapper) Unwrap() Activation {
 	return tw.Activation
+}
+
+func TestInterruptErrorIs(t *testing.T) {
+	ie := InterruptError{}
+	tests := []struct {
+		name   string
+		target error
+		want   bool
+	}{
+		{
+			name:   "same type",
+			target: InterruptError{},
+			want:   true,
+		},
+		{
+			name:   "different error",
+			target: fmt.Errorf("other error"),
+			want:   false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ie.Is(tc.target); got != tc.want {
+				t.Errorf("Is(%v) = %t, wanted %t", tc.target, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFolderActivation(t *testing.T) {
+	parentAct := EmptyActivation()
+	frame := mustNewExecutionFrame(t, parentAct)
+	defer frame.Close()
+	fld := newFolder(&evalFold{}, frame)
+	defer releaseFolder(fld)
+	if fld.Parent() != frame {
+		t.Errorf("fld.Parent() = %v, wanted %v", fld.Parent(), frame)
+	}
+	if fld.Unwrap() != frame {
+		t.Errorf("fld.Unwrap() = %v, wanted %v", fld.Unwrap(), frame)
+	}
+}
+
+func TestEvalWatchConstructor(t *testing.T) {
+	watchConst := &evalWatchConstructor{
+		constructor: &evalList{
+			id:    1,
+			elems: []InterpretableV2{NewConstValue(2, types.IntOne)},
+		},
+	}
+	if len(watchConst.InitVals()) != 1 {
+		t.Errorf("watchConst.InitVals() len = %d, wanted 1", len(watchConst.InitVals()))
+	}
+	if watchConst.Type() != types.ListType {
+		t.Errorf("watchConst.Type() = %v, wanted %v", watchConst.Type(), types.ListType)
+	}
+}
+
+func TestCustomDecorator(t *testing.T) {
+	decV1 := func(i Interpretable) (Interpretable, error) {
+		return i, nil
+	}
+	opt := CustomDecorator(decV1)
+	p := &planner{}
+	p2, err := opt(p)
+	if err != nil {
+		t.Fatalf("CustomDecorator failed: %v", err)
+	}
+	if len(p2.decorators) != 1 {
+		t.Fatalf("CustomDecorator did not add decorator")
+	}
+	res, err := p2.decorators[0](NewConstValue(1, types.IntOne))
+	if err != nil {
+		t.Fatalf("wrapped decorator failed: %v", err)
+	}
+	if res.ID() != 1 {
+		t.Errorf("wrapped decorator returned node with ID %d, wanted 1", res.ID())
+	}
+}
+
+func TestCostTrackerActualCost(t *testing.T) {
+	ct := &CostTracker{cost: 42}
+	if ct.ActualCost() != 42 {
+		t.Errorf("ct.ActualCost() = %d, wanted 42", ct.ActualCost())
+	}
+}
+
+func TestV2Adapter(t *testing.T) {
+	legacy := &testLegacyInterpretable{id: 42}
+	adapted := adaptToV2(legacy)
+	if adapted.ID() != 42 {
+		t.Errorf("adapted.ID() = %d, wanted 42", adapted.ID())
+	}
+	frame := mustNewExecutionFrame(t, EmptyActivation())
+	defer frame.Close()
+	val := adapted.Exec(frame)
+	if val.Equal(types.IntOne) != types.True {
+		t.Errorf("adapted.Exec() = %v, wanted 1", val)
+	}
+}
+
+func TestInterpretableArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		call InterpretableCall
+		want int
+	}{
+		{
+			name: "evalNe",
+			call: &evalNe{lhs: NewConstValue(1, types.IntOne), rhs: NewConstValue(2, types.IntOne)},
+			want: 2,
+		},
+		{
+			name: "evalZeroArity",
+			call: &evalZeroArity{},
+			want: 0,
+		},
+		{
+			name: "evalVarArgs",
+			call: &evalVarArgs{args: []InterpretableV2{NewConstValue(1, types.IntOne)}},
+			want: 1,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := len(tc.call.Args()); got != tc.want {
+				t.Errorf("Args() len = %d, wanted %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNewCall(t *testing.T) {
+	call := NewCall(10, "f", "f_overload", []InterpretableV2{NewConstValue(1, types.IntOne)}, func(args ...ref.Val) ref.Val { return types.True })
+	if call.ID() != 10 {
+		t.Errorf("NewCall.ID() = %d, wanted 10", call.ID())
+	}
+}
+
+func TestExhaustiveOperatorsLegacyEval(t *testing.T) {
+	reg, _ := types.NewRegistry()
+	fac := NewAttributeFactory(containers.DefaultContainer, reg, reg)
+
+	tests := []struct {
+		name string
+		expr Interpretable
+	}{
+		{
+			name: "exhaustive or",
+			expr: &evalExhaustiveOr{id: 1},
+		},
+		{
+			name: "exhaustive and",
+			expr: &evalExhaustiveAnd{id: 2},
+		},
+		{
+			name: "exhaustive conditional",
+			expr: &evalExhaustiveConditional{
+				id: 3,
+				attr: &conditionalAttribute{
+					expr:   NewConstValue(4, types.True),
+					truthy: fac.AbsoluteAttribute(5, "a"),
+					falsy:  fac.AbsoluteAttribute(6, "b"),
+				},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.expr.Eval(EmptyActivation())
+		})
+	}
+}
+
+func TestFindFrame(t *testing.T) {
+	frame := mustNewExecutionFrame(t, EmptyActivation())
+	defer frame.Close()
+
+	tests := []struct {
+		name string
+		act  Activation
+	}{
+		{
+			name: "nested wrapper",
+			act:  &testActivationWrapper{Activation: &testActivationWrapper{Activation: frame, name: "w1"}, name: "w2"},
+		},
+		{
+			name: "parent hierarchy",
+			act:  &parentActivationWrapper{parent: frame},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			found := findFrame(tc.act)
+			if found != frame {
+				t.Errorf("findFrame() = %v, wanted %v", found, frame)
+			}
+		})
+	}
+}
+
+func TestObservableInterpretable(t *testing.T) {
+	obsInt := &ObservableInterpretable{InterpretableV2: NewConstValue(12, types.True)}
+	if obsInt.ID() != 12 {
+		t.Errorf("obsInt.ID() = %d, wanted 12", obsInt.ID())
+	}
+	res := obsInt.Eval(EmptyActivation())
+	if res.Equal(types.True) != types.True {
+		t.Errorf("obsInt.Eval() = %v, wanted true", res)
+	}
+}
+
+type testLegacyInterpretable struct {
+	id int64
+}
+
+func (t *testLegacyInterpretable) ID() int64 {
+	return t.id
+}
+
+func (t *testLegacyInterpretable) Eval(vars Activation) ref.Val {
+	return types.IntOne
+}
+
+type parentActivationWrapper struct {
+	parent Activation
+}
+
+func (paw *parentActivationWrapper) ResolveName(name string) (any, bool) {
+	return paw.parent.ResolveName(name)
+}
+
+func (paw *parentActivationWrapper) Parent() Activation {
+	return paw.parent
 }

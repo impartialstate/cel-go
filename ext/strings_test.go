@@ -21,10 +21,10 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/google/cel-go/cel"
-	"github.com/google/cel-go/checker"
-	"github.com/google/cel-go/common/types"
-	"github.com/google/cel-go/common/types/ref"
+	"cel.dev/cel-go/cel"
+	"cel.dev/cel-go/checker"
+	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/common/types/ref"
 )
 
 // TODO: move these tests to a conformance test.
@@ -146,11 +146,23 @@ var stringTests = []struct {
 		err:  "index out of range: 30",
 	},
 	{expr: `'tacocat'.indexOf('a', 30) == -1`},
+	{expr: `'tacocat'.indexOf('', 7) == 7`},
+	{expr: `'tacocat'.indexOf('', 30) == 7`},
+	{
+		expr: `'tacocat'.indexOf('', -1) == 0`,
+		err:  "index out of range: -1",
+	},
 	{
 		expr: `'tacocat'.lastIndexOf('a', -1) == -1`,
 		err:  "index out of range: -1",
 	},
 	{expr: `'tacocat'.lastIndexOf('a', 30) == -1`},
+	{expr: `'tacocat'.lastIndexOf('', 7) == 7`},
+	{expr: `'tacocat'.lastIndexOf('', 30) == 7`},
+	{
+		expr: `'tacocat'.lastIndexOf('', -1) == 0`,
+		err:  "index out of range: -1",
+	},
 	{
 		expr: `"tacocat".substring(40) == "cat"`,
 		err:  "index out of range: 40",

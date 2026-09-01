@@ -18,9 +18,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/google/cel-go/common/containers"
-	"github.com/google/cel-go/common/types"
-	"github.com/google/cel-go/common/types/ref"
+	"cel.dev/cel-go/common/containers"
+	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/common/types/ref"
 )
 
 // AttributePattern represents a top-level variable with an optional set of qualifier patterns.
@@ -255,6 +255,9 @@ func (fac *partialAttributeFactory) matchesUnknownPatterns(
 	patterns := vars.UnknownAttributePatterns()
 	candidateIndices := map[int]struct{}{}
 	for _, variable := range variableNames {
+		if holder, ok := vars.(localVariableHolder); ok && holder.IsLocalVariable(variable) {
+			continue
+		}
 		for i, pat := range patterns {
 			if pat.VariableMatches(variable) {
 				if len(qualifiers) == 0 {

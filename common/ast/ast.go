@@ -18,9 +18,9 @@ package ast
 import (
 	"slices"
 
-	"github.com/google/cel-go/common"
-	"github.com/google/cel-go/common/types"
-	"github.com/google/cel-go/common/types/ref"
+	"cel.dev/cel-go/common"
+	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/common/types/ref"
 )
 
 // AST contains a protobuf expression and source info along with CEL-native type and reference information.
@@ -170,6 +170,14 @@ func (a *AST) IDs() map[int64]bool {
 		PostOrderVisit(call, visitor)
 	}
 	return visitor
+}
+
+// NodeCount returns the total number of expression nodes in the AST, including macro calls.
+func NodeCount(a *AST) int {
+	if a == nil {
+		return 0
+	}
+	return len(a.IDs())
 }
 
 // ClearUnusedIDs removes IDs not used in the AST or macro calls from SourceInfo.

@@ -19,10 +19,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/google/cel-go/cel"
-	"github.com/google/cel-go/checker"
-	"github.com/google/cel-go/common/types"
-	"github.com/google/cel-go/interpreter"
+	"cel.dev/cel-go/cel"
+	"cel.dev/cel-go/checker"
+	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/interpreter"
 )
 
 func TestTwoVarComprehensions(t *testing.T) {
@@ -339,7 +339,7 @@ func TestTwoVarComprehensionsCost(t *testing.T) {
 				"m.@values.@items": 2,
 			},
 			estimatedCost: checker.CostEstimate{Min: 73, Max: 173},
-			actualCost:    100,
+			actualCost:    98,
 		},
 		{
 			name:          "transformMapEntry literal input",

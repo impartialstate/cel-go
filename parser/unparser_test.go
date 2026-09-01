@@ -19,9 +19,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/google/cel-go/common"
-	"github.com/google/cel-go/common/ast"
-	"github.com/google/cel-go/common/operators"
+	"cel.dev/cel-go/common"
+	"cel.dev/cel-go/common/ast"
+	"cel.dev/cel-go/common/operators"
 
 	"google.golang.org/protobuf/proto"
 
@@ -123,6 +123,13 @@ func TestUnparse(t *testing.T) {
 		{name: "call_cond_equiv", in: `(a || b ? c : d).e`, out: `((a || b) ? c : d).e`},
 		{name: "lit_quote_bytes_equiv", in: `b'aaa"bbb'`, out: `b"\141\141\141\042\142\142\142"`},
 		{name: "select_equiv", in: `a . b . c`, out: `a.b.c`},
+		// Doubles whose 'g'-format produces scientific notation must
+		// roundtrip without an incorrect trailing ".0". See #1325.
+		{name: "lit_double_sci_small", in: `0.00001`, out: `1e-05`},
+		{name: "lit_double_sci_smaller", in: `0.000000001`, out: `1e-09`},
+		{name: "lit_double_sci_large", in: `1e30`, out: `1e+30`},
+		{name: "lit_double_sci_neg_exp", in: `5e-5`, out: `5e-05`},
+		{name: "lit_double_sci_upper_e", in: `1E7`, out: `1e+07`},
 
 		// These expressions require macro call tracking to be enabled.
 		{

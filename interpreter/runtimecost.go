@@ -16,13 +16,13 @@ package interpreter
 
 import (
 	"errors"
-	"math"
 
-	"github.com/google/cel-go/common"
-	"github.com/google/cel-go/common/overloads"
-	"github.com/google/cel-go/common/types"
-	"github.com/google/cel-go/common/types/ref"
-	"github.com/google/cel-go/common/types/traits"
+	"cel.dev/cel-go/common"
+	"cel.dev/cel-go/common/cost"
+	"cel.dev/cel-go/common/overloads"
+	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/common/types/ref"
+	"cel.dev/cel-go/common/types/traits"
 )
 
 // WARNING: Any changes to cost calculations in this file require a corresponding change in checker/cost.go
@@ -57,51 +57,8 @@ func CostObserver(opts ...costTrackPlanOption) PlannerOption {
 			return nil, errors.New("cost tracker factory not configured")
 		}
 		p.observers = append(p.observers, ct)
-		p.decorators = append(p.decorators, decObserveEval(ct.Observe))
 		return p, nil
 	}
-}
-
-// costTrackerConverter identifies an object which is convertible to a CostTracker instance.
-type costTrackerConverter interface {
-	asCostTracker() *CostTracker
-}
-
-// costTrackActivation hides state in the Activation in a manner not accessible to expressions.
-type costTrackActivation struct {
-	vars        Activation
-	costTracker *CostTracker
-}
-
-// ResolveName proxies variable lookups to the backing activation.
-func (cta costTrackActivation) ResolveName(name string) (any, bool) {
-	return cta.vars.ResolveName(name)
-}
-
-// Parent proxies parent lookups to the backing activation.
-func (cta costTrackActivation) Parent() Activation {
-	return cta.vars
-}
-
-// AsPartialActivation supports conversion to a partial activation in order to detect unknown attributes.
-func (cta costTrackActivation) AsPartialActivation() (PartialActivation, bool) {
-	return AsPartialActivation(cta.vars)
-}
-
-// asCostTracker implements the costTrackerConverter method.
-func (cta costTrackActivation) asCostTracker() *CostTracker {
-	return cta.costTracker
-}
-
-// asCostTracker walks the Activation hierarchy and returns the first cost tracker found, if present.
-func asCostTracker(vars Activation) (*CostTracker, bool) {
-	if conv, ok := vars.(costTrackerConverter); ok {
-		return conv.asCostTracker(), true
-	}
-	if vars.Parent() != nil {
-		return asCostTracker(vars.Parent())
-	}
-	return nil, false
 }
 
 // costTrackerFactory holds a factory for producing new CostTracker instances on each Eval call.
@@ -111,27 +68,40 @@ type costTrackerFactory struct {
 
 // InitState produces a CostTracker and bundles it into an Activation in a way which is not visible
 // to expression evaluation.
-func (ct *costTrackerFactory) InitState(vars Activation) (Activation, error) {
+func (ct *costTrackerFactory) InitState(frame *ExecutionFrame) (any, error) {
+	if frame.ctx != nil && frame.ctx.costs != nil {
+		return frame.ctx.costs, nil
+	}
 	tracker, err := ct.factory()
 	if err != nil {
 		return nil, err
 	}
-	return costTrackActivation{vars: vars, costTracker: tracker}, nil
+	if frame.ctx == nil {
+		frame.ctx = evalContextPool.Get().(*evalContext)
+	}
+	frame.ctx.costs = tracker
+	return tracker, nil
 }
 
 // GetState extracts the CostTracker from the Activation.
-func (ct *costTrackerFactory) GetState(vars Activation) any {
-	if tracker, found := asCostTracker(vars); found {
-		return tracker
+func (ct *costTrackerFactory) GetState(frame *ExecutionFrame) any {
+	if frame == nil || frame.ctx == nil {
+		return nil
 	}
-	return nil
+	return frame.ctx.costs
 }
 
 // Observe computes the incremental cost of each step and records it into the CostTracker associated
 // with the evaluation.
 func (ct *costTrackerFactory) Observe(vars Activation, id int64, programStep any, val ref.Val) {
-	tracker, found := asCostTracker(vars)
-	if !found {
+	frame := AsFrame(vars)
+	state := ct.GetState(frame)
+	if state == nil {
+		return
+	}
+	tracker, ok := state.(*CostTracker)
+	if !ok {
+		// The state is configured with CostTrackFactory so this shouldn't happen.
 		return
 	}
 	switch t := programStep.(type) {
@@ -265,39 +235,54 @@ type CostTracker struct {
 	stack refValStack
 }
 
+// Clone makes a shallow copy of the tracker.
+// The different clones can be used independently from
+// each other.
+func (c *CostTracker) Clone() (*CostTracker, error) {
+	tracker := &CostTracker{
+		Estimator:           c.Estimator,
+		overloadTrackers:    c.overloadTrackers,
+		Limit:               c.Limit,
+		presenceTestHasCost: c.presenceTestHasCost,
+	}
+	return tracker, nil
+}
+
 // ActualCost returns the runtime cost
 func (c *CostTracker) ActualCost() uint64 {
 	return c.cost
 }
 
 func (c *CostTracker) costCall(call InterpretableCall, args []ref.Val, result ref.Val) uint64 {
-	var cost uint64
+	var total uint64
 	if len(c.overloadTrackers) != 0 {
 		if tracker, found := c.overloadTrackers[call.OverloadID()]; found {
 			callCost := tracker(args, result)
 			if callCost != nil {
-				cost += *callCost
-				return cost
+				total = cost.SafeAdd(total, *callCost)
+				return total
 			}
 		}
 	}
 	if c.Estimator != nil {
 		callCost := c.Estimator.CallCost(call.Function(), call.OverloadID(), args, result)
 		if callCost != nil {
-			cost += *callCost
-			return cost
+			total = cost.SafeAdd(total, *callCost)
+			return total
 		}
 	}
 	// if user didn't specify, the default way of calculating runtime cost would be used.
 	// if user has their own implementation of ActualCostEstimator, make sure to cover the mapping between overloadId and cost calculation
 	switch call.OverloadID() {
 	// O(n) functions
-	case overloads.StartsWithString, overloads.EndsWithString, overloads.StringToBytes, overloads.BytesToString, overloads.ExtQuoteString, overloads.ExtFormatString:
-		cost += uint64(math.Ceil(float64(actualSize(args[0])) * common.StringTraversalCostFactor))
+	case overloads.StartsWithString, overloads.EndsWithString:
+		total = cost.SafeAdd(total, cost.SafeMultiplyByFactor(actualSize(args[1]), common.StringTraversalCostFactor))
+	case overloads.StringToBytes, overloads.BytesToString, overloads.ExtQuoteString, overloads.ExtFormatString:
+		total = cost.SafeAdd(total, cost.SafeMultiplyByFactor(actualSize(args[0]), common.StringTraversalCostFactor))
 	case overloads.InList:
 		// If a list is composed entirely of constant values this is O(1), but we don't account for that here.
 		// We just assume all list containment checks are O(n).
-		cost += actualSize(args[1])
+		total = cost.SafeAdd(total, actualSize(args[1]))
 	// O(min(m, n)) functions
 	case overloads.LessString, overloads.GreaterString, overloads.LessEqualsString, overloads.GreaterEqualsString,
 		overloads.LessBytes, overloads.GreaterBytes, overloads.LessEqualsBytes, overloads.GreaterEqualsBytes,
@@ -307,32 +292,30 @@ func (c *CostTracker) costCall(call InterpretableCall, args []ref.Val, result re
 		// of 1.
 		lhsSize := actualSize(args[0])
 		rhsSize := actualSize(args[1])
-		minSize := lhsSize
-		if rhsSize < minSize {
-			minSize = rhsSize
-		}
-		cost += uint64(math.Ceil(float64(minSize) * common.StringTraversalCostFactor))
+		minSize := min(rhsSize, lhsSize)
+		total = cost.SafeAdd(total, cost.SafeMultiplyByFactor(minSize, common.StringTraversalCostFactor))
 	// O(m+n) functions
 	case overloads.AddString, overloads.AddBytes:
 		// In the worst case scenario, we would need to reallocate a new backing store and copy both operands over.
-		cost += uint64(math.Ceil(float64(actualSize(args[0])+actualSize(args[1])) * common.StringTraversalCostFactor))
+		argSize := cost.SafeAdd(actualSize(args[0]), actualSize(args[1]))
+		total = cost.SafeAdd(total, cost.SafeMultiplyByFactor(argSize, common.StringTraversalCostFactor))
 	// O(nm) functions
-	case overloads.MatchesString:
+	case overloads.Matches, overloads.MatchesString:
 		// https://swtch.com/~rsc/regexp/regexp1.html applies to RE2 implementation supported by CEL
 		// Add one to string length for purposes of cost calculation to prevent product of string and regex to be 0
 		// in case where string is empty but regex is still expensive.
-		strCost := uint64(math.Ceil((1.0 + float64(actualSize(args[0]))) * common.StringTraversalCostFactor))
+		strCost := cost.SafeMultiplyByFactor(cost.SafeAdd(1, actualSize(args[0])), common.StringTraversalCostFactor)
 		// We don't know how many expressions are in the regex, just the string length (a huge
 		// improvement here would be to somehow get a count the number of expressions in the regex or
 		// how many states are in the regex state machine and use that to measure regex cost).
 		// For now, we're making a guess that each expression in a regex is typically at least 4 chars
 		// in length.
-		regexCost := uint64(math.Ceil(float64(actualSize(args[1])) * common.RegexStringLengthCostFactor))
-		cost += strCost * regexCost
+		regexCost := cost.SafeMultiplyByFactor(actualSize(args[1]), common.RegexStringLengthCostFactor)
+		total = cost.SafeAdd(total, cost.SafeMultiply(strCost, regexCost))
 	case overloads.ContainsString:
-		strCost := uint64(math.Ceil(float64(actualSize(args[0])) * common.StringTraversalCostFactor))
-		substrCost := uint64(math.Ceil(float64(actualSize(args[1])) * common.StringTraversalCostFactor))
-		cost += strCost * substrCost
+		strCost := cost.SafeMultiplyByFactor(actualSize(args[0]), common.StringTraversalCostFactor)
+		substrCost := cost.SafeMultiplyByFactor(actualSize(args[1]), common.StringTraversalCostFactor)
+		total = cost.SafeAdd(total, cost.SafeMultiply(strCost, substrCost))
 
 	default:
 		// The following operations are assumed to have O(1) complexity.
@@ -342,10 +325,10 @@ func (c *CostTracker) costCall(call InterpretableCall, args []ref.Val, result re
 		// - Computing the size of strings, byte sequences, lists and maps.
 		// - Logical operations and all operators on fixed width scalars (comparisons, equality)
 		// - Any functions that don't have a declared cost either here or in provided ActualCostEstimator.
-		cost++
+		total = cost.SafeAdd(total, 1)
 
 	}
-	return cost
+	return total
 }
 
 // actualSize returns the size of the value for all traits.Sizer values, a fixed size for all proto-based
@@ -397,7 +380,7 @@ func (s *refValStack) drop(ids ...int64) {
 // the stack.
 // WARNING: It is possible for multiple expressions with the same ID to exist (due to how macros are implemented) so it's
 // possible that a dropped ID will remain on the stack.  They should be removed when IDs on the stack are popped.
-func (s *refValStack) dropArgs(args []Interpretable) ([]ref.Val, bool) {
+func (s *refValStack) dropArgs(args []InterpretableV2) ([]ref.Val, bool) {
 	result := make([]ref.Val, len(args))
 argloop:
 	for nIdx := len(args) - 1; nIdx >= 0; nIdx-- {

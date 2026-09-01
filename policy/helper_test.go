@@ -19,15 +19,14 @@ import (
 	"os"
 	"testing"
 
-	"github.com/google/cel-go/cel"
-	"github.com/google/cel-go/common/env"
-	"github.com/google/cel-go/common/types"
-	"github.com/google/cel-go/common/types/ref"
-	"github.com/google/cel-go/test"
+	"cel.dev/cel-go/cel"
+	"cel.dev/cel-go/common/env"
+	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/common/types/ref"
+	"cel.dev/cel-go/common/types/traits"
+	"cel.dev/cel-go/test"
 
 	"go.yaml.in/yaml/v3"
-
-	proto3pb "github.com/google/cel-go/test/proto3pb"
 )
 
 var (
@@ -52,68 +51,6 @@ var (
 	    : optional.none())`,
 		},
 		{
-			name: "nested_rule",
-			expr: `
-	cel.@block([
-	  ["us", "uk", "es"],
-	  {"us": false, "ru": false, "ir": false}],
-	  ((resource.origin in @index1 && !(resource.origin in @index0))
-	    ? optional.of({"banned": true}) : optional.none()).orValue(
-	     (resource.origin in @index0) ? {"banned": false} : {"banned": true}))`,
-		},
-		{
-			name: "nested_rule2",
-			expr: `
-	cel.@block([
-	  ["us", "uk", "es"],
-	  {"us": false, "ru": false, "ir": false}],
-	  resource.?user.orValue("").startsWith("bad")
-	  ? ((resource.origin in @index1 && !(resource.origin in @index0))
-	    ? {"banned": "restricted_region"}
-	    : {"banned": "bad_actor"})
-	  : (!(resource.origin in @index0)
-	    ? {"banned": "unconfigured_region"} : {}))`,
-		},
-		{
-			name: "nested_rule3",
-			expr: `
-	cel.@block([
-	  ["us", "uk", "es"],
-	  {"us": false, "ru": false, "ir": false}],
-	  resource.?user.orValue("").startsWith("bad")
-	  ? optional.of((resource.origin in @index1 && !(resource.origin in @index0))
-	    ? {"banned": "restricted_region"} : {"banned": "bad_actor"})
-		: (!(resource.origin in @index0)
-		  ? optional.of({"banned": "unconfigured_region"}) : optional.none()))`,
-		},
-		{
-			name: "nested_rule4",
-			expr: `(x > 0) ? true : false`,
-		},
-		{
-			name: "nested_rule5",
-			expr: `
-	(x > 0)
-	  ? ((x > 2) ? optional.of(true) : optional.none())
-	  : ((x > 1)
-	    ? ((x >= 2) ? optional.of(true) : optional.none())
-		: optional.of(false))`,
-		},
-		{
-			name: "nested_rule6",
-			expr: `
-	((x > 2) ? optional.of(true) : optional.none())
-	  .orValue(((x > 3) ? optional.of(true) : optional.none())
-	  .orValue(false))`,
-		},
-		{
-			name: "nested_rule7",
-			expr: `
-	((x > 2) ? optional.of(true) : optional.none())
-	.or(((x > 3) ? optional.of(true) : optional.none())
-	.or((x > 1) ? optional.of(false) : optional.none()))`,
-		},
-		{
 			name: "unnest",
 			expr: `
 	cel.@block([values.filter(x, x > 2)],
@@ -125,45 +62,6 @@ var (
 	     ? optional.of("at least one power of 6")
 		 : optional.none())))
 			`,
-		},
-		{
-			name: "context_pb",
-			expr: `
-	(single_int32 > google.expr.proto3.test.TestAllTypes{single_int64: 10}.single_int64)
-	? optional.of("invalid spec, got single_int32=%d, wanted <= 10".format([single_int32]))
-	: ((standalone_enum == google.expr.proto3.test.TestAllTypes.NestedEnum.BAR ||
-      google.expr.proto3.test.ImportedGlobalEnum.IMPORT_BAR in imported_enums)
-	  ? optional.of("invalid spec, neither nested nor imported enums may refer to BAR or IMPORT_BAR")
-	  : optional.none())`,
-			envOpts: []cel.EnvOption{
-				cel.Types(&proto3pb.TestAllTypes{}),
-			},
-		},
-		{
-			name: "pb",
-			expr: `
-	(spec.single_int32 > google.expr.proto3.test.TestAllTypes{single_int64: 10}.single_int64)
-	? optional.of("invalid spec, got single_int32=%d, wanted <= 10".format([spec.single_int32]))
-	: ((spec.standalone_enum == google.expr.proto3.test.TestAllTypes.NestedEnum.BAR ||
-      google.expr.proto3.test.ImportedGlobalEnum.IMPORT_BAR in spec.imported_enums)
-	  ? optional.of("invalid spec, neither nested nor imported enums may refer to BAR or IMPORT_BAR")
-	  : optional.none())`,
-			envOpts: []cel.EnvOption{
-				cel.Types(&proto3pb.TestAllTypes{}),
-			},
-		},
-		{
-			name: "required_labels",
-			expr: `
-	cel.@block([
-	  spec.labels,
-	  @index0.filter(l, !(l in resource.labels)),
-	  resource.labels.transformList(l, value, l in @index0 && value != @index0[l], l)],
-      (@index1.size() > 0)
-	   ? optional.of("missing one or more required labels: %s".format([@index1]))
-	   : ((@index2.size() > 0)
-	     ? optional.of("invalid values provided on one or more labels: %s".format([@index2]))
-		 : optional.none()))`,
 		},
 		{
 			name: "restricted_destinations",
@@ -210,6 +108,49 @@ var (
 			: optional.none())))
 	  : optional.of(@index3.format([@index0, @index2])))`,
 		},
+		{
+			name: "nested_rules_unconditional_chaining",
+			expr: `
+	cel.@block([3],
+	((x > @index0) ? optional.of("a") : ((x == @index0) ? optional.of("b") : optional.none()))
+	  .orValue("c"))`,
+		},
+		{
+			name: "nested_rules_unconditional_chaining_optional",
+			expr: `
+	cel.@block([3],
+	((x > @index0) ? optional.of("a") : ((x == @index0) ? optional.of("b") : optional.none()))
+	  .or((x == 1) ? optional.of("c") : optional.none()))`,
+		},
+		{
+			name: "nested_rules_unwrap_rewrap",
+			expr: `
+	(x == 1)
+	  ? optional.of(((y == 1) ? optional.of("a") : optional.none()).orValue("b"))
+	  : optional.none()`,
+		},
+		{
+			name: "agent_tool_execution_governance",
+			expr: `(request.is_emergency ? ["REQUIRE_VP_APPROVAL"] : ((tool.is_mutation && request.env == "prod") ? ["REQUIRE_TECH_LEAD_2FA"] : (tool.is_mutation ? ["REQUIRE_PEER_CONFIRMATION"] : []))) + ((hasCreditCard(tool.call.args) ? ["REDACT_PCI"] : (hasEmailOrPhone(tool.call.args) ? ["REDACT_PII"] : [])) + ((tool.call.args.batch_size > 10000) ? ["THROTTLE_TIER_3"] : ((tool.call.args.batch_size > 1000) ? ["THROTTLE_TIER_2"] : ((tool.call.args.batch_size > 100) ? ["THROTTLE_TIER_1"] : []))))`,
+			envOpts: []cel.EnvOption{
+				cel.Function("hasCreditCard",
+					cel.Overload("hasCreditCard", []*cel.Type{cel.DynType}, cel.BoolType,
+						cel.UnaryBinding(func(args ref.Val) ref.Val {
+							if m, ok := args.(traits.Mapper); ok {
+								return types.Bool(m.Contains(types.String("cc")) == types.True)
+							}
+							return types.False
+						}))),
+				cel.Function("hasEmailOrPhone",
+					cel.Overload("hasEmailOrPhone", []*cel.Type{cel.DynType}, cel.BoolType,
+						cel.UnaryBinding(func(args ref.Val) ref.Val {
+							if m, ok := args.(traits.Mapper); ok {
+								return types.Bool(m.Contains(types.String("email")) == types.True || m.Contains(types.String("phone")) == types.True)
+							}
+							return types.False
+						}))),
+			},
+		},
 	}
 
 	composerUnnestTests = []struct {
@@ -217,6 +158,7 @@ var (
 		expr         string
 		composed     string
 		composerOpts []ComposerOption
+		envOpts      []cel.EnvOption
 		outputType   *cel.Type
 	}{
 		{
@@ -237,70 +179,7 @@ var (
 			`,
 			outputType: cel.OptionalType(cel.StringType),
 		},
-		{
-			name:         "required_labels",
-			composerOpts: []ComposerOption{ExpressionUnnestHeight(2)},
-			composed: `
-		cel.@block([
-			spec.labels,
-			@index0.filter(l, !(l in resource.labels)),
-			resource.labels.transformList(l, value, l in @index0 && value != @index0[l], l),
-			@index1.size() > 0,
-			"missing one or more required labels: %s".format([@index1]),
-			@index2.size() > 0,
-			"invalid values provided on one or more labels: %s".format([@index2])],
-			@index3 ? optional.of(@index4) : (@index5 ? optional.of(@index6) : optional.none()))
-			`,
-			outputType: cel.OptionalType(cel.StringType),
-		},
-		{
-			name:         "required_labels",
-			composerOpts: []ComposerOption{ExpressionUnnestHeight(4)},
-			composed: `
-		cel.@block([
-			spec.labels,
-			@index0.filter(l, !(l in resource.labels)),
-			resource.labels.transformList(l, value, l in @index0 && value != @index0[l], l),
-			(@index2.size() > 0)
-			  ? optional.of("invalid values provided on one or more labels: %s".format([@index2]))
-			  : optional.none()
-		],
-		(@index1.size() > 0)
-		  ? optional.of("missing one or more required labels: %s".format([@index1]))
-		  : @index3)`,
-			outputType: cel.OptionalType(cel.StringType),
-		},
-		{
-			name:         "nested_rule2",
-			composerOpts: []ComposerOption{ExpressionUnnestHeight(4)},
-			composed: `
-	cel.@block([
-	  ["us", "uk", "es"],
-	  {"us": false, "ru": false, "ir": false},
-	  resource.origin in @index1 && !(resource.origin in @index0),
-	  !(resource.origin in @index0) ? {"banned": "unconfigured_region"} : {}],
-	  resource.?user.orValue("").startsWith("bad")
-	    ? (@index2 ? {"banned": "restricted_region"} : {"banned": "bad_actor"})
-		: @index3)`,
-			outputType: cel.MapType(cel.StringType, cel.StringType),
-		},
-		{
-			name:         "nested_rule2",
-			composerOpts: []ComposerOption{ExpressionUnnestHeight(5)},
-			composed: `
-	cel.@block([
-	  ["us", "uk", "es"],
-	  {"us": false, "ru": false, "ir": false},
-	  (resource.origin in @index1 && !(resource.origin in @index0))
-	    ? {"banned": "restricted_region"}
-	    : {"banned": "bad_actor"}],
-	  resource.?user.orValue("").startsWith("bad")
-	    ? @index2
-	    : (!(resource.origin in @index0)
-	      ? {"banned": "unconfigured_region"}
-		  : {}))`,
-			outputType: cel.MapType(cel.StringType, cel.StringType),
-		},
+
 		{
 			name:         "limits",
 			composerOpts: []ComposerOption{ExpressionUnnestHeight(3)},
@@ -352,6 +231,30 @@ var (
 		((now.getHours() < 24) ? optional.of(@index4 + "!!!") : optional.none()))],
 		(now.getHours() >= 20) ? @index5 : optional.of(@index3.format([@index0, @index2])))`,
 			outputType: cel.OptionalType(cel.StringType),
+		},
+		{
+			name:         "agent_tool_execution_governance",
+			composerOpts: []ComposerOption{ExpressionUnnestHeight(2)},
+			envOpts: []cel.EnvOption{
+				cel.Function("hasCreditCard",
+					cel.Overload("hasCreditCard", []*cel.Type{cel.DynType}, cel.BoolType,
+						cel.UnaryBinding(func(args ref.Val) ref.Val {
+							if m, ok := args.(traits.Mapper); ok {
+								return types.Bool(m.Contains(types.String("cc")) == types.True)
+							}
+							return types.False
+						}))),
+				cel.Function("hasEmailOrPhone",
+					cel.Overload("hasEmailOrPhone", []*cel.Type{cel.DynType}, cel.BoolType,
+						cel.UnaryBinding(func(args ref.Val) ref.Val {
+							if m, ok := args.(traits.Mapper); ok {
+								return types.Bool(m.Contains(types.String("email")) == types.True || m.Contains(types.String("phone")) == types.True)
+							}
+							return types.False
+						}))),
+			},
+			composed: `cel.@block([tool.is_mutation && request.env == "prod", tool.is_mutation ? ["REQUIRE_PEER_CONFIRMATION"] : [], hasEmailOrPhone(tool.call.args) ? ["REDACT_PII"] : [], tool.call.args.batch_size > 10000, tool.call.args.batch_size > 1000, tool.call.args.batch_size > 100, request.is_emergency ? ["REQUIRE_VP_APPROVAL"] : (@index0 ? ["REQUIRE_TECH_LEAD_2FA"] : @index1)], @index6 + ((hasCreditCard(tool.call.args) ? ["REDACT_PCI"] : @index2) + (@index3 ? ["THROTTLE_TIER_3"] : (@index4 ? ["THROTTLE_TIER_2"] : (@index5 ? ["THROTTLE_TIER_1"] : [])))))`,
+			outputType: cel.ListType(cel.StringType),
 		},
 	}
 
@@ -414,6 +317,9 @@ ERROR: testdata/errors/policy.yaml:45:16: incompatible output types: block has o
  | ........^
 ERROR: testdata/errors_unreachable/policy.yaml:36:13: match creates unreachable outputs
  |           - output: |
+ | ............^
+ERROR: testdata/errors_unreachable/policy.yaml:38:13: Condition is always false
+ |           - condition: "false"
  | ............^`,
 		},
 		{
@@ -421,6 +327,30 @@ ERROR: testdata/errors_unreachable/policy.yaml:36:13: match creates unreachable 
 			err: `ERROR: testdata/nested_incompatible_outputs/policy.yaml:22:9: incompatible output types: block has output type string, but previous outputs have type bool
  |         match:
  | ........^`,
+		},
+		{
+			name: "aggregate_errors",
+			err: `ERROR: testdata/aggregate_errors/policy.yaml:21:13: match creates unreachable outputs
+ |           - condition: "true"
+ | ............^
+ERROR: testdata/aggregate_errors/policy.yaml:24:22: incompatible output types: block has output type int, but previous outputs have type optional_type(string)
+ |             output: "403"
+ | .....................^`,
+		},
+		{
+			name: "aggregate_list_errors",
+			err: `ERROR: testdata/aggregate_list_errors/policy.yaml:21:13: match creates unreachable outputs
+ |           - condition: "true"
+ | ............^
+ERROR: testdata/aggregate_list_errors/policy.yaml:24:22: incompatible output types: block has output type int, but previous outputs have type list(string)
+ |             output: "403"
+ | .....................^`,
+		},
+		{
+			name: "aggregate_nested_mixed_semantics",
+			err: `ERROR: testdata/aggregate_nested_mixed_semantics/policy.yaml:23:15: nested aggregate rules are not allowed
+ |               aggregate:
+ | ..............^`,
 		},
 	}
 )

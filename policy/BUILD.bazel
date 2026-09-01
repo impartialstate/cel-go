@@ -18,8 +18,9 @@ load("//test:cel_go_test.bzl", "cel_go_test")
 
 package(
     default_visibility = [
+        "//conformance:__subpackages__",
         "//policy:__subpackages__",
-        "//tools:__subpackages__"
+        "//tools:__subpackages__",
     ],
     licenses = ["notice"],
 )
@@ -36,7 +37,7 @@ go_library(
         "test_tag_handler_k8s.go",
         "yaml.go",
     ],
-    importpath = "github.com/google/cel-go/policy",
+    importpath = "cel.dev/cel-go/policy",
     deps = [
         "//cel:go_default_library",
         "//common:go_default_library",
@@ -71,8 +72,9 @@ go_test(
         "//test:go_default_library",
         "//common/debug:go_default_library",
         "//common/types:go_default_library",
-        "//interpreter:go_default_library",
         "//common/types/ref:go_default_library",
+        "//common/types/traits:go_default_library",
+        "//interpreter:go_default_library",
         "//test/proto3pb:go_default_library",
         "@in_yaml_go_yaml_v3//:go_default_library",
         "@com_github_google_go_cmp//cmp:go_default_library",
@@ -94,130 +96,46 @@ proto_descriptor_set(
 )
 
 cel_go_test(
-    name = "context_pb_policy",
-    cel_expr = "testdata/context_pb/policy.yaml",
-    config = "testdata/context_pb/config.yaml",
+    name = "nested_rules_variable_shadowing_policy",
+    cel_expr = "testdata/nested_rules_variable_shadowing/policy.yaml",
+    config = "testdata/nested_rules_variable_shadowing/config.yaml",
     enable_coverage = True,
-    file_descriptor_set = ":test_all_types_fds",
     test_src = "//policy/test:cel_test_runner.go",
-    test_suite = "testdata/context_pb/tests.yaml",
+    test_suite = "testdata/nested_rules_variable_shadowing/tests.yaml",
 )
 
 cel_go_test(
-    name = "k8s_policy",
-    cel_expr = "testdata/k8s/policy.yaml",
-    config = "testdata/k8s/config.yaml",
-    deps = ["//policy:go_default_library"],
+    name = "nested_rules_unconditional_chaining_policy",
+    cel_expr = "testdata/nested_rules_unconditional_chaining/policy.yaml",
+    config = "testdata/nested_rules_unconditional_chaining/config.yaml",
     enable_coverage = True,
-    test_src = "//policy/test:k8s_cel_test_runner.go",
-    test_suite = "testdata/k8s/tests.yaml",
+    test_src = "//policy/test:cel_test_runner.go",
+    test_suite = "testdata/nested_rules_unconditional_chaining/tests.yaml",
 )
 
 cel_go_test(
-    name = "limits_policy",
-    cel_expr = "testdata/limits/policy.yaml",
-    config = "testdata/limits/config.yaml",
+    name = "nested_rules_unconditional_chaining_optional_policy",
+    cel_expr = "testdata/nested_rules_unconditional_chaining_optional/policy.yaml",
+    config = "testdata/nested_rules_unconditional_chaining_optional/config.yaml",
     enable_coverage = True,
     test_src = "//policy/test:cel_test_runner.go",
-    test_suite = "testdata/limits/tests.yaml",
+    test_suite = "testdata/nested_rules_unconditional_chaining_optional/tests.yaml",
 )
 
 cel_go_test(
-    name = "nested_rule_policy",
-    cel_expr = "testdata/nested_rule/policy.yaml",
-    config = "testdata/nested_rule/config.yaml",
+    name = "nested_rules_unwrap_rewrap_policy",
+    cel_expr = "testdata/nested_rules_unwrap_rewrap/policy.yaml",
+    config = "testdata/nested_rules_unwrap_rewrap/config.yaml",
     enable_coverage = True,
     test_src = "//policy/test:cel_test_runner.go",
-    test_suite = "testdata/nested_rule/tests.yaml",
+    test_suite = "testdata/nested_rules_unwrap_rewrap/tests.yaml",
 )
 
 cel_go_test(
-    name = "nested_rule2_policy",
-    cel_expr = "testdata/nested_rule2/policy.yaml",
-    config = "testdata/nested_rule2/config.yaml",
+    name = "variable_type_propagation_policy",
+    cel_expr = "testdata/variable_type_propagation/policy.yaml",
+    config = "testdata/variable_type_propagation/config.yaml",
     enable_coverage = True,
     test_src = "//policy/test:cel_test_runner.go",
-    test_suite = "testdata/nested_rule2/tests.yaml",
-)
-
-cel_go_test(
-    name = "nested_rule3_policy",
-    cel_expr = "testdata/nested_rule3/policy.yaml",
-    config = "testdata/nested_rule3/config.yaml",
-    enable_coverage = True,
-    test_src = "//policy/test:cel_test_runner.go",
-    test_suite = "testdata/nested_rule3/tests.yaml",
-)
-
-cel_go_test(
-    name = "nested_rule4_policy",
-    cel_expr = "testdata/nested_rule4/policy.yaml",
-    config = "testdata/nested_rule4/config.yaml",
-    enable_coverage = True,
-    test_src = "//policy/test:cel_test_runner.go",
-    test_suite = "testdata/nested_rule4/tests.yaml",
-)
-
-cel_go_test(
-    name = "nested_rule5_policy",
-    cel_expr = "testdata/nested_rule5/policy.yaml",
-    config = "testdata/nested_rule5/config.yaml",
-    enable_coverage = True,
-    test_src = "//policy/test:cel_test_runner.go",
-    test_suite = "testdata/nested_rule5/tests.yaml",
-)
-
-cel_go_test(
-    name = "nested_rule6_policy",
-    cel_expr = "testdata/nested_rule6/policy.yaml",
-    config = "testdata/nested_rule6/config.yaml",
-    enable_coverage = True,
-    test_src = "//policy/test:cel_test_runner.go",
-    test_suite = "testdata/nested_rule6/tests.yaml",
-)
-
-cel_go_test(
-    name = "nested_rule7_policy",
-    cel_expr = "testdata/nested_rule7/policy.yaml",
-    config = "testdata/nested_rule7/config.yaml",
-    enable_coverage = True,
-    test_src = "//policy/test:cel_test_runner.go",
-    test_suite = "testdata/nested_rule7/tests.yaml",
-)
-
-cel_go_test(
-    name = "pb_policy",
-    cel_expr = "testdata/pb/policy.yaml",
-    config = "testdata/pb/config.yaml",
-    file_descriptor_set = ":test_all_types_fds",
-    enable_coverage = True,
-    test_src = "//policy/test:cel_test_runner.go",
-    test_suite = "testdata/pb/tests.yaml",
-)
-
-cel_go_test(
-    name = "required_labels_policy",
-    cel_expr = "testdata/required_labels/policy.yaml",
-    config = "testdata/required_labels/config.yaml",
-    enable_coverage = True,
-    test_src = "//policy/test:cel_test_runner.go",
-    test_suite = "testdata/required_labels/tests.yaml",
-)
-
-cel_go_test(
-    name = "restricted_destinations_policy",
-    cel_expr = "testdata/restricted_destinations/policy.yaml",
-    config = "testdata/restricted_destinations/config.yaml",
-    enable_coverage = True,
-    test_src = "//policy/test:cel_test_runner.go",
-    test_suite = "testdata/restricted_destinations/tests.yaml",
-)
-
-cel_go_test(
-    name = "unnest_policy",
-    cel_expr = "testdata/unnest/policy.yaml",
-    config = "testdata/unnest/config.yaml",
-    enable_coverage = True,
-    test_src = "//policy/test:cel_test_runner.go",
-    test_suite = "testdata/unnest/tests.yaml",
+    test_suite = "testdata/variable_type_propagation/tests.yaml",
 )

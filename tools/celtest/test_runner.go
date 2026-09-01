@@ -25,14 +25,16 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/google/cel-go/cel"
-	"github.com/google/cel-go/common/ast"
-	"github.com/google/cel-go/common/operators"
-	"github.com/google/cel-go/common/types"
-	"github.com/google/cel-go/common/types/ref"
-	"github.com/google/cel-go/interpreter"
-	"github.com/google/cel-go/test"
-	"github.com/google/cel-go/tools/compiler"
+	"cel.dev/cel-go/cel"
+	"cel.dev/cel-go/common/ast"
+	"cel.dev/cel-go/common/debug"
+	"cel.dev/cel-go/common/env"
+	"cel.dev/cel-go/common/operators"
+	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/common/types/ref"
+	"cel.dev/cel-go/interpreter"
+	"cel.dev/cel-go/test"
+	"cel.dev/cel-go/tools/compiler"
 	"github.com/google/go-cmp/cmp"
 
 	"google.golang.org/protobuf/encoding/prototext"
@@ -57,6 +59,7 @@ var (
 	configPath            string
 	baseConfigPath        string
 	enableCoverage        bool
+	enableDebug           bool
 )
 
 func init() {
@@ -66,6 +69,7 @@ func init() {
 	flag.StringVar(&baseConfigPath, "base_config_path", "", "path to a base config file")
 	flag.StringVar(&celExpression, "cel_expr", "", "CEL expression to test")
 	flag.BoolVar(&enableCoverage, "enable_coverage", false, "Enable coverage calculation and reporting.")
+	flag.BoolVar(&enableDebug, "celtest_debug", false, "Enables verbose logging of test case execution.")
 }
 
 func updateRunfilesPathForFlags(testResourcesDir string) error {
@@ -315,6 +319,32 @@ func TestSuiteParserOption(p TestSuiteParser) TestRunnerOption {
 	}
 }
 
+type typeAdorner struct {
+	ast *cel.Ast
+}
+
+// Implements type.Adorner
+func (a *typeAdorner) GetMetadata(ctx any) string {
+	e, ok := ctx.(ast.Expr)
+	if !ok {
+		return ""
+	}
+	t := a.ast.NativeRep().GetType(e.ID())
+	if t != nil {
+		return " : " + env.SerializeTypeDesc(t).SpecifierFormat()
+	}
+	return " : <no type inferred>"
+}
+
+// DebugAST returns a string representation of the AST adorned with type information.
+func DebugAST(ast *cel.Ast) string {
+	if ast == nil {
+		return "<nil>"
+	}
+	adorner := &typeAdorner{ast: ast}
+	return debug.ToAdornedDebugString(ast.NativeRep().Expr(), adorner)
+}
+
 // TestRunner provides a structure to hold the different components required to execute tests for
 // a list of Input Expressions. The TestRunner can be configured with the following options:
 // - Compiler: The compiler used for parsing and compiling the input expressions.
@@ -359,6 +389,16 @@ func NewTest(name string, input cel.PartialActivation, resultMatcher func(ref.Va
 		input:         input,
 		resultMatcher: resultMatcher,
 	}
+}
+
+// Name returns the name of the test case.
+func (t *Test) Name() string {
+	return t.name
+}
+
+// ResultMatcher returns the result matcher function of the test case.
+func (t *Test) ResultMatcher() func(ref.Val, error) TestResult {
+	return t.resultMatcher
 }
 
 // TestResult represents the result of a test case execution. It contains the validation result
@@ -550,6 +590,9 @@ func (tr *TestRunner) Programs(t *testing.T, opts ...cel.ProgramOption) ([]Progr
 			}
 			return nil, err
 		}
+		if enableDebug {
+			t.Logf("Loaded AST:\n%s", DebugAST(ast))
+		}
 		prg, err := e.Program(ast, opts...)
 		if err != nil {
 			return nil, err
@@ -691,6 +734,9 @@ func (tr *TestRunner) createResultMatcherFromPB(t *testing.T, testCase *conforma
 			if err != nil {
 				return TestResult{Success: false, Wanted: fmt.Sprintf("simple value %v", want), Error: err}
 			}
+			if optVal, ok := val.(*types.Optional); ok && optVal.HasValue() {
+				val = optVal.GetValue()
+			}
 			outputVal, err := refValueToExprValue(val)
 			if err != nil {
 				return TestResult{Success: false, Wanted: fmt.Sprintf("simple value %v", want), Error: fmt.Errorf("refValueToExprValue(%q) failed: %v", val, err)}
@@ -709,26 +755,32 @@ func (tr *TestRunner) createResultMatcherFromPB(t *testing.T, testCase *conforma
 			return successResult
 		}, nil
 	case *conformancepb.TestOutput_ResultExpr:
-		return func(val ref.Val, err error) TestResult {
+		return func(got ref.Val, err error) TestResult {
 			if err != nil {
 				return TestResult{Success: false, Error: err}
 			}
-			testOut, err := tr.eval(testOutput.ResultExpr)
+			want, err := tr.eval(testOutput.ResultExpr)
 			if err != nil {
 				return TestResult{Success: false, Error: fmt.Errorf("eval(%q) failed: %v", testOutput.ResultExpr, err)}
 			}
-			if optOut, ok := val.(*types.Optional); ok {
-				if optOut.Equal(types.OptionalNone) == types.True {
-					if testOut.Equal(types.OptionalNone) != types.True {
-						return TestResult{Success: false, Wanted: fmt.Sprintf("optional value %v", testOut), Error: fmt.Errorf("policy eval got %v", val)}
+			if gotOpt, ok := got.(*types.Optional); ok {
+				if gotOpt.Equal(types.OptionalNone) == types.True {
+					if want.Equal(types.OptionalNone) == types.True {
+						return successResult
 					}
-				} else if testOut.Equal(optOut.GetValue()) != types.True {
-					return TestResult{Success: false, Wanted: fmt.Sprintf("optional value %v", testOut), Error: fmt.Errorf("policy eval got %v", val)}
+					return TestResult{Success: false, Wanted: fmt.Sprintf("optional value %v", want), Error: fmt.Errorf("policy eval got %v", got)}
 				}
-			} else if val.Equal(testOut) != types.True {
-				return TestResult{Success: false, Wanted: fmt.Sprintf("optional value %v", testOut), Error: fmt.Errorf("policy eval got %v", val)}
+				if want.Equal(gotOpt.GetValue()) == types.True {
+					if enableDebug {
+						t.Log("result implicitly unwrapped optional\n")
+					}
+					return successResult
+				}
 			}
-			return successResult
+			if got.Equal(want) == types.True {
+				return successResult
+			}
+			return TestResult{Success: false, Wanted: fmt.Sprintf("optional value %v", want), Error: fmt.Errorf("policy eval got %v", got)}
 		}, nil
 	case *conformancepb.TestOutput_EvalError:
 		return func(val ref.Val, err error) TestResult {
@@ -900,17 +952,19 @@ func (tr *TestRunner) createResultMatcher(t *testing.T, testOutput *test.Output)
 	if testOutput.Value != nil {
 		want := e.CELTypeAdapter().NativeToValue(testOutput.Value)
 		return func(out ref.Val, err error) TestResult {
-			if err == nil {
-				if out.Equal(want) == types.True {
+			if err != nil {
+				return TestResult{Success: false, Wanted: fmt.Sprintf("simple value %v", want), Error: err}
+			}
+			if out.Equal(want) == types.True {
+				return successResult
+			}
+			if optOut, ok := out.(*types.Optional); ok {
+				if optOut.HasValue() && optOut.GetValue().Equal(want) == types.True {
 					return successResult
 				}
-				if optOut, ok := out.(*types.Optional); ok {
-					if optOut.HasValue() && optOut.GetValue().Equal(want) == types.True {
-						return successResult
-					}
-				}
 			}
-			return TestResult{Success: false, Wanted: fmt.Sprintf("simple value %v", want), Error: err}
+			return TestResult{Success: false, Wanted: fmt.Sprintf("simple value %v", want), Error: fmt.Errorf("policy eval got %v", out)}
+
 		}, nil
 	}
 	if testOutput.Expr != "" {
@@ -919,17 +973,19 @@ func (tr *TestRunner) createResultMatcher(t *testing.T, testOutput *test.Output)
 			return nil, fmt.Errorf("eval(%q) failed: %w", testOutput.Expr, err)
 		}
 		return func(out ref.Val, err error) TestResult {
-			if err == nil {
-				if out.Equal(want) == types.True {
+			if err != nil {
+				return TestResult{Success: false, Wanted: fmt.Sprintf("simple value %v", want), Error: err}
+			}
+			if out.Equal(want) == types.True {
+				return successResult
+			}
+			if optOut, ok := out.(*types.Optional); ok {
+				if optOut.HasValue() && optOut.GetValue().Equal(want) == types.True {
 					return successResult
 				}
-				if optOut, ok := out.(*types.Optional); ok {
-					if optOut.HasValue() && optOut.GetValue().Equal(want) == types.True {
-						return successResult
-					}
-				}
 			}
-			return TestResult{Success: false, Wanted: fmt.Sprintf("simple value %v", want), Error: err}
+			return TestResult{Success: false, Wanted: fmt.Sprintf("simple value %v", want), Error: fmt.Errorf("policy eval got %v", out)}
+
 		}, nil
 	}
 	if testOutput.ErrorSet != nil {
@@ -972,6 +1028,9 @@ func (tr *TestRunner) ExecuteTest(t *testing.T, programs []Program, test *Test) 
 			return fmt.Errorf("CEL program not set")
 		}
 		out, details, err := pr.Eval(test.input)
+		if enableDebug {
+			t.Logf("Eval result: %v (err: %v)", out, err)
+		}
 		if testResult := test.resultMatcher(out, err); !testResult.Success {
 			return fmt.Errorf("test: %s \n wanted: %v \n failed: %v", test.name, testResult.Wanted, testResult.Error)
 		}

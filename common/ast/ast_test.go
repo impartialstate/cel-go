@@ -20,11 +20,11 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/google/cel-go/checker"
-	"github.com/google/cel-go/common"
-	"github.com/google/cel-go/common/ast"
-	"github.com/google/cel-go/common/overloads"
-	"github.com/google/cel-go/common/types"
+	"cel.dev/cel-go/checker"
+	"cel.dev/cel-go/common"
+	"cel.dev/cel-go/common/ast"
+	"cel.dev/cel-go/common/overloads"
+	"cel.dev/cel-go/common/types"
 	"google.golang.org/protobuf/encoding/prototext"
 	"google.golang.org/protobuf/proto"
 )
@@ -390,6 +390,16 @@ func TestMaxID(t *testing.T) {
 	// due to the presence of the macro which was injected after the fact.
 	if ast.MaxID(checked) != maxID+4 {
 		t.Errorf("ast.MaxID() got %v, wanted %d", ast.MaxID(checked), maxID+4)
+	}
+}
+
+func TestNodeCount(t *testing.T) {
+	if ast.NodeCount(nil) != 0 {
+		t.Errorf("NodeCount(nil) got %d, wanted 0", ast.NodeCount(nil))
+	}
+	checked := mustTypeCheck(t, `1 + 2`)
+	if count := ast.NodeCount(checked); count != 3 {
+		t.Errorf("NodeCount(1 + 2) got %d, wanted 3", count)
 	}
 }
 

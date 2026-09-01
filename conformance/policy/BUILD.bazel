@@ -1,0 +1,41 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_test")
+load("@rules_proto//proto:defs.bzl", "proto_descriptor_set")
+load(":cel_policy_conformance_test.bzl", "cel_policy_conformance_test_go")
+
+package(
+    licenses = ["notice"],  # Apache 2.0
+)
+
+proto_descriptor_set(
+    name = "test_all_types_fds",
+    deps = [
+        "@dev_cel_expr//proto/cel/expr/conformance/proto3:test_all_types_proto",
+    ],
+)
+
+go_test(
+    name = "go_default_test",
+    size = "small",
+    srcs = ["policy_conformance_test.go"],
+    tags = [
+        "manual",
+        "notap",
+    ],
+    deps = [
+        "//cel:go_default_library",
+        "//common/types:go_default_library",
+        "//common/types/ref:go_default_library",
+        "//policy:go_default_library",
+        "//tools/celtest:go_default_library",
+        "//tools/compiler:go_default_library",
+        "@dev_cel_expr//conformance/proto3:go_default_library",
+        "@io_bazel_rules_go//go/runfiles",
+    ],
+)
+
+cel_policy_conformance_test_go(
+    name = "policy_conformance_tests",
+    file_descriptor_set = ":test_all_types_fds",
+    testdata = "@cel_policy//conformance:testdata",
+)
+

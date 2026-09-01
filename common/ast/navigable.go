@@ -15,8 +15,8 @@
 package ast
 
 import (
-	"github.com/google/cel-go/common/types"
-	"github.com/google/cel-go/common/types/ref"
+	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/common/types/ref"
 )
 
 // NavigableExpr represents the base navigable expression value with methods to inspect the
@@ -179,6 +179,29 @@ func PostOrderVisit(expr Expr, visitor Visitor) {
 // PreOrderVisit walks the expression graph and calls the visitor in pre-order (top-down).
 func PreOrderVisit(expr Expr, visitor Visitor) {
 	visit(expr, visitor, preOrder, 0, 0)
+}
+
+// ExceedsDepth determines whether the AST contains expressions nested deeper than the specified
+// maxDepth. The root expression has depth 0, so a maxDepth of 250 permits expressions nested up
+// to and including 250 levels deep.
+//
+// The traversal is bounded: it descends at most maxDepth+1 levels, so it remains safe to call on
+// adversarially deep inputs that could otherwise exhaust the Go stack during later checking or
+// planning. A non-positive maxDepth disables the check and returns false.
+func ExceedsDepth(a *AST, maxDepth int) bool {
+	if a == nil || maxDepth <= 0 {
+		return false
+	}
+	exceedsDepth := false
+	visitor := NewExprVisitor(func(e Expr) {
+		if nav, ok := e.(NavigableExpr); ok && nav.Depth() >= maxDepth {
+			exceedsDepth = true
+		}
+	})
+	// Bound the walk to maxDepth+1 levels so it never recurses past the first level that exceeds
+	// the limit, keeping the check itself safe on the deep inputs it guards against.
+	visit(NavigateAST(a), visitor, postOrder, 0, maxDepth+1)
+	return exceedsDepth
 }
 
 type visitOrder int

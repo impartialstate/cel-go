@@ -100,3 +100,30 @@ func TestNewBuffer_Empty(t *testing.T) {
 		t.Errorf("type mismatch: got %T, want %T", rb, &emptyBuffer{})
 	}
 }
+
+func TestNewBufferAndLineOffsetsWithLimit_Exceeded(t *testing.T) {
+	_, _, err := NewBufferAndLineOffsetsWithLimit("greetings", 5)
+	if err == nil {
+		t.Fatalf("expected size limit error, got nil")
+	}
+	if got, want := err.Error(), "expression code point size exceeds limit: size: 9, limit 5"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestNewBufferAndLineOffsetsWithLimit_MultibyteWithinLimit(t *testing.T) {
+	data := "🙂🙂"
+	rb, offs, err := NewBufferAndLineOffsetsWithLimit(data, 2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got, want := rb.Len(), 2; got != want {
+		t.Fatalf("length mismatch: got %d, want %d", got, want)
+	}
+	if got, want := rb.Slice(0, rb.Len()), data; got != want {
+		t.Fatalf("slice mismatch: got %q, want %q", got, want)
+	}
+	if got, want := len(offs), 1; got != want {
+		t.Fatalf("line offsets mismatch: got %d, want %d", got, want)
+	}
+}

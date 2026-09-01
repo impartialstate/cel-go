@@ -18,12 +18,13 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/google/cel-go/common/operators"
-	"github.com/google/cel-go/common/overloads"
-	"github.com/google/cel-go/common/types"
-	"github.com/google/cel-go/common/types/ref"
-	"github.com/google/cel-go/common/types/traits"
-	"github.com/google/cel-go/test"
+	celenv "cel.dev/cel-go/common/env"
+	"cel.dev/cel-go/common/operators"
+	"cel.dev/cel-go/common/overloads"
+	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/common/types/ref"
+	"cel.dev/cel-go/common/types/traits"
+	"cel.dev/cel-go/test"
 )
 
 func TestValidateDurationLiterals(t *testing.T) {
@@ -200,6 +201,77 @@ func TestValidateRegexLiterals(t *testing.T) {
 				t.Fatalf("e.Compile(%v) failed: %v", tc.expr, iss.Err())
 			}
 		})
+	}
+}
+
+func TestValidateRegexProgramSizeLimit(t *testing.T) {
+	opts := []EnvOption{
+		Variable("x", types.StringType),
+		ASTValidators(ValidateRegexProgramSizeLimit(5)),
+	}
+
+	tests := []struct {
+		expr string
+		iss  string
+	}{
+		{
+			expr: `'hello'.matches('el*')`,
+		},
+		{
+			expr: `'hello'.matches('(a|b)*[0-9]+')`,
+			iss: `
+			ERROR: <input>:1:17: regex program size 8 exceeds limit of 5
+             | 'hello'.matches('(a|b)*[0-9]+')
+             | ................^`,
+		},
+		{
+			expr: `'hello'.matches(x)`,
+		},
+	}
+	for _, tst := range tests {
+		tc := tst
+		t.Run(tc.expr, func(t *testing.T) {
+			_, err := Compile(tc.expr, opts...)
+			if tc.iss != "" {
+				if err == nil {
+					t.Fatalf("Compile(%v) returned ast, expected error: %v", tc.expr, tc.iss)
+				}
+				if !test.Compare(err.Error(), tc.iss) {
+					t.Fatalf("Compile(%v) returned %v, expected error: %v", tc.expr, err, tc.iss)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Compile(%v) failed: %v", tc.expr, err)
+			}
+		})
+	}
+}
+
+func TestValidateRegexProgramSizeLimitToConfig(t *testing.T) {
+	val := ValidateRegexProgramSizeLimit(5)
+	cfg := val.(ConfigurableASTValidator).ToConfig()
+	if cfg.Name != regexProgramSizeLimitValidatorName {
+		t.Errorf("ToConfig().Name = %s, wanted %s", cfg.Name, regexProgramSizeLimitValidatorName)
+	}
+	if limit, ok := cfg.ConfigValue("limit"); !ok || limit != 5 {
+		t.Errorf("ToConfig().ConfigValue('limit') = %v, wanted 5", limit)
+	}
+}
+
+func TestValidateRegexProgramSizeLimitFactory(t *testing.T) {
+	val := ValidateRegexProgramSizeLimit(5)
+	cfg := val.(ConfigurableASTValidator).ToConfig()
+	fac, ok := astValidatorFactories[regexProgramSizeLimitValidatorName]
+	if !ok {
+		t.Fatalf("missing factory for %s", regexProgramSizeLimitValidatorName)
+	}
+	vFromCfg, err := fac(cfg)
+	if err != nil {
+		t.Fatalf("fac(cfg) failed: %v", err)
+	}
+	if vFromCfg.Name() != regexProgramSizeLimitValidatorName {
+		t.Errorf("vFromCfg.Name() = %s, wanted %s", vFromCfg.Name(), regexProgramSizeLimitValidatorName)
 	}
 }
 
@@ -416,3 +488,112 @@ func TestValidatorConfig(t *testing.T) {
 		t.Error("config.Set() with incorrect value type did not fail")
 	}
 }
+
+func TestOverrideValidator(t *testing.T) {
+	// Base environment configured with comprehension nesting limit of 2.
+	baseEnv, err := NewEnv(
+		ASTValidators(ValidateComprehensionNestingLimit(2)),
+	)
+	if err != nil {
+		t.Fatalf("NewEnv() failed: %v", err)
+	}
+
+	expr := `[1, 2, 3].map(i, [4, 5, 6].map(j, [7, 8, 9].map(k, i * j * k)))`
+
+	// Fails in base environment with limit 2.
+	_, iss := baseEnv.Compile(expr)
+	if iss.Err() == nil {
+		t.Fatalf("baseEnv.Compile() succeeded, expected nesting limit error")
+	}
+
+	// Extend environment overriding limit to 3.
+	extEnv, err := baseEnv.Extend(
+		ASTValidators(ValidateComprehensionNestingLimit(3)),
+	)
+	if err != nil {
+		t.Fatalf("baseEnv.Extend() failed: %v", err)
+	}
+
+	// Succeeds in extended environment with limit 3.
+	_, iss = extEnv.Compile(expr)
+	if iss.Err() != nil {
+		t.Fatalf("extEnv.Compile() failed: %v", iss.Err())
+	}
+
+	// Verify base environment still fails (immutability check).
+	_, iss = baseEnv.Compile(expr)
+	if iss.Err() == nil {
+		t.Fatalf("baseEnv.Compile() succeeded after Extend, expected baseEnv to remain unchanged")
+	}
+
+	// Extend environment overriding limit to 1 (stricter limit).
+	stricterEnv, err := extEnv.Extend(
+		ASTValidators(ValidateComprehensionNestingLimit(1)),
+	)
+	if err != nil {
+		t.Fatalf("extEnv.Extend() failed: %v", err)
+	}
+
+	expr2 := `[1, 2, 3].exists(i, [4, 5, 6].filter(j, j % i != 0).size() > 0)`
+	// 2 levels deep: succeeds in extEnv (limit 3), fails in stricterEnv (limit 1).
+	_, iss = extEnv.Compile(expr2)
+	if iss.Err() != nil {
+		t.Fatalf("extEnv.Compile() for 2 levels failed: %v", iss.Err())
+	}
+	_, iss = stricterEnv.Compile(expr2)
+	if iss.Err() == nil {
+		t.Fatalf("stricterEnv.Compile() for 2 levels succeeded, expected error")
+	}
+}
+
+func TestOverrideValidatorFromConfig(t *testing.T) {
+	baseEnv, err := NewEnv(
+		ASTValidators(ValidateComprehensionNestingLimit(2)),
+	)
+	if err != nil {
+		t.Fatalf("NewEnv() failed: %v", err)
+	}
+
+	conf := celenv.NewConfig("override_validator").
+		AddValidators(celenv.NewValidator(nestingLimitValidatorName).SetConfig(map[string]any{"limit": 3}))
+
+	extEnv, err := baseEnv.Extend(FromConfig(conf))
+	if err != nil {
+		t.Fatalf("baseEnv.Extend(FromConfig) failed: %v", err)
+	}
+
+	expr := `[1, 2, 3].map(i, [4, 5, 6].map(j, [7, 8, 9].map(k, i * j * k)))`
+	_, iss := extEnv.Compile(expr)
+	if iss.Err() != nil {
+		t.Fatalf("extEnv.Compile() failed: %v", iss.Err())
+	}
+}
+
+func TestOverrideValidatorPreservesOrder(t *testing.T) {
+	v1 := ValidateDurationLiterals()
+	v2 := ValidateComprehensionNestingLimit(2)
+	v3 := ValidateTimestampLiterals()
+
+	env1, err := NewEnv(ASTValidators(v1, v2, v3))
+	if err != nil {
+		t.Fatalf("NewEnv() failed: %v", err)
+	}
+
+	v2New := ValidateComprehensionNestingLimit(5)
+	env2, err := env1.Extend(ASTValidators(v2New))
+	if err != nil {
+		t.Fatalf("Extend() failed: %v", err)
+	}
+
+	validators := env2.Validators()
+	if len(validators) != 3 {
+		t.Fatalf("got %d validators, wanted 3", len(validators))
+	}
+	if validators[0].Name() != v1.Name() || validators[1].Name() != v2.Name() || validators[2].Name() != v3.Name() {
+		t.Fatalf("validator order or names unexpected: %v, %v, %v", validators[0].Name(), validators[1].Name(), validators[2].Name())
+	}
+	if val, ok := validators[1].(nestingLimitValidator); !ok || val.limit != 5 {
+		t.Fatalf("expected overridden nesting limit validator with limit 5, got %v", validators[1])
+	}
+}
+

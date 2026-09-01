@@ -24,12 +24,12 @@ import (
 
 	"go.yaml.in/yaml/v3"
 
-	"github.com/google/cel-go/cel"
-	"github.com/google/cel-go/common"
-	"github.com/google/cel-go/common/env"
-	"github.com/google/cel-go/common/types"
-	"github.com/google/cel-go/ext"
-	"github.com/google/cel-go/policy"
+	"cel.dev/cel-go/cel"
+	"cel.dev/cel-go/common"
+	"cel.dev/cel-go/common/env"
+	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/ext"
+	"cel.dev/cel-go/policy"
 	"google.golang.org/protobuf/encoding/prototext"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -112,6 +112,7 @@ type compiler struct {
 	policyCompilerOptions    []policy.CompilerOption
 	policyMetadataEnvOptions []PolicyMetadataEnvOption
 	env                      *cel.Env
+	envErr                   error
 	doOnce                   sync.Once
 }
 
@@ -145,8 +146,8 @@ func extensionOpt() cel.EnvOption {
 	return func(e *cel.Env) (*cel.Env, error) {
 		envConfig := &env.Config{
 			Extensions: []*env.Extension{
-				&env.Extension{Name: "optional", Version: "latest"},
-				&env.Extension{Name: "bindings", Version: "latest"},
+				{Name: "optional", Version: "latest"},
+				{Name: "bindings", Version: "latest"},
 			},
 		}
 		return e.Extend(cel.FromConfig(envConfig, ext.ExtensionOptionFactory))
@@ -155,11 +156,10 @@ func extensionOpt() cel.EnvOption {
 
 // CreateEnv creates a singleton CEL environment with the configured environment options.
 func (c *compiler) CreateEnv() (*cel.Env, error) {
-	var err error
 	c.doOnce.Do(func() {
-		c.env, err = cel.NewCustomEnv(c.envOptions...)
+		c.env, c.envErr = cel.NewCustomEnv(c.envOptions...)
 	})
-	return c.env, err
+	return c.env, c.envErr
 }
 
 // CreatePolicyParser creates a policy parser using the optionally configured parser options.
