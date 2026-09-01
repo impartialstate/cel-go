@@ -16,6 +16,7 @@ package gatekeeper
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -135,5 +136,35 @@ ERROR: testdata/errors/template.yaml:44:61: undeclared reference to 'variables' 
  | ............................................................^`
 	if err.Error() != want {
 		t.Errorf("CompileFile() got error:\n%s\nwanted:\n%s", err.Error(), want)
+	}
+}
+
+// TestCompileRejectsTemplatesWithoutCEL checks the errors reported for a
+// template this package cannot compile, which name what is wrong with the
+// template rather than what went wrong inside the compiler.
+func TestCompileRejectsTemplatesWithoutCEL(t *testing.T) {
+	tests := []struct {
+		name string
+		want string
+	}{
+		{
+			name: "errors_rego_only",
+			want: "no K8sNativeValidation code found in spec.targets: this template is implemented with Rego",
+		},
+		{
+			name: "errors_no_validations",
+			want: "K8sNativeValidation source declares no validations",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := CompileFile("testdata/" + tc.name + "/template.yaml")
+			if err == nil {
+				t.Fatalf("CompileFile() succeeded, wanted %q", tc.want)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("CompileFile() error is:\n%s\nwanted it to report %q", err, tc.want)
+			}
+		})
 	}
 }

@@ -157,6 +157,7 @@ type templateTagHandler struct {
 
 	config          *config
 	matchConditions []policy.ValueString
+	celFound        bool
 }
 
 // PolicyTag handles the top-level fields of a ConstraintTemplate document:
@@ -204,6 +205,7 @@ func (h *templateTagHandler) parseMetadata(ctx policy.ParserContext, node *yaml.
 // template's targets.
 func (h *templateTagHandler) parseSpec(ctx policy.ParserContext, specID int64, node *yaml.Node, p *policy.Policy) {
 	h.matchConditions = nil
+	h.celFound = false
 	celFound := false
 	rangeMap(ctx, node, func(fieldName string, keyID int64, val *yaml.Node) {
 		switch fieldName {
@@ -306,12 +308,20 @@ func (h *templateTagHandler) parseCode(ctx policy.ParserContext, codeID int64, n
 				ctx.ReportErrorAtID(codeID, "%s engine is missing its source", EngineName)
 				continue
 			}
-			if celFound {
+			if h.celFound {
 				ctx.ReportErrorAtID(sourceID, "only one %s engine may be declared", EngineName)
 				continue
 			}
-			p.SetRule(h.ruleWithPrelude(ctx, sourceID, ctx.ParseRule(ctx, p, source)))
-			celFound = true
+			// The engine counts as found even when its source turns out to
+			// be unusable, so that the reason reported is the one which is
+			// wrong with the template.
+			h.celFound, celFound = true, true
+			rule := ctx.ParseRule(ctx, p, source)
+			if len(rule.Matches()) == 0 {
+				ctx.ReportErrorAtID(sourceID, "%s source declares no validations", EngineName)
+				continue
+			}
+			p.SetRule(h.ruleWithPrelude(ctx, sourceID, rule))
 		case RegoEngineName:
 			p.SetMetadata(MetadataHasRegoEngine, true)
 		}

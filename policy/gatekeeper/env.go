@@ -120,7 +120,9 @@ func WithDataProvider(provider DataProvider) Option {
 // the results of earlier lookups; a policy which exceeds it fails its review.
 func MaxDataRounds(rounds int) Option {
 	return func(c *config) {
-		c.maxRounds = rounds
+		if rounds > 0 {
+			c.maxRounds = rounds
+		}
 	}
 }
 

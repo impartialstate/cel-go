@@ -238,6 +238,9 @@ func (r *resolver) hasPending() bool {
 
 // fetch resolves every pending lookup in one call to the provider.
 func (r *resolver) fetch(ctx context.Context) error {
+	if len(r.order) == 0 {
+		return nil
+	}
 	if r.provider == nil {
 		req := r.pending[r.order[0]]
 		return fmt.Errorf("the policy reads %s but no data provider is configured: "+

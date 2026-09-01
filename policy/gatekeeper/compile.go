@@ -119,6 +119,10 @@ func Compile(src *policy.Source, opts ...Option) (*Template, error) {
 	if err != nil {
 		return nil, err
 	}
+	singles := splitValidations(p)
+	if len(singles) == 0 {
+		return nil, fmt.Errorf("%s: the %s source declares no validations", src.Description(), EngineName)
+	}
 	// The whole template is compiled first so that every mistake in it is
 	// reported once, rather than once per validation which shares a variable.
 	composed, iss := policy.Compile(env, p)
@@ -133,7 +137,7 @@ func Compile(src *policy.Source, opts ...Option) (*Template, error) {
 		ast:         composed,
 		config:      c,
 	}
-	for i, single := range splitValidations(p) {
+	for i, single := range singles {
 		ast, iss := policy.Compile(env, single)
 		if iss.Err() != nil {
 			return nil, iss.Err()
@@ -143,9 +147,6 @@ func Compile(src *policy.Source, opts ...Option) (*Template, error) {
 			return nil, fmt.Errorf("validation %d: %w", i, err)
 		}
 		t.validations = append(t.validations, &validation{program: prg, ast: ast})
-	}
-	if len(t.validations) == 0 {
-		return nil, fmt.Errorf("%s: template declares no validations", src.Description())
 	}
 	return t, nil
 }
