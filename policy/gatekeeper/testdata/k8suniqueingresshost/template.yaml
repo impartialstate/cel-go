@@ -1,0 +1,72 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# A referential policy: the decision depends on objects other than the one being
+# admitted, which the policy reads from the cluster inventory. Policies of this
+# shape are the reason the Gatekeeper policy library keeps a Rego
+# implementation, since CEL has no way to read the inventory.
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8suniqueingresshost
+  annotations:
+    description: >-
+      Requires all Ingress rule hosts to be unique across the cluster.
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sUniqueIngressHost
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            exemptNamespaces:
+              type: array
+              description: Namespaces whose ingresses may reuse a host.
+              items:
+                type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      code:
+        - engine: K8sNativeValidation
+          source:
+            matchConditions:
+              - name: has-rules
+                expression: >-
+                  has(variables.anyObject.spec) && has(variables.anyObject.spec.rules)
+            variables:
+              - name: identity
+                expression: >-
+                  variables.anyObject.metadata.namespace + "/" + variables.anyObject.metadata.name
+              - name: hosts
+                expression: >-
+                  variables.anyObject.spec.rules.filter(rule, has(rule.host)).map(rule, rule.host)
+              - name: exempt
+                expression: >-
+                  variables.params != null && has(variables.params.exemptNamespaces)
+                    ? variables.params.exemptNamespaces : []
+              - name: conflicting
+                expression: >-
+                  inventory.list("networking.k8s.io/v1", "Ingress")
+                    .filter(other,
+                      other.metadata.namespace + "/" + other.metadata.name != variables.identity &&
+                      !(other.metadata.namespace in variables.exempt) &&
+                      has(other.spec.rules) &&
+                      other.spec.rules.exists(rule, has(rule.host) && rule.host in variables.hosts))
+                    .map(other, other.metadata.namespace + "/" + other.metadata.name)
+            validations:
+              - expression: "size(variables.conflicting) == 0"
+                messageExpression: >-
+                  "ingress host is already claimed by: " + variables.conflicting.join(", ")

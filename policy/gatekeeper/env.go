@@ -62,11 +62,20 @@ const (
 	anyObjectExpr = `object == null ? oldObject : object`
 )
 
-// config carries the options which shape the CEL environment of a template.
+// config carries the options which shape the CEL environment of a template and
+// the reviews evaluated against it.
 type config struct {
 	typedParams  bool
 	extraOptions []cel.EnvOption
+	provider     DataProvider
+	maxRounds    int
 }
+
+// defaultMaxRounds bounds how many times a review re-evaluates a policy to
+// resolve referential data. Each round resolves every lookup the policy can
+// reach, so more than a couple of rounds means a policy whose lookups depend on
+// the results of earlier ones.
+const defaultMaxRounds = 10
 
 // Option configures how a ConstraintTemplate is compiled.
 type Option func(*config)
@@ -93,8 +102,30 @@ func EnvOptions(opts ...cel.EnvOption) Option {
 	}
 }
 
+// WithDataProvider supplies the referential data a policy reads: the cluster
+// inventory Rego policies read from `data.inventory`, and the providers Rego
+// policies query with `external_data`.
+//
+// A policy which makes a lookup without a provider configured fails its review
+// with an error naming the lookup, rather than silently deciding on absent
+// data.
+func WithDataProvider(provider DataProvider) Option {
+	return func(c *config) {
+		c.provider = provider
+	}
+}
+
+// MaxDataRounds bounds how many times a review re-evaluates a policy to resolve
+// referential data. The default is enough for policies whose lookups depend on
+// the results of earlier lookups; a policy which exceeds it fails its review.
+func MaxDataRounds(rounds int) Option {
+	return func(c *config) {
+		c.maxRounds = rounds
+	}
+}
+
 func newConfig(opts ...Option) *config {
-	c := &config{}
+	c := &config{maxRounds: defaultMaxRounds}
 	for _, opt := range opts {
 		opt(c)
 	}
@@ -138,6 +169,9 @@ func environmentOptions(schema map[string]any, c *config) []cel.EnvOption {
 		cel.Variable(NamespaceObjectVar, cel.DynType),
 	}
 	opts = append(opts, Libraries()...)
+	// Referential data has no equivalent in a ValidatingAdmissionPolicy, so the
+	// functions which read it are declared alongside the admission variables.
+	opts = append(opts, DataFunctions())
 	if c.typedParams {
 		opts = append(opts, cel.Variable(variablePrefix+ParamsVariable, ParamsType(schema)))
 	}

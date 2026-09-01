@@ -33,6 +33,7 @@ type Template struct {
 	policy      *policy.Policy
 	env         *cel.Env
 	ast         *cel.Ast
+	config      *config
 	validations []*validation
 }
 
@@ -130,6 +131,7 @@ func Compile(src *policy.Source, opts ...Option) (*Template, error) {
 		policy:      p,
 		env:         env,
 		ast:         composed,
+		config:      c,
 	}
 	for i, single := range splitValidations(p) {
 		ast, iss := policy.Compile(env, single)
@@ -233,10 +235,16 @@ func (t *Template) ValidateParams(params any) []error {
 //
 // An empty result means the request is admitted.
 func (t *Template) Review(ctx context.Context, r Review) ([]Violation, error) {
+	// The lookups of a review are resolved once and shared by its validations,
+	// so a policy which reads the same object from two validations reads it
+	// once.
+	data := newResolver(t.config.provider)
 	vars := r.activation()
+	vars[InventoryVar] = &inventoryValue{resolver: data}
+	vars[ExternalDataVar] = &externalDataValue{resolver: data}
 	var violations []Violation
 	for i, v := range t.validations {
-		out, _, err := v.program.ContextEval(ctx, vars)
+		out, err := t.evaluate(ctx, v.program, data, vars)
 		if err != nil {
 			return nil, fmt.Errorf("validation %d: %w", i, err)
 		}
@@ -249,6 +257,35 @@ func (t *Template) Review(ctx context.Context, r Review) ([]Violation, error) {
 		}
 	}
 	return violations, nil
+}
+
+// evaluate runs a validation, resolving the referential data it reads.
+//
+// A lookup which has not been answered evaluates to an unknown value, which CEL
+// propagates without failing the expression. The lookups the expression reached
+// are then fetched together and the expression is evaluated again, so that
+// independent lookups are fetched in one batch, and a lookup the expression
+// short-circuits past is never fetched at all.
+func (t *Template) evaluate(ctx context.Context, prg cel.Program, data *resolver, vars map[string]any) (ref.Val, error) {
+	for round := 0; round < t.config.maxRounds; round++ {
+		out, _, err := prg.ContextEval(ctx, vars)
+		if err != nil {
+			return nil, err
+		}
+		if !types.IsUnknown(out) {
+			return out, nil
+		}
+		if !data.hasPending() {
+			// The expression cannot make progress: an unknown reached the
+			// result without a lookup to resolve it.
+			return nil, fmt.Errorf("evaluation produced an unresolved value: %v", out)
+		}
+		if err := data.fetch(ctx); err != nil {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("referential data did not resolve after %d rounds, "+
+		"which means the policy's lookups depend on each other more deeply than MaxDataRounds allows", t.config.maxRounds)
 }
 
 // activation binds the variables of the Gatekeeper admission engine. Inputs

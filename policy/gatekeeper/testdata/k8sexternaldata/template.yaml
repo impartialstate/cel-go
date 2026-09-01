@@ -1,0 +1,56 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# A policy which validates container images against an external data provider,
+# the CEL equivalent of Rego's external_data builtin. The response has the shape
+# the builtin returns, so a policy ported from Rego reads it the same way.
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8sexternaldata
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sExternalData
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            provider:
+              type: string
+              description: The external data provider which validates images.
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      code:
+        - engine: K8sNativeValidation
+          source:
+            variables:
+              - name: images
+                expression: >-
+                  has(variables.anyObject.spec) && has(variables.anyObject.spec.containers)
+                    ? variables.anyObject.spec.containers.map(container, container.image) : []
+              - name: response
+                expression: >-
+                  externalData.get(variables.params.provider, variables.images)
+              - name: rejected
+                expression: >-
+                  variables.response.errors.map(failure, string(failure[0]))
+            validations:
+              - expression: "variables.response.system_error == ''"
+                messageExpression: >-
+                  "the external data provider failed: " + variables.response.system_error
+              - expression: "size(variables.rejected) == 0"
+                messageExpression: >-
+                  "images rejected by the external data provider: " + variables.rejected.join(", ")
