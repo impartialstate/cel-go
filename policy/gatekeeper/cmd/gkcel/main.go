@@ -33,7 +33,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/google/cel-go/policy/gatekeeper"
+	"cel.dev/cel-go/policy/gatekeeper"
 )
 
 const usage = `gkcel compiles and tests the CEL within Gatekeeper ConstraintTemplates.

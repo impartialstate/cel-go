@@ -37,7 +37,7 @@ go_library(
         "template.go",
         "testing.go",
     ],
-    importpath = "github.com/google/cel-go/policy/gatekeeper",
+    importpath = "cel.dev/cel-go/policy/gatekeeper",
     deps = [
         "//cel:go_default_library",
         "//common/ast:go_default_library",

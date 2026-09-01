@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/google/cel-go/policy"
+	"cel.dev/cel-go/policy"
 )
 
 // ParamsSchema returns the openAPIV3Schema declared by a ConstraintTemplate,

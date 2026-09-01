@@ -19,7 +19,7 @@ beside it:
 This package addresses both.
 
 ```
-go run github.com/google/cel-go/policy/gatekeeper/cmd/gkcel check template.yaml
+go run cel.dev/cel-go/policy/gatekeeper/cmd/gkcel check template.yaml
 ```
 
 ```

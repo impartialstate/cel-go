@@ -22,7 +22,7 @@ package(
 go_library(
     name = "go_default_library",
     srcs = ["main.go"],
-    importpath = "github.com/google/cel-go/policy/gatekeeper/cmd/gkcel",
+    importpath = "cel.dev/cel-go/policy/gatekeeper/cmd/gkcel",
     deps = [
         "//policy/gatekeeper:go_default_library",
     ],

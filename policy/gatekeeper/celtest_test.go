@@ -17,9 +17,9 @@ package gatekeeper_test
 import (
 	"testing"
 
-	"github.com/google/cel-go/policy/gatekeeper"
-	"github.com/google/cel-go/tools/celtest"
-	"github.com/google/cel-go/tools/compiler"
+	"cel.dev/cel-go/policy/gatekeeper"
+	"cel.dev/cel-go/tools/celtest"
+	"cel.dev/cel-go/tools/compiler"
 )
 
 // TestTemplateWithCELTestRunner runs a ConstraintTemplate through the CEL test

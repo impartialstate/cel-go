@@ -19,7 +19,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/google/cel-go/policy"
+	"cel.dev/cel-go/policy"
 )
 
 // TestParamsFieldsAreChecked confirms that a policy which reads a parameter the

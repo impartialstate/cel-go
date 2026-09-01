@@ -68,7 +68,7 @@ import (
 
 	"go.yaml.in/yaml/v3"
 
-	"github.com/google/cel-go/policy"
+	"cel.dev/cel-go/policy"
 )
 
 const (

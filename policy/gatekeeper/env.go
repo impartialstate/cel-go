@@ -15,9 +15,9 @@
 package gatekeeper
 
 import (
-	"github.com/google/cel-go/cel"
-	"github.com/google/cel-go/common/types"
-	"github.com/google/cel-go/ext"
+	"cel.dev/cel-go/cel"
+	"cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/ext"
 )
 
 // Variable names bound by the Gatekeeper admission engine. They mirror the
