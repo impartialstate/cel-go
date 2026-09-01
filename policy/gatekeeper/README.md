@@ -115,9 +115,10 @@ violations, err := tmpl.Review(ctx, gatekeeper.Review{
 })
 ```
 
-Every validation of the template is evaluated, so a review reports each
-violation an object fails rather than stopping at the first, as Gatekeeper
-does. A match condition which does not hold means no violation at all.
+The validations of a template compose into one expression which yields the
+messages of those an object fails, so a review reports each violation rather
+than stopping at the first, as Gatekeeper does. A match condition which does
+not hold means no violation at all.
 
 ## The environment a policy sees
 

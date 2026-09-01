@@ -34,6 +34,16 @@ const (
 	aggregate
 )
 
+const (
+	// FirstMatch evaluates the matches of a rule in order and yields the result of
+	// the first whose condition holds.
+	FirstMatch = firstMatch
+
+	// Aggregate evaluates every match of a rule and yields the list of the results
+	// whose conditions hold.
+	Aggregate = aggregate
+)
+
 // NewPolicy creates a policy object which references a policy source and source information.
 func NewPolicy(src *Source, info *ast.SourceInfo) *Policy {
 	return &Policy{

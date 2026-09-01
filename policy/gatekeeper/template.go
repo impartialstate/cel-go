@@ -323,6 +323,10 @@ func (h *templateTagHandler) parseCode(ctx policy.ParserContext, codeID int64, n
 			// wrong with the template.
 			h.celFound, celFound = true, true
 			rule := ctx.ParseRule(ctx, p, source)
+			// Gatekeeper reports every validation an object fails, so the
+			// validations of a source contribute to a list rather than the
+			// first result winning.
+			rule.SetSemantic(policy.Aggregate)
 			if len(rule.Matches()) == 0 {
 				ctx.ReportErrorAtID(sourceID, "%s source declares no validations", EngineName)
 				continue

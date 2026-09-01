@@ -18,8 +18,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"reflect"
 
 	"cel.dev/cel-go/cel"
+	"cel.dev/cel-go/common"
 	"cel.dev/cel-go/common/types"
 	"cel.dev/cel-go/common/types/ref"
 	"cel.dev/cel-go/policy"
@@ -33,16 +35,8 @@ type Template struct {
 	policy      *policy.Policy
 	env         *cel.Env
 	ast         *cel.Ast
+	program     cel.Program
 	config      *config
-	validations []*validation
-}
-
-// validation is a single entry of the template's `validations` list, compiled
-// as its own program so that a review reports every violation rather than
-// stopping at the first, as Gatekeeper does.
-type validation struct {
-	program cel.Program
-	ast     *cel.Ast
 }
 
 // Violation is a message reported by a validation which the reviewed object
@@ -51,10 +45,6 @@ type Violation struct {
 	// Message is the result of the validation's `message` or
 	// `messageExpression`.
 	Message string
-
-	// Index is the position of the failing validation within the template's
-	// `validations` list.
-	Index int
 }
 
 // Review is an admission request to evaluate a template against. Every field is
@@ -119,72 +109,44 @@ func Compile(src *policy.Source, opts ...Option) (*Template, error) {
 	if err != nil {
 		return nil, err
 	}
-	singles := splitValidations(p)
-	if len(singles) == 0 {
-		return nil, fmt.Errorf("%s: the %s source declares no validations", src.Description(), EngineName)
-	}
-	// The whole template is compiled first so that every mistake in it is
-	// reported once, rather than once per validation which shares a variable.
-	composed, iss := policy.Compile(env, p)
+	// The validations of a template are composed into one expression which
+	// yields the messages of those the object fails, so a review reports every
+	// violation rather than stopping at the first, as Gatekeeper does.
+	ast, iss := policy.Compile(env, p)
 	if iss.Err() != nil {
-		return nil, iss.Err()
+		return nil, compileError(p, iss)
 	}
-	t := &Template{
+	program, err := env.Program(ast, c.programOptions()...)
+	if err != nil {
+		return nil, err
+	}
+	return &Template{
 		name:        p.Name().Value,
 		description: p.Description().Value,
 		policy:      p,
 		env:         env,
-		ast:         composed,
+		ast:         ast,
+		program:     program,
 		config:      c,
-	}
-	for i, single := range singles {
-		ast, iss := policy.Compile(env, single)
-		if iss.Err() != nil {
-			return nil, iss.Err()
-		}
-		prg, err := env.Program(ast, c.programOptions()...)
-		if err != nil {
-			return nil, fmt.Errorf("validation %d: %w", i, err)
-		}
-		t.validations = append(t.validations, &validation{program: prg, ast: ast})
-	}
-	return t, nil
+	}, nil
 }
 
-// splitValidations returns one policy per validation of the template, each
-// carrying the variables and match conditions which apply to it.
-//
-// Gatekeeper reports every validation an object fails, while a CEL policy
-// yields the first result which matches, so each validation is compiled on its
-// own. The policies share the source of the template they came from, which
-// keeps errors and coverage reported against it.
-func splitValidations(p *policy.Policy) []*policy.Policy {
-	prelude := p.Rule()
-	if len(prelude.Matches()) != 1 || !prelude.Matches()[0].HasRule() {
-		return []*policy.Policy{p}
+// compileError renders the mistakes in a template, dropping the ones the
+// compiler reports more than once for the same expression: a policy author
+// needs one message per mistake, at the position which holds it.
+func compileError(p *policy.Policy, iss *cel.Issues) error {
+	errs := common.NewErrors(p.Source())
+	seen := map[string]bool{}
+	unique := make([]*common.Error, 0, len(iss.Errors()))
+	for _, err := range iss.Errors() {
+		key := fmt.Sprintf("%d:%d:%s", err.Location.Line(), err.Location.Column(), err.Message)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		unique = append(unique, err)
 	}
-	guard := prelude.Matches()[0]
-	rule := guard.Rule()
-	policies := make([]*policy.Policy, 0, len(rule.Matches()))
-	for _, match := range rule.Matches() {
-		single := policy.NewRule(match.SourceID())
-		single.AddVariables(rule.Variables())
-		single.AddMatch(match)
-
-		guarded := policy.NewMatch(guard.SourceID())
-		guarded.SetCondition(guard.Condition())
-		guarded.SetRule(single)
-
-		outer := policy.NewRule(guard.SourceID())
-		outer.AddVariables(prelude.Variables())
-		outer.AddMatch(guarded)
-
-		clone := policy.NewPolicy(p.Source(), p.SourceInfo())
-		clone.SetName(p.Name())
-		clone.SetRule(outer)
-		policies = append(policies, clone)
-	}
-	return policies
+	return cel.NewIssues(errs.Append(unique)).Err()
 }
 
 // Name is the metadata.name of the ConstraintTemplate.
@@ -202,10 +164,10 @@ func (t *Template) Env() *cel.Env {
 	return t.env
 }
 
-// AST is the whole template compiled into a single CEL expression, in which the
-// validations are evaluated in order until one reports a violation. It is the
-// form a policy engine would evaluate, and the form the CEL test runner
-// measures coverage against.
+// AST is the whole template compiled into a single CEL expression, which yields
+// the messages of the validations an object fails. It is the form a policy
+// engine would evaluate, and the form the CEL test runner measures coverage
+// against.
 func (t *Template) AST() *cel.Ast {
 	return t.ast
 }
@@ -236,43 +198,32 @@ func (t *Template) ValidateParams(params any) []error {
 //
 // An empty result means the request is admitted.
 func (t *Template) Review(ctx context.Context, r Review) ([]Violation, error) {
-	// The lookups of a review are resolved once and shared by its validations,
-	// so a policy which reads the same object from two validations reads it
-	// once.
 	// Evaluation runs asynchronous calls on their own goroutines, which are
 	// abandoned when the review returns, so they are cancelled rather than left
 	// running.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	// The lookups of a review are resolved once and shared by its validations,
+	// so a policy which reads the same object from two validations reads it
+	// once.
 	data := newResolver(t.config.provider)
 	vars := r.activation()
 	vars[InventoryVar] = &inventoryValue{resolver: data}
 	vars[ExternalDataVar] = &externalDataValue{resolver: data}
 	vars[DataVar] = newDataValue(data)
-	results, err := t.evaluate(ctx, data, vars)
+	out, err := t.evaluate(ctx, data, vars)
 	if err != nil {
 		return nil, err
 	}
-	var violations []Violation
-	for i, out := range results {
-		message, violated, err := violationMessage(out)
-		if err != nil {
-			return nil, fmt.Errorf("validation %d: %w", i, err)
-		}
-		if violated {
-			violations = append(violations, Violation{Message: message, Index: i})
-		}
-	}
-	return violations, nil
+	return violations(out)
 }
 
 // evaluate runs the validations of a template, resolving the referential data
 // they read.
 //
-// The validations are independent, so they are evaluated together and the
-// lookups they make overlap. Each is evaluated concurrently: the inventory
-// functions block on their own goroutines until the provider answers, and the
-// evaluator carries on with the rest of the expression meanwhile.
+// A lookup made through the inventory functions is an asynchronous call: it
+// runs on its own goroutine and the evaluator carries on with the rest of the
+// expression meanwhile, so the lookups a policy makes overlap.
 //
 // The reads a policy makes through the data namespace are index operations
 // rather than calls, which cannot be asynchronous. They yield an unknown value
@@ -280,47 +231,18 @@ func (t *Template) Review(ctx context.Context, r Review) ([]Violation, error) {
 // gathers the reads the policy reached and the next one runs with the answers.
 // A read the policy short-circuits past is never fetched, and one which depends
 // on an earlier result resolves in a later pass.
-func (t *Template) evaluate(ctx context.Context, data *resolver, vars map[string]any) ([]ref.Val, error) {
-	results := make([]ref.Val, len(t.validations))
-	for round := 0; round < t.config.maxRounds; round++ {
-		outcomes := make(chan validationOutcome, len(t.validations))
-		launched := 0
-		for i, v := range t.validations {
-			if results[i] != nil {
-				continue
-			}
-			launched++
-			go func(index int, program cel.Program) {
-				outcomes <- validationOutcome{index: index, result: <-program.ConcurrentEval(ctx, vars)}
-			}(i, v.program)
+func (t *Template) evaluate(ctx context.Context, data *resolver, vars map[string]any) (ref.Val, error) {
+	for pass := 0; pass < t.config.maxRounds; pass++ {
+		result := <-t.program.ConcurrentEval(ctx, vars)
+		if result.Err != nil {
+			return nil, result.Err
 		}
-		if launched == 0 {
-			return results, nil
-		}
-		unresolved := 0
-		var failure error
-		for n := 0; n < launched; n++ {
-			outcome := <-outcomes
-			switch {
-			case outcome.result.Err != nil:
-				if failure == nil {
-					failure = fmt.Errorf("validation %d: %w", outcome.index, outcome.result.Err)
-				}
-			case types.IsUnknown(outcome.result.Val):
-				unresolved++
-			default:
-				results[outcome.index] = outcome.result.Val
-			}
-		}
-		if failure != nil {
-			return nil, failure
-		}
-		if unresolved == 0 {
-			return results, nil
+		if !types.IsUnknown(result.Val) {
+			return result.Val, nil
 		}
 		if !data.hasPending() {
-			// The policy cannot make progress: an unknown reached the result of
-			// a validation without a read to resolve it.
+			// The policy cannot make progress: an unknown reached the result
+			// without a read to resolve it.
 			return nil, fmt.Errorf("evaluation produced an unresolved value")
 		}
 		if err := data.fetchPending(ctx); err != nil {
@@ -330,13 +252,6 @@ func (t *Template) evaluate(ctx context.Context, data *resolver, vars map[string
 	return nil, fmt.Errorf("referential data did not resolve after %d passes, "+
 		"which means the policy's reads through the data namespace depend on each other "+
 		"more deeply than MaxDataRounds allows", t.config.maxRounds)
-}
-
-// validationOutcome carries the result of one validation back to the review
-// which is evaluating them together.
-type validationOutcome struct {
-	index  int
-	result cel.EvalResult
 }
 
 // activation binds the variables of the Gatekeeper admission engine. Inputs
@@ -362,23 +277,24 @@ func (r Review) activation() map[string]any {
 	}
 }
 
-// violationMessage interprets the result of a validation. A validation which
-// the object satisfies yields no value, as its match condition did not hold.
-func violationMessage(out ref.Val) (string, bool, error) {
+// violations reads the result of a policy: the messages of the validations the
+// object failed. A policy whose match conditions did not hold yields no value
+// at all, which is a request the policy does not apply to.
+func violations(out ref.Val) ([]Violation, error) {
 	if opt, ok := out.(*types.Optional); ok {
 		if !opt.HasValue() {
-			return "", false, nil
+			return nil, nil
 		}
 		out = opt.GetValue()
 	}
-	switch value := out.(type) {
-	case types.String:
-		return string(value), true, nil
-	case types.Bool:
-		// A validation whose message is a boolean cannot happen through the
-		// template syntax, but a policy built by other means might produce one.
-		return "", bool(value), nil
-	default:
-		return "", false, fmt.Errorf("unexpected validation result type: %v", out.Type())
+	messages, err := out.ConvertToNative(reflect.TypeOf([]string{}))
+	if err != nil {
+		return nil, fmt.Errorf("unexpected policy result %v: %w", out.Type(), err)
 	}
+	reported := messages.([]string)
+	result := make([]Violation, 0, len(reported))
+	for _, message := range reported {
+		result = append(result, Violation{Message: message})
+	}
+	return result, nil
 }

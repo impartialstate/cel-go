@@ -13,7 +13,8 @@
 # limitations under the License.
 
 # The same template exercised through the CEL test runner, which reports which
-# parts of the policy the tests reached.
+# parts of the policy the tests reached. A policy yields the messages of the
+# validations an object fails, so an admitted object yields an empty list.
 description: Required labels admission tests
 section:
   - name: "admitted"
@@ -38,7 +39,7 @@ section:
                     - key: owner
                       allowedRegex: "^[a-z]+$"
         output:
-          expr: "optional.none()"
+          expr: "[]"
   - name: "rejected"
     tests:
       - name: "unlabelled"
@@ -61,7 +62,7 @@ section:
                     - key: owner
                       allowedRegex: "^[a-z]+$"
         output:
-          value: "missing required label, requires all of: owner"
+          expr: "['missing required label, requires all of: owner']"
       - name: "label value does not match"
         input:
           object:
@@ -82,4 +83,4 @@ section:
                     - key: owner
                       allowedRegex: "^[a-z]+$"
         output:
-          value: "regex mismatch"
+          expr: "['regex mismatch']"
