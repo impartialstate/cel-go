@@ -43,7 +43,22 @@
 //
 // This package parses that document into a CEL policy so the expressions can be
 // type-checked and unit tested locally, with errors reported against the
-// template's own line and column numbers.
+// template's own line and column numbers. It also gives CEL policies the
+// referential data Rego policies read from data.inventory and fetch with
+// external_data. See the README for the whole picture.
+//
+// The environment a policy is compiled against tracks what a Kubernetes cluster
+// provides rather than everything cel-go offers, so that a template which
+// compiles here is one a cluster will accept. The libraries a recent cluster
+// has and this environment does not are quantity, URL, IP and CIDR, format,
+// semver, the authorizer, and two-variable comprehensions. A policy which needs
+// one of these can declare it with the EnvOptions option, and a policy which
+// needs quantity or the authorizer needs an implementation of it first.
+//
+// What a cluster decides and this package does not: whether a constraint
+// applies to an object at all, which is the constraint's spec.match; what is
+// done with a violation, which is its enforcementAction and the template's
+// failurePolicy; and the cost limits which bound how long an expression may run.
 package gatekeeper
 
 import (

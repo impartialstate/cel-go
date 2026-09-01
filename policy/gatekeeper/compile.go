@@ -115,7 +115,7 @@ func Compile(src *policy.Source, opts ...Option) (*Template, error) {
 		return nil, iss.Err()
 	}
 	schema, _ := ParamsSchema(p)
-	env, err := cel.NewEnv(environmentOptions(schema, c)...)
+	env, err := cel.NewEnv(append(environmentOptions(c), schemaOptions(schema, c)...)...)
 	if err != nil {
 		return nil, err
 	}

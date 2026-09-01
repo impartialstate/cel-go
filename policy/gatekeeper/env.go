@@ -132,27 +132,50 @@ func newConfig(opts ...Option) *config {
 	return c
 }
 
-// EnvOptionFromMetadata returns a function which builds the CEL environment for
-// a ConstraintTemplate from the metadata collected while parsing it.
+// EnvironmentOptions returns the CEL environment of the Gatekeeper
+// K8sNativeValidation engine: the variables it binds, the extension libraries
+// it enables, and the functions which read referential data.
 //
-// The signature matches the policy metadata hook of the CEL compiler tool, so
-// the environment of a template is derived from the template itself:
+// It is the environment a ConstraintTemplate is compiled against, and is
+// exported for tools which build their own compiler:
 //
-//	compiler.NewCompiler(
-//	    compiler.PolicyMetadataEnvOption(gatekeeper.EnvOptionFromMetadata()),
-//	    gatekeeper.ParserOption())
+//	compilerOpts := []any{gatekeeper.ParserOption()}
+//	for _, opt := range gatekeeper.EnvironmentOptions() {
+//	    compilerOpts = append(compilerOpts, opt)
+//	}
+//	celtest.TriggerTests(t, celtest.TestCompiler(compilerOpts...), ...)
+func EnvironmentOptions(opts ...Option) []cel.EnvOption {
+	return environmentOptions(newConfig(opts...))
+}
+
+// EnvOptionFromMetadata returns a function which declares what a template's own
+// schema adds to the environment, from the metadata collected while parsing it.
+//
+// The signature matches the policy metadata hook of the CEL compiler tool,
+// which supplies the metadata of the policy being compiled. It complements
+// EnvironmentOptions rather than replacing it, and contributes nothing unless
+// the TypedParams option is set, since the type of a template's parameters is
+// the only part of its environment which the template itself determines.
 func EnvOptionFromMetadata(opts ...Option) func(map[string]any) cel.EnvOption {
 	c := newConfig(opts...)
 	return func(metadata map[string]any) cel.EnvOption {
 		schema, _ := metadata[MetadataParamsSchema].(map[string]any)
-		return envOption(environmentOptions(schema, c))
+		return envOption(schemaOptions(schema, c))
 	}
 }
 
-// environmentOptions returns the environment of the Gatekeeper
-// K8sNativeValidation engine: the variables it binds and the CEL extension
-// libraries it enables.
-func environmentOptions(schema map[string]any, c *config) []cel.EnvOption {
+// schemaOptions returns the declarations derived from the openAPIV3Schema of a
+// template's constraint.
+func schemaOptions(schema map[string]any, c *config) []cel.EnvOption {
+	if !c.typedParams {
+		return nil
+	}
+	return []cel.EnvOption{cel.Variable(variablePrefix+ParamsVariable, ParamsType(schema))}
+}
+
+// environmentOptions returns the variables the admission engine binds, the
+// libraries it enables, and the functions which read referential data.
+func environmentOptions(c *config) []cel.EnvOption {
 	// The admission inputs are declared as untyped values because Kubernetes
 	// binds them from unstructured objects and leaves them null when they do
 	// not apply to the request, and a null check does not type-check against a
@@ -172,9 +195,6 @@ func environmentOptions(schema map[string]any, c *config) []cel.EnvOption {
 	// Referential data has no equivalent in a ValidatingAdmissionPolicy, so the
 	// functions which read it are declared alongside the admission variables.
 	opts = append(opts, DataFunctions())
-	if c.typedParams {
-		opts = append(opts, cel.Variable(variablePrefix+ParamsVariable, ParamsType(schema)))
-	}
 	return append(opts, c.extraOptions...)
 }
 
@@ -186,17 +206,22 @@ const variablePrefix = "variables."
 // Libraries returns the CEL extension libraries available to policies
 // evaluated by the Gatekeeper admission engine.
 //
-// The set approximates the environment Kubernetes configures for admission
-// policies. See the package documentation for the differences which remain.
+// The set is deliberately close to the environment Kubernetes configures for
+// admission policies rather than to everything cel-go offers, so that a
+// template which compiles here is one a cluster will also accept. The
+// Kubernetes list and regex functions are supplied by this package, since
+// cel-go does not provide them, and the string extension is pinned to the
+// version Kubernetes enables.
+//
+// Libraries a cluster has and this environment does not are listed in the
+// package documentation; a policy which needs one can declare it with the
+// EnvOptions option.
 func Libraries() []cel.EnvOption {
 	return []cel.EnvOption{
 		cel.OptionalTypes(),
 		cel.CrossTypeNumericComparisons(true),
 		cel.EagerlyValidateDeclarations(true),
-		ext.Strings(),
-		ext.Sets(),
-		ext.Encoders(),
-		ext.Math(),
+		ext.Strings(ext.StringsVersion(2)),
 		KubernetesLists(),
 		KubernetesStrings(),
 	}

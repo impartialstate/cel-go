@@ -1,5 +1,10 @@
 # CEL Policy
 
+> Writing policies for OPA Gatekeeper? The [`gatekeeper`](gatekeeper/README.md)
+> package compiles and tests the CEL inside a ConstraintTemplate without a
+> cluster, and gives those policies the referential data Rego reads from
+> `data.inventory`.
+
 The Common Expression Language (CEL) supports simple expressions: no variables,
 functions, or modules. However, CEL expression graphs can be composed together,
 allowing for reuse and development clarity which is not otherwise possible

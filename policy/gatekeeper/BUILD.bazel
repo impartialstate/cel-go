@@ -1,0 +1,74 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+package(
+    default_visibility = [
+        "//policy:__subpackages__",
+        "//tools:__subpackages__",
+    ],
+    licenses = ["notice"],
+)
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "compile.go",
+        "data.go",
+        "env.go",
+        "k8slib.go",
+        "schema.go",
+        "static.go",
+        "suite.go",
+        "template.go",
+        "testing.go",
+    ],
+    importpath = "github.com/google/cel-go/policy/gatekeeper",
+    deps = [
+        "//cel:go_default_library",
+        "//common/types:go_default_library",
+        "//common/types/ref:go_default_library",
+        "//common/types/traits:go_default_library",
+        "//ext:go_default_library",
+        "//policy:go_default_library",
+        "@in_yaml_go_yaml_v3//:go_default_library",
+    ],
+)
+
+go_test(
+    name = "go_default_test",
+    size = "small",
+    srcs = [
+        "celtest_test.go",
+        "compile_test.go",
+        "data_test.go",
+        "k8slib_test.go",
+        "schema_test.go",
+        "suite_test.go",
+    ],
+    data = glob(["testdata/**"]),
+    embed = [":go_default_library"],
+    deps = [
+        "//cel:go_default_library",
+        "//tools/celtest:go_default_library",
+        "//tools/compiler:go_default_library",
+        "@in_yaml_go_yaml_v3//:go_default_library",
+    ],
+)
+
+filegroup(
+    name = "testdata",
+    srcs = glob(["testdata/**"]),
+)
