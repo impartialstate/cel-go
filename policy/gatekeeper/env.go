@@ -66,11 +66,14 @@ const (
 // config carries the options which shape the CEL environment of a template and
 // the reviews evaluated against it.
 type config struct {
-	objectSchema map[string]any
-	schemas      *SchemaTypes
-	extraOptions []cel.EnvOption
-	provider     DataProvider
-	maxRounds    int
+	objectSchema   map[string]any
+	maxConcurrency int
+	synchronous    bool
+	programOpts    []cel.ProgramOption
+	schemas        *SchemaTypes
+	extraOptions   []cel.EnvOption
+	provider       DataProvider
+	maxRounds      int
 }
 
 // defaultMaxRounds bounds how many times a review re-evaluates a policy to
@@ -135,9 +138,54 @@ func WithDataProvider(provider DataProvider) Option {
 	}
 }
 
-// MaxDataRounds bounds how many times a review re-evaluates a policy to resolve
-// referential data. The default is enough for policies whose lookups depend on
-// the results of earlier lookups; a policy which exceeds it fails its review.
+// MaxConcurrentLookups bounds how many lookups a review may have in flight at
+// once, so that a policy which reads the cluster from within a comprehension
+// over a large list cannot launch a goroutine per element.
+//
+// The default is the evaluator's, which does not bound them.
+func MaxConcurrentLookups(limit int) Option {
+	return func(c *config) {
+		c.maxConcurrency = limit
+	}
+}
+
+// SynchronousLookups declares the inventory functions with blocking rather than
+// asynchronous bindings.
+//
+// An environment which declares an asynchronous function yields programs that
+// only ConcurrentEval can run, so a tool which evaluates a policy with Eval —
+// the CEL test runner among them — needs this form. The lookups of a policy
+// then run one after another on the evaluating goroutine, and are not
+// cancellable.
+func SynchronousLookups() Option {
+	return func(c *config) {
+		c.synchronous = true
+	}
+}
+
+// ProgramOptions passes options to the programs a template compiles to, for
+// evaluation behavior this package does not expose, such as the strategy which
+// decides when the evaluator resumes after asynchronous calls complete.
+func ProgramOptions(opts ...cel.ProgramOption) Option {
+	return func(c *config) {
+		c.programOpts = append(c.programOpts, opts...)
+	}
+}
+
+// programOptions returns the options the programs of a template are planned
+// with.
+func (c *config) programOptions() []cel.ProgramOption {
+	opts := c.programOpts
+	if c.maxConcurrency > 0 {
+		opts = append(append([]cel.ProgramOption{}, opts...), cel.AsyncMaxConcurrency(c.maxConcurrency))
+	}
+	return opts
+}
+
+// MaxDataRounds bounds how many passes a review makes to resolve the reads a
+// policy performs through the data namespace, which cannot be asynchronous. The
+// default is enough for policies whose reads depend on the results of earlier
+// reads; a policy which exceeds it fails its review.
 func MaxDataRounds(rounds int) Option {
 	return func(c *config) {
 		if rounds > 0 {
@@ -305,7 +353,7 @@ func environmentOptions(c *config) []cel.EnvOption {
 	// Referential data has no equivalent in a ValidatingAdmissionPolicy, so the
 	// functions which read it are declared alongside the admission variables,
 	// as are the reads a policy ported from Rego makes.
-	opts = append(opts, DataFunctions(), RegoCompatibility())
+	opts = append(opts, dataFunctions(c), RegoCompatibility())
 	return append(opts, c.extraOptions...)
 }
 
@@ -336,6 +384,15 @@ func Libraries() []cel.EnvOption {
 		KubernetesLists(),
 		KubernetesStrings(),
 	}
+}
+
+// dataFunctions declares the referential lookups with the binding style the
+// configuration asks for.
+func dataFunctions(c *config) cel.EnvOption {
+	if c.synchronous {
+		return DataFunctions(SynchronousLookups())
+	}
+	return DataFunctions()
 }
 
 // envOption combines a list of environment options into one.

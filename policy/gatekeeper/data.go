@@ -129,65 +129,39 @@ type Response struct {
 	Err error
 }
 
-// DataProvider answers the referential lookups made by a policy.
+// DataProvider answers a referential lookup made by a policy.
 //
-// Lookups are answered in batches: a policy's expressions are evaluated to
-// discover every lookup it can make, all of them are passed to the provider at
-// once, and evaluation resumes with the answers. A provider is free to resolve a
-// batch concurrently, and Parallel does so for providers which answer one
-// request at a time.
+// Lookups run as asynchronous CEL functions: each is called on its own
+// goroutine with the context of the review, and the evaluator continues as they
+// complete, so the lookups a policy makes are resolved concurrently. An
+// implementation should honor cancellation, since a review whose context is
+// done abandons the lookups still in flight.
 //
-// Responses must be returned in the order of the requests.
+// The value returned follows the kind of the request: the object, or nil, for
+// InventoryGet; the list of objects for InventoryList; and the provider
+// response for ExternalData. It is converted to a CEL value with the standard
+// type adapter, so Kubernetes objects are supplied as map[string]any, the form
+// the API server and Gatekeeper's cache hold them in.
 type DataProvider interface {
-	Resolve(ctx context.Context, requests []Request) ([]Response, error)
-}
-
-// SingleDataProvider answers one referential lookup at a time. Parallel adapts
-// it to the batched DataProvider interface.
-type SingleDataProvider interface {
 	Resolve(ctx context.Context, request Request) (any, error)
 }
 
-// Parallel adapts a provider which answers one request at a time into one which
-// answers a batch, resolving up to limit requests concurrently. A limit of zero
-// or less places no bound on concurrency.
-func Parallel(provider SingleDataProvider, limit int) DataProvider {
-	return &parallelProvider{provider: provider, limit: limit}
+// BatchDataProvider answers several lookups in one call.
+//
+// A provider which can answer a batch more cheaply than the requests one at a
+// time implements it in addition to DataProvider. It is used for the reads a
+// policy makes through the data namespace, which are gathered a round at a
+// time; the lookups made through the inventory functions are asynchronous and
+// arrive one per call.
+//
+// Responses must be returned in the order of the requests.
+type BatchDataProvider interface {
+	DataProvider
+
+	ResolveBatch(ctx context.Context, requests []Request) ([]Response, error)
 }
 
-type parallelProvider struct {
-	provider SingleDataProvider
-	limit    int
-}
-
-func (p *parallelProvider) Resolve(ctx context.Context, requests []Request) ([]Response, error) {
-	responses := make([]Response, len(requests))
-	var tokens chan struct{}
-	if p.limit > 0 {
-		tokens = make(chan struct{}, p.limit)
-	}
-	var wg sync.WaitGroup
-	for i, req := range requests {
-		wg.Add(1)
-		go func(i int, req Request) {
-			defer wg.Done()
-			if tokens != nil {
-				tokens <- struct{}{}
-				defer func() { <-tokens }()
-			}
-			if err := ctx.Err(); err != nil {
-				responses[i] = Response{Err: err}
-				return
-			}
-			value, err := p.provider.Resolve(ctx, req)
-			responses[i] = Response{Value: value, Err: err}
-		}(i, req)
-	}
-	wg.Wait()
-	return responses, ctx.Err()
-}
-
-// DataProviderFunc adapts a function to the SingleDataProvider interface.
+// DataProviderFunc adapts a function to the DataProvider interface.
 type DataProviderFunc func(ctx context.Context, request Request) (any, error)
 
 // Resolve calls the function.
@@ -198,33 +172,196 @@ func (f DataProviderFunc) Resolve(ctx context.Context, request Request) (any, er
 // resolver holds the referential data read during a single review: the lookups
 // a policy has asked for, and the answers gathered so far.
 //
-// A lookup which has not been answered evaluates to an unknown value, which CEL
-// propagates through the expression without failing it. The review then fetches
-// every lookup the expression reached and evaluates it again, so that
-// independent lookups are fetched together rather than one at a time, and a
-// lookup which the expression short-circuits past is never fetched at all.
+// It serves two kinds of read. A lookup made through the inventory functions is
+// asynchronous: the call blocks on its own goroutine until the provider
+// answers, and the evaluator carries on with the rest of the expression
+// meanwhile. A lookup made through the data namespace is an index rather than a
+// call, which cannot be asynchronous, so it yields an unknown value that CEL
+// propagates without failing the expression; the review then fetches what the
+// pass reached and evaluates again.
+//
+// Both share one cache, so an object read by either route is fetched once, and
+// two lookups of the same object made at the same time wait on one call to the
+// provider rather than making two.
 type resolver struct {
 	provider DataProvider
-	answers  map[string]ref.Val
-	keyed    map[string]ref.Val
-	pending  map[string]Request
-	order    []string
+
+	mu      sync.Mutex
+	answers map[string]*answer
+	keyed   map[string]ref.Val
+	pending map[string]Request
+	order   []string
+}
+
+// answer is the state of one lookup: a call in flight, or the value it
+// produced.
+type answer struct {
+	done  chan struct{}
+	value ref.Val
+	err   error
 }
 
 func newResolver(provider DataProvider) *resolver {
 	return &resolver{
 		provider: provider,
-		answers:  map[string]ref.Val{},
+		answers:  map[string]*answer{},
 		keyed:    map[string]ref.Val{},
 		pending:  map[string]Request{},
 	}
+}
+
+// fetch answers a lookup, waiting for the provider. It is what the asynchronous
+// inventory functions call, on the goroutine the evaluator gives them.
+//
+// A lookup already in flight is waited on rather than repeated, so a policy
+// which reads the same object from two expressions makes one call.
+func (r *resolver) fetch(ctx context.Context, req Request) ref.Val {
+	key := requestKey(req)
+	r.mu.Lock()
+	if existing, found := r.answers[key]; found {
+		r.mu.Unlock()
+		return existing.await(ctx)
+	}
+	if r.provider == nil {
+		r.mu.Unlock()
+		return types.NewErr("%s", noProviderError(req))
+	}
+	pending := &answer{done: make(chan struct{})}
+	r.answers[key] = pending
+	r.mu.Unlock()
+
+	value, err := r.provider.Resolve(ctx, req)
+	if err != nil {
+		pending.err = fmt.Errorf("%s: %w", describeRequest(req), err)
+	} else {
+		pending.value = types.DefaultTypeAdapter.NativeToValue(value)
+	}
+	close(pending.done)
+	return pending.await(ctx)
+}
+
+// await returns the value of a lookup once it has one, or the reason the review
+// stopped waiting.
+func (a *answer) await(ctx context.Context) ref.Val {
+	select {
+	case <-a.done:
+		if a.err != nil {
+			return types.WrapErr(a.err)
+		}
+		return a.value
+	case <-ctx.Done():
+		return types.WrapErr(ctx.Err())
+	}
+}
+
+// lookup returns the answer to a request, recording it as pending and returning
+// an unknown value when it has not been fetched yet. It serves the reads made
+// through the data namespace, which cannot wait for a provider.
+func (r *resolver) lookup(req Request) ref.Val {
+	key := requestKey(req)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if existing, found := r.answers[key]; found {
+		select {
+		case <-existing.done:
+			if existing.err != nil {
+				return types.WrapErr(existing.err)
+			}
+			return existing.value
+		default:
+		}
+	}
+	if _, found := r.pending[key]; !found {
+		r.pending[key] = req
+		r.order = append(r.order, key)
+	}
+	return types.NewUnknown(0, types.NewAttributeTrail(req.Kind.String()))
+}
+
+// hasPending reports whether any lookup is waiting to be fetched.
+func (r *resolver) hasPending() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.pending) != 0
+}
+
+// fetchPending resolves every lookup gathered during a pass, in one call to the
+// provider when it can answer a batch, and concurrently when it cannot.
+func (r *resolver) fetchPending(ctx context.Context) error {
+	r.mu.Lock()
+	requests := make([]Request, 0, len(r.order))
+	keys := append([]string{}, r.order...)
+	for _, key := range keys {
+		requests = append(requests, r.pending[key])
+	}
+	r.pending = map[string]Request{}
+	r.order = nil
+	provider := r.provider
+	r.mu.Unlock()
+
+	if len(requests) == 0 {
+		return nil
+	}
+	if provider == nil {
+		return fmt.Errorf("%s", noProviderError(requests[0]))
+	}
+	responses, err := r.resolveBatch(ctx, provider, requests)
+	if err != nil {
+		return err
+	}
+	for i, response := range responses {
+		if response.Err != nil {
+			return fmt.Errorf("%s: %w", describeRequest(requests[i]), response.Err)
+		}
+		r.record(keys[i], types.DefaultTypeAdapter.NativeToValue(response.Value))
+	}
+	return nil
+}
+
+// resolveBatch answers a batch of requests, using the provider's own batch
+// call when it has one.
+func (r *resolver) resolveBatch(ctx context.Context, provider DataProvider, requests []Request) ([]Response, error) {
+	if batched, ok := provider.(BatchDataProvider); ok {
+		responses, err := batched.ResolveBatch(ctx, requests)
+		if err != nil {
+			return nil, err
+		}
+		if len(responses) != len(requests) {
+			return nil, fmt.Errorf("data provider returned %d responses for %d requests", len(responses), len(requests))
+		}
+		return responses, nil
+	}
+	responses := make([]Response, len(requests))
+	var wg sync.WaitGroup
+	for i, req := range requests {
+		wg.Add(1)
+		go func(i int, req Request) {
+			defer wg.Done()
+			value, err := provider.Resolve(ctx, req)
+			responses[i] = Response{Value: value, Err: err}
+		}(i, req)
+	}
+	wg.Wait()
+	return responses, ctx.Err()
+}
+
+// record stores the answer to a lookup so that either kind of read finds it.
+func (r *resolver) record(key string, value ref.Val) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	done := make(chan struct{})
+	close(done)
+	r.answers[key] = &answer{done: done, value: value}
 }
 
 // listByName answers a list lookup as a map from object name to object, which
 // is the shape a Rego policy reads the inventory in.
 func (r *resolver) listByName(req Request) ref.Val {
 	key := requestKey(req)
-	if keyed, found := r.keyed[key]; found {
+	r.mu.Lock()
+	keyed, found := r.keyed[key]
+	r.mu.Unlock()
+	if found {
 		return keyed
 	}
 	answer := r.lookup(req)
@@ -235,11 +372,11 @@ func (r *resolver) listByName(req Request) ref.Val {
 	if !ok {
 		return types.NewErr("%s: expected a list of objects, got %s", describeRequest(req), answer.Type())
 	}
-	objects := map[ref.Val]ref.Val{}
 	size, ok := list.Size().(types.Int)
 	if !ok {
 		return types.MaybeNoSuchOverloadErr(list.Size())
 	}
+	objects := map[ref.Val]ref.Val{}
 	for i := types.Int(0); i < size; i++ {
 		object := list.Get(i)
 		name, err := objectName(object)
@@ -248,8 +385,10 @@ func (r *resolver) listByName(req Request) ref.Val {
 		}
 		objects[name] = object
 	}
-	keyed := types.NewRefValMap(types.DefaultTypeAdapter, objects)
+	keyed = types.NewRefValMap(types.DefaultTypeAdapter, objects)
+	r.mu.Lock()
 	r.keyed[key] = keyed
+	r.mu.Unlock()
 	return keyed
 }
 
@@ -274,55 +413,10 @@ func objectName(object ref.Val) (ref.Val, ref.Val) {
 	return name, nil
 }
 
-// lookup returns the answer to a request, recording it as pending and returning
-// an unknown value when it has not been fetched yet.
-func (r *resolver) lookup(req Request) ref.Val {
-	key := requestKey(req)
-	if answer, found := r.answers[key]; found {
-		return answer
-	}
-	if _, found := r.pending[key]; !found {
-		r.pending[key] = req
-		r.order = append(r.order, key)
-	}
-	return types.NewUnknown(0, types.NewAttributeTrail(req.Kind.String()))
-}
-
-// hasPending reports whether any lookup is waiting to be fetched.
-func (r *resolver) hasPending() bool {
-	return len(r.pending) != 0
-}
-
-// fetch resolves every pending lookup in one call to the provider.
-func (r *resolver) fetch(ctx context.Context) error {
-	if len(r.order) == 0 {
-		return nil
-	}
-	if r.provider == nil {
-		req := r.pending[r.order[0]]
-		return fmt.Errorf("the policy reads %s but no data provider is configured: "+
-			"pass gatekeeper.WithDataProvider to supply the cluster inventory and external data", req.Kind)
-	}
-	requests := make([]Request, 0, len(r.order))
-	for _, key := range r.order {
-		requests = append(requests, r.pending[key])
-	}
-	responses, err := r.provider.Resolve(ctx, requests)
-	if err != nil {
-		return err
-	}
-	if len(responses) != len(requests) {
-		return fmt.Errorf("data provider returned %d responses for %d requests", len(responses), len(requests))
-	}
-	for i, response := range responses {
-		if response.Err != nil {
-			return fmt.Errorf("%s: %w", describeRequest(requests[i]), response.Err)
-		}
-		r.answers[r.order[i]] = types.DefaultTypeAdapter.NativeToValue(response.Value)
-	}
-	r.pending = map[string]Request{}
-	r.order = nil
-	return nil
+// noProviderError explains a lookup made with nothing to answer it.
+func noProviderError(req Request) string {
+	return fmt.Sprintf("the policy reads %s but no data provider is configured: "+
+		"pass gatekeeper.WithDataProvider to supply the cluster inventory and external data", req.Kind)
 }
 
 // requestKey identifies a request, so that the same lookup made twice is
@@ -372,39 +466,61 @@ func describeRequest(req Request) string {
 // The response of externalData.get has the shape Rego's `external_data` builtin
 // returns: `responses` holds the key and value pairs which resolved, `errors`
 // the pairs which did not.
-func DataFunctions() cel.EnvOption {
+func DataFunctions(opts ...Option) cel.EnvOption {
+	c := newConfig(opts...)
+	name := "gatekeeper.data"
+	if c.synchronous {
+		// The two forms declare the same functions with different bindings, so
+		// an environment takes one or the other.
+		name += ".synchronous"
+	}
 	return cel.Lib(&libraryOptions{
-		name: "gatekeeper.data",
+		name: name,
 		opts: []cel.EnvOption{
 			cel.Variable(InventoryVar, InventoryType),
 			cel.Variable(ExternalDataVar, ExternalDataType),
 			cel.Function("get",
 				cel.MemberOverload("inventory_get_cluster",
 					[]*cel.Type{InventoryType, cel.StringType, cel.StringType, cel.StringType}, cel.DynType,
-					cel.FunctionBinding(inventoryGet)),
+					lookupBinding(c, inventoryGet)),
 				cel.MemberOverload("inventory_get_namespaced",
 					[]*cel.Type{InventoryType, cel.StringType, cel.StringType, cel.StringType, cel.StringType}, cel.DynType,
-					cel.FunctionBinding(inventoryGet)),
+					lookupBinding(c, inventoryGet)),
 				cel.MemberOverload("external_data_get",
 					[]*cel.Type{ExternalDataType, cel.StringType, cel.ListType(cel.StringType)},
 					cel.MapType(cel.StringType, cel.DynType),
-					cel.FunctionBinding(externalDataGet)),
+					lookupBinding(c, externalDataGet)),
 				cel.MemberOverload("external_data_get_request",
 					[]*cel.Type{ExternalDataType, cel.MapType(cel.StringType, cel.DynType)},
 					cel.MapType(cel.StringType, cel.DynType),
-					cel.BinaryBinding(externalDataRequest))),
+					lookupBinding(c, externalDataRequest))),
 			cel.Function("list",
 				cel.MemberOverload("inventory_list_cluster",
 					[]*cel.Type{InventoryType, cel.StringType, cel.StringType}, cel.ListType(cel.DynType),
-					cel.FunctionBinding(inventoryList)),
+					lookupBinding(c, inventoryList)),
 				cel.MemberOverload("inventory_list_namespaced",
 					[]*cel.Type{InventoryType, cel.StringType, cel.StringType, cel.StringType}, cel.ListType(cel.DynType),
-					cel.FunctionBinding(inventoryList))),
+					lookupBinding(c, inventoryList))),
 		},
 	})
 }
 
-func inventoryGet(args ...ref.Val) ref.Val {
+// lookupBinding binds a lookup to its implementation, asynchronously by
+// default so that the lookups of a policy overlap.
+//
+// An environment declaring an asynchronous function yields programs which only
+// ConcurrentEval can run, so a tool which evaluates them with Eval asks for the
+// blocking form instead.
+func lookupBinding(c *config, fn func(context.Context, ...ref.Val) ref.Val) cel.OverloadOpt {
+	if c.synchronous {
+		return cel.FunctionBinding(func(args ...ref.Val) ref.Val {
+			return fn(context.Background(), args...)
+		})
+	}
+	return cel.AsyncBinding(fn)
+}
+
+func inventoryGet(ctx context.Context, args ...ref.Val) ref.Val {
 	r, ok := args[0].(*inventoryValue)
 	if !ok {
 		return types.MaybeNoSuchOverloadErr(args[0])
@@ -419,10 +535,10 @@ func inventoryGet(args ...ref.Val) ref.Val {
 	} else {
 		req.Name = strs[2]
 	}
-	return r.resolver.lookup(req)
+	return r.resolver.fetch(ctx, req)
 }
 
-func inventoryList(args ...ref.Val) ref.Val {
+func inventoryList(ctx context.Context, args ...ref.Val) ref.Val {
 	r, ok := args[0].(*inventoryValue)
 	if !ok {
 		return types.MaybeNoSuchOverloadErr(args[0])
@@ -435,10 +551,10 @@ func inventoryList(args ...ref.Val) ref.Val {
 	if len(strs) == 3 {
 		req.Namespaced, req.Namespace = true, strs[2]
 	}
-	return r.resolver.lookup(req)
+	return r.resolver.fetch(ctx, req)
 }
 
-func externalDataGet(args ...ref.Val) ref.Val {
+func externalDataGet(ctx context.Context, args ...ref.Val) ref.Val {
 	r, ok := args[0].(*externalDataValue)
 	if !ok {
 		return types.MaybeNoSuchOverloadErr(args[0])
@@ -451,7 +567,7 @@ func externalDataGet(args ...ref.Val) ref.Val {
 	if err != nil {
 		return types.WrapErr(err)
 	}
-	return r.resolver.lookup(Request{
+	return r.resolver.fetch(ctx, Request{
 		Kind:     ExternalData,
 		Provider: string(provider),
 		Keys:     keys.([]string),
@@ -462,7 +578,8 @@ func externalDataGet(args ...ref.Val) ref.Val {
 // names the provider and the keys to send it:
 //
 //	external_data({"provider": "my-provider", "keys": ["key"]})
-func externalDataRequest(receiver, request ref.Val) ref.Val {
+func externalDataRequest(ctx context.Context, args ...ref.Val) ref.Val {
+	receiver, request := args[0], args[1]
 	mapper, ok := request.(traits.Mapper)
 	if !ok {
 		return types.MaybeNoSuchOverloadErr(request)
@@ -475,7 +592,7 @@ func externalDataRequest(receiver, request ref.Val) ref.Val {
 	if !found {
 		return types.NewErr("%s request holds no keys", ExternalDataFunc)
 	}
-	return externalDataGet(receiver, provider, keys)
+	return externalDataGet(ctx, receiver, provider, keys)
 }
 
 func stringArgs(args []ref.Val) ([]string, ref.Val) {

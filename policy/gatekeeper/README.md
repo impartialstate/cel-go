@@ -249,44 +249,47 @@ functions.
 
 ### Lookups are asynchronous
 
-CEL expressions must be side-effect free and fast, so a lookup does not block
-evaluation. A lookup which has not been answered evaluates to an *unknown*
-value, which CEL propagates through the expression without failing it. One pass
-therefore discovers every lookup the policy can reach; those are handed to the
-provider as a single batch, and the expression is evaluated again with the
-answers.
-
-The consequences are worth stating plainly:
-
-* Independent lookups are fetched **together**, not one round trip at a time —
-  across the whole policy, since every validation is evaluated before anything
-  is fetched.
-* A lookup the policy short-circuits past is **never fetched**.
-* A lookup which depends on an earlier result resolves in a later round.
-* Answers are shared by the validations of one review, so an object read from
-  two validations is fetched once.
-
-A provider implements either the batch interface or the single-request one:
+A lookup made through the inventory functions is an asynchronous CEL call: it
+runs on its own goroutine with the review's context, and the evaluator carries
+on with the rest of the expression while it is in flight. The lookups a policy
+makes therefore overlap, across its validations as well as within one, and a
+lookup the policy short-circuits past is never made.
 
 ```go
 type DataProvider interface {
-    Resolve(ctx context.Context, requests []Request) ([]Response, error)
+    Resolve(ctx context.Context, request Request) (any, error)
 }
 
-// Or answer one at a time and let Parallel fan them out, four at a time:
-provider := gatekeeper.Parallel(gatekeeper.DataProviderFunc(
-    func(ctx context.Context, req gatekeeper.Request) (any, error) {
-        return client.List(ctx, req.APIVersion, req.ResourceKind, req.Namespace)
-    }), 4)
-
 tmpl, err := gatekeeper.CompileFile("template.yaml",
-    gatekeeper.WithDataProvider(provider))
+    gatekeeper.WithDataProvider(provider),
+    // A policy which reads the cluster from inside a comprehension could
+    // otherwise launch a goroutine per element.
+    gatekeeper.MaxConcurrentLookups(8))
 ```
 
+A provider which answers a batch more cheaply than the requests one at a time
+also implements `BatchDataProvider`. That is used for the reads a policy makes
+through the data namespace, which are index operations rather than calls and so
+cannot be asynchronous: they yield an unknown value, which CEL propagates
+without failing the expression, so one pass gathers the reads the policy
+reached and the next runs with the answers. Reads which depend on earlier
+results resolve in later passes.
+
+Whichever route a policy takes:
+
+* An object read by two expressions is fetched once, and two reads of the same
+  object in flight at the same time wait on one call rather than making two.
+* A policy which makes a lookup with no provider configured fails its review
+  naming the lookup, rather than quietly deciding on absent data.
+* Cancelling the review's context abandons the lookups still running.
+
+Since an environment which declares an asynchronous function yields programs
+that only `ConcurrentEval` can run, a tool which evaluates a policy with `Eval`
+— the CEL test runner among them — asks for `SynchronousLookups()`, which binds
+the same functions to blocking implementations.
+
 For tests, `StaticProvider` answers from a fixed set of objects, so a test
-states the cluster it expects a decision under rather than arranging one. A
-policy which makes a lookup with no provider configured fails its review naming
-the lookup, rather than quietly deciding on absent data.
+states the cluster it expects a decision under rather than arranging one.
 
 ## What is not modeled
 

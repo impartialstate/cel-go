@@ -42,8 +42,15 @@ type StaticProvider struct {
 	MissingProviderError error
 }
 
-// Resolve answers a batch of lookups from the objects the provider holds.
-func (p *StaticProvider) Resolve(_ context.Context, requests []Request) ([]Response, error) {
+// Resolve answers a lookup from the objects the provider holds.
+func (p *StaticProvider) Resolve(_ context.Context, request Request) (any, error) {
+	response := p.resolve(request)
+	return response.Value, response.Err
+}
+
+// ResolveBatch answers a set of lookups, which the provider holds already and
+// so can answer without waiting.
+func (p *StaticProvider) ResolveBatch(_ context.Context, requests []Request) ([]Response, error) {
 	responses := make([]Response, 0, len(requests))
 	for _, req := range requests {
 		responses = append(responses, p.resolve(req))

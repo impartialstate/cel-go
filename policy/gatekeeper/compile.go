@@ -142,7 +142,7 @@ func Compile(src *policy.Source, opts ...Option) (*Template, error) {
 		if iss.Err() != nil {
 			return nil, iss.Err()
 		}
-		prg, err := env.Program(ast)
+		prg, err := env.Program(ast, c.programOptions()...)
 		if err != nil {
 			return nil, fmt.Errorf("validation %d: %w", i, err)
 		}
@@ -239,6 +239,11 @@ func (t *Template) Review(ctx context.Context, r Review) ([]Violation, error) {
 	// The lookups of a review are resolved once and shared by its validations,
 	// so a policy which reads the same object from two validations reads it
 	// once.
+	// Evaluation runs asynchronous calls on their own goroutines, which are
+	// abandoned when the review returns, so they are cancelled rather than left
+	// running.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	data := newResolver(t.config.provider)
 	vars := r.activation()
 	vars[InventoryVar] = &inventoryValue{resolver: data}
@@ -264,46 +269,74 @@ func (t *Template) Review(ctx context.Context, r Review) ([]Violation, error) {
 // evaluate runs the validations of a template, resolving the referential data
 // they read.
 //
-// A lookup which has not been answered evaluates to an unknown value, which CEL
-// propagates without failing the expression. Every validation is evaluated
-// before anything is fetched, so a round gathers the lookups the whole policy
-// can reach and fetches them together: a policy whose validations each read the
-// cluster makes one call to the provider, not one per validation. A lookup an
-// expression short-circuits past is never fetched, and a lookup which depends
-// on an earlier result resolves in a later round.
+// The validations are independent, so they are evaluated together and the
+// lookups they make overlap. Each is evaluated concurrently: the inventory
+// functions block on their own goroutines until the provider answers, and the
+// evaluator carries on with the rest of the expression meanwhile.
+//
+// The reads a policy makes through the data namespace are index operations
+// rather than calls, which cannot be asynchronous. They yield an unknown value
+// instead, which CEL propagates without failing the expression, so a pass
+// gathers the reads the policy reached and the next one runs with the answers.
+// A read the policy short-circuits past is never fetched, and one which depends
+// on an earlier result resolves in a later pass.
 func (t *Template) evaluate(ctx context.Context, data *resolver, vars map[string]any) ([]ref.Val, error) {
 	results := make([]ref.Val, len(t.validations))
 	for round := 0; round < t.config.maxRounds; round++ {
-		unresolved := 0
+		outcomes := make(chan validationOutcome, len(t.validations))
+		launched := 0
 		for i, v := range t.validations {
 			if results[i] != nil {
 				continue
 			}
-			out, _, err := v.program.ContextEval(ctx, vars)
-			if err != nil {
-				return nil, fmt.Errorf("validation %d: %w", i, err)
-			}
-			if types.IsUnknown(out) {
+			launched++
+			go func(index int, program cel.Program) {
+				outcomes <- validationOutcome{index: index, result: <-program.ConcurrentEval(ctx, vars)}
+			}(i, v.program)
+		}
+		if launched == 0 {
+			return results, nil
+		}
+		unresolved := 0
+		var failure error
+		for n := 0; n < launched; n++ {
+			outcome := <-outcomes
+			switch {
+			case outcome.result.Err != nil:
+				if failure == nil {
+					failure = fmt.Errorf("validation %d: %w", outcome.index, outcome.result.Err)
+				}
+			case types.IsUnknown(outcome.result.Val):
 				unresolved++
-				continue
+			default:
+				results[outcome.index] = outcome.result.Val
 			}
-			results[i] = out
+		}
+		if failure != nil {
+			return nil, failure
 		}
 		if unresolved == 0 {
 			return results, nil
 		}
 		if !data.hasPending() {
 			// The policy cannot make progress: an unknown reached the result of
-			// a validation without a lookup to resolve it.
+			// a validation without a read to resolve it.
 			return nil, fmt.Errorf("evaluation produced an unresolved value")
 		}
-		if err := data.fetch(ctx); err != nil {
+		if err := data.fetchPending(ctx); err != nil {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("referential data did not resolve after %d rounds, "+
-		"which means the policy's lookups depend on each other more deeply than MaxDataRounds allows",
-		t.config.maxRounds)
+	return nil, fmt.Errorf("referential data did not resolve after %d passes, "+
+		"which means the policy's reads through the data namespace depend on each other "+
+		"more deeply than MaxDataRounds allows", t.config.maxRounds)
+}
+
+// validationOutcome carries the result of one validation back to the review
+// which is evaluating them together.
+type validationOutcome struct {
+	index  int
+	result cel.EvalResult
 }
 
 // activation binds the variables of the Gatekeeper admission engine. Inputs

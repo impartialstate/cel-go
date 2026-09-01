@@ -105,14 +105,11 @@ func TestRegoShapedReads(t *testing.T) {
 }
 
 // TestRegoReadsAreBatched confirms that the inventory reads a policy makes
-// through the data namespace are gathered into one call to the provider, the
-// same as the reads it makes through the functions.
+// through the data namespace are gathered into one call to the provider, while
+// the query it makes through the external data builtin runs asynchronously
+// alongside them.
 func TestRegoReadsAreBatched(t *testing.T) {
-	var batches [][]Request
-	provider := &recordingProvider{
-		record:   func(reqs []Request) { batches = append(batches, reqs) },
-		provider: regoCluster(),
-	}
+	provider := &recordingProvider{provider: regoCluster()}
 	tmpl := compileTemplate(t, "k8sregoinventory", WithDataProvider(provider))
 	if _, err := tmpl.Review(context.Background(), Review{
 		Object:     regoPod("prod", map[string]any{"app": "web"}, "registry.example.com/web:1.0"),
@@ -120,11 +117,15 @@ func TestRegoReadsAreBatched(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Review() failed: %v", err)
 	}
-	if len(batches) != 1 {
-		t.Fatalf("provider was called %d times with %v, wanted a single batch", len(batches), batches)
+	singles, batches := provider.calls()
+	if batches != 1 {
+		t.Fatalf("provider answered %d batches, wanted the reads through the data namespace gathered into one", batches)
 	}
-	if len(batches[0]) != 3 {
-		t.Errorf("batch holds %d requests, wanted the two inventory reads and the provider query", len(batches[0]))
+	if got := len(provider.batches[0]); got != 2 {
+		t.Errorf("batch holds %d requests, wanted the two inventory reads", got)
+	}
+	if singles != 1 {
+		t.Errorf("provider answered %d lookups outside the batch, wanted only the external data query", singles)
 	}
 }
 

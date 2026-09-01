@@ -16,10 +16,10 @@ package gatekeeper
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func ingress(namespace, name string, hosts ...string) map[string]any {
@@ -105,50 +105,20 @@ func TestReviewWithoutProvider(t *testing.T) {
 	}
 }
 
-// TestReviewBatchesLookups confirms that the lookups a policy makes are
-// gathered and resolved together, rather than one round trip at a time.
-func TestReviewBatchesLookups(t *testing.T) {
-	var mu sync.Mutex
-	var batches [][]Request
-	provider := &recordingProvider{
-		record: func(reqs []Request) {
-			mu.Lock()
-			defer mu.Unlock()
-			batches = append(batches, reqs)
-		},
-		provider: &StaticProvider{Objects: []any{ingress("prod", "web", "example.com")}},
-	}
-	tmpl := compileTemplate(t, "k8smultilookup", WithDataProvider(provider))
-	if _, err := tmpl.Review(context.Background(), Review{
-		Object: map[string]any{
-			"apiVersion": "v1",
-			"kind":       "Pod",
-			"metadata":   map[string]any{"namespace": "dev", "name": "nginx"},
-		},
-	}); err != nil {
-		t.Fatalf("Review() failed: %v", err)
-	}
-	if len(batches) != 1 {
-		t.Fatalf("provider was called %d times with %v, wanted a single batch", len(batches), batches)
-	}
-	if len(batches[0]) != 2 {
-		t.Errorf("batch holds %d requests, wanted the policy's two independent lookups", len(batches[0]))
-	}
-}
-
-// TestReviewParallelProvider confirms the batch adapter resolves the requests
-// of a batch concurrently: neither lookup returns until both have started.
-func TestReviewParallelProvider(t *testing.T) {
+// TestReviewLookupsRunConcurrently confirms that the lookups a policy makes are
+// in flight at the same time: neither returns until both have started, which a
+// provider called one lookup after another could not satisfy.
+func TestReviewLookupsRunConcurrently(t *testing.T) {
 	started := make(chan struct{}, 2)
-	provider := Parallel(DataProviderFunc(func(ctx context.Context, req Request) (any, error) {
+	provider := DataProviderFunc(func(ctx context.Context, req Request) (any, error) {
 		started <- struct{}{}
 		<-ctx.Done()
 		return nil, ctx.Err()
-	}), 0)
+	})
 	tmpl := compileTemplate(t, "k8smultilookup", WithDataProvider(provider))
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		// Both lookups of the batch are in flight before either can return.
+		// Both lookups are in flight before either can return.
 		<-started
 		<-started
 		cancel()
@@ -160,12 +130,39 @@ func TestReviewParallelProvider(t *testing.T) {
 			"metadata":   map[string]any{"namespace": "dev", "name": "nginx"},
 		},
 	})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Review() error is %v, wanted the cancelled context", err)
+	if err == nil {
+		t.Fatal("Review() succeeded, wanted the cancelled context to fail it")
 	}
 }
 
-// TestReviewChainedLookups confirms that a lookup which depends on the result
+// TestReviewSharesAnswers confirms that an object read by more than one
+// expression is fetched once, whichever of them reaches it first.
+func TestReviewSharesAnswers(t *testing.T) {
+	provider := &recordingProvider{
+		provider: &StaticProvider{Objects: []any{ingress("prod", "web", "example.com")}},
+	}
+	tmpl := compileTemplate(t, "k8srepeatedlookup", WithDataProvider(provider))
+	violations, err := tmpl.Review(context.Background(), Review{
+		Object: map[string]any{
+			"apiVersion": "v1",
+			"kind":       "Pod",
+			"metadata":   map[string]any{"namespace": "prod", "name": "nginx"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Review() failed: %v", err)
+	}
+	if len(violations) != 0 {
+		t.Errorf("Review() got %v, wanted no violations", messages(violations))
+	}
+	singles, batches := provider.calls()
+	if singles != 1 || batches != 0 {
+		t.Errorf("provider answered %d lookups in %d batches, wanted the repeated read fetched once",
+			singles, batches)
+	}
+}
+
+// TestReviewChainedLookups confirms// TestReviewChainedLookups confirms that a lookup which depends on the result
 // of an earlier one is resolved in a later round.
 func TestReviewChainedLookups(t *testing.T) {
 	cluster := &StaticProvider{
@@ -185,11 +182,7 @@ func TestReviewChainedLookups(t *testing.T) {
 			},
 		},
 	}
-	var rounds int
-	provider := &recordingProvider{
-		record:   func([]Request) { rounds++ },
-		provider: cluster,
-	}
+	provider := &recordingProvider{provider: cluster}
 	tmpl := compileTemplate(t, "k8schainedlookup", WithDataProvider(provider))
 	pod := func(namespace string) map[string]any {
 		return map[string]any{
@@ -205,8 +198,9 @@ func TestReviewChainedLookups(t *testing.T) {
 	if len(violations) != 0 {
 		t.Errorf("Review() got %v, wanted no violations", messages(violations))
 	}
-	if rounds != 2 {
-		t.Errorf("provider was called %d times, wanted one round per dependent lookup", rounds)
+	if singles, batches := provider.calls(); singles != 2 || batches != 0 {
+		t.Errorf("provider answered %d lookups in %d batches, wanted one call per dependent lookup",
+			singles, batches)
 	}
 	violations, err = tmpl.Review(context.Background(), Review{Object: pod("unlabelled")})
 	if err != nil {
@@ -279,12 +273,70 @@ func TestReviewExternalData(t *testing.T) {
 	}
 }
 
+// recordingProvider notes how a provider is called: one lookup at a time for
+// the asynchronous inventory functions, and a batch for the reads a policy
+// makes through the data namespace.
 type recordingProvider struct {
-	record   func([]Request)
-	provider DataProvider
+	provider *StaticProvider
+
+	mu      sync.Mutex
+	singles []Request
+	batches [][]Request
 }
 
-func (p *recordingProvider) Resolve(ctx context.Context, requests []Request) ([]Response, error) {
-	p.record(requests)
-	return p.provider.Resolve(ctx, requests)
+func (p *recordingProvider) Resolve(ctx context.Context, request Request) (any, error) {
+	p.mu.Lock()
+	p.singles = append(p.singles, request)
+	p.mu.Unlock()
+	return p.provider.Resolve(ctx, request)
+}
+
+func (p *recordingProvider) ResolveBatch(ctx context.Context, requests []Request) ([]Response, error) {
+	p.mu.Lock()
+	p.batches = append(p.batches, requests)
+	p.mu.Unlock()
+	return p.provider.ResolveBatch(ctx, requests)
+}
+
+func (p *recordingProvider) calls() (int, int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.singles), len(p.batches)
+}
+
+// TestMaxConcurrentLookups confirms that the bound on lookups in flight is
+// honored: with a bound of one, the second lookup of a policy does not start
+// until the first has returned.
+func TestMaxConcurrentLookups(t *testing.T) {
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	provider := DataProviderFunc(func(ctx context.Context, req Request) (any, error) {
+		started <- struct{}{}
+		<-release
+		return []any{}, nil
+	})
+	tmpl := compileTemplate(t, "k8smultilookup",
+		WithDataProvider(provider), MaxConcurrentLookups(1))
+	done := make(chan error, 1)
+	go func() {
+		_, err := tmpl.Review(context.Background(), Review{
+			Object: map[string]any{
+				"apiVersion": "v1",
+				"kind":       "Pod",
+				"metadata":   map[string]any{"namespace": "dev", "name": "nginx"},
+			},
+		})
+		done <- err
+	}()
+	<-started
+	select {
+	case <-started:
+		close(release)
+		t.Fatal("a second lookup started while one was in flight, wanted the bound honored")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("Review() failed: %v", err)
+	}
 }

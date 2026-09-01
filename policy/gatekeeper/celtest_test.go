@@ -33,7 +33,12 @@ func TestTemplateWithCELTestRunner(t *testing.T) {
 	// separately here, so they share one registry of schema types: the types a
 	// template derives from its schemas must be known to the environment its
 	// programs are planned against.
-	opts := []gatekeeper.Option{gatekeeper.WithSchemaTypes(gatekeeper.NewSchemaTypes(nil))}
+	// The test runner evaluates programs with Eval, which cannot run the
+	// asynchronous lookups, so the environment declares their blocking form.
+	opts := []gatekeeper.Option{
+		gatekeeper.WithSchemaTypes(gatekeeper.NewSchemaTypes(nil)),
+		gatekeeper.SynchronousLookups(),
+	}
 	compilerOpts := []any{
 		gatekeeper.ParserOption(opts...),
 		compiler.PolicyMetadataEnvOption(gatekeeper.EnvOptionFromMetadata(opts...)),
