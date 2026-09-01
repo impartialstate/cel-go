@@ -1,0 +1,60 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# A test suite in the format Gatekeeper's gator tool reads, run against the CEL
+# of the templates rather than against a cluster.
+kind: Suite
+apiVersion: test.gatekeeper.sh/v1alpha1
+tests:
+  - name: required-labels
+    template: ../k8srequiredlabels/template.yaml
+    constraint: constraint-required-labels.yaml
+    cases:
+      - name: labelled-pod
+        object: pod-labelled.yaml
+        assertions:
+          - violations: no
+      - name: unlabelled-pod
+        object: pod-unlabelled.yaml
+        assertions:
+          - violations: 1
+            message: "missing required label"
+      - name: malformed-label-value
+        object: pod-malformed-label.yaml
+        assertions:
+          - violations: yes
+            message: "regex mismatch"
+  - name: unique-ingress-host
+    template: ../k8suniqueingresshost/template.yaml
+    constraint: constraint-unique-host.yaml
+    cases:
+      - name: host-claimed-by-another-namespace
+        object: ingress-conflicting.yaml
+        inventory:
+          - inventory.yaml
+        assertions:
+          - violations: yes
+            message: "already claimed by: prod/web"
+      - name: unclaimed-host
+        object: ingress-unique.yaml
+        inventory:
+          - inventory.yaml
+        assertions:
+          - violations: no
+      - name: deleting-an-ingress-does-not-conflict-with-itself
+        object: review-delete.yaml
+        inventory:
+          - inventory.yaml
+        assertions:
+          - violations: no
