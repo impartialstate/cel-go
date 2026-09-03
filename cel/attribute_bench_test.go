@@ -71,13 +71,23 @@ package cel
 //     boxing; an int64 small enough for the runtime's cache never allocated.
 //     Fused, `attr == const` costs about what resolving the attribute alone
 //     costs -- the comparison becomes free. The price is observability: the
-//     fused node absorbs an id, so state tracking sees one fewer node. See
-//     TestFuseAttrEqualsLosesObservability.
+//     fused node absorbs an id, so state tracking sees one fewer node, and
+//     runtime cost is undercounted by the charges its children would have
+//     made. Declaring the fused node an InterpretableCall does not recover
+//     the cost: the observer pops argument values off a stack keyed by node
+//     id, and absorbed children never push. Charging directly is possible,
+//     but only from inside package interpreter (asCostTracker and
+//     CostTracker.cost are unexported) and only under the default cost model,
+//     since a custom ActualCostEstimator is handed []ref.Val and would force
+//     back the very boxing fusion removes. See
+//     TestFuseAttrEqualsLosesObservability, TestFuseAttrEqualsUndercountsCost
+//     and TestEqualsCostIsDataDependent.
 
 import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/google/cel-go/common/operators"
@@ -884,4 +894,113 @@ func TestFuseAttrEqualsLosesObservability(t *testing.T) {
 		t.Errorf("fused plan tracked %d ids, wanted fewer than the unfused %d; if fusion "+
 			"has become observability-preserving, update this test and the note above", fused, plain)
 	}
+}
+
+// TestFuseAttrEqualsUndercountsCost pins down what fusion does to runtime cost,
+// which is stricter than the observability question above: a wrong cost is a
+// wrong answer, not just a missing trace.
+//
+// The cost observer charges per node by type-switching on it -- `case
+// Qualifier` adds one, `case InterpretableCall` calls costCall -- and pops the
+// call's argument values off a stack keyed by node id. A fused node absorbs its
+// children, so those children never push, and two units go missing: the
+// attribute node's Qualifier charge and the equals call itself. Per-qualifier
+// cost survives, because evalWatchAttr observes qualifiers inside Resolve
+// rather than at the node level.
+//
+// Note that declaring the fused node an InterpretableCall does not fix this:
+// the arm fires, but dropArgs cannot find the absorbed children's values on the
+// stack and adds nothing.
+func TestFuseAttrEqualsUndercountsCost(t *testing.T) {
+	env, err := NewEnv(Variable("m", mapAnyType))
+	if err != nil {
+		t.Fatalf("NewEnv() failed: %v", err)
+	}
+	ast, iss := env.Compile(`m.k0.k0 == "admin"`)
+	if iss.Err() != nil {
+		t.Fatalf("Compile() failed: %v", iss.Err())
+	}
+	vars := map[string]any{"m": map[string]any{"k0": map[string]any{"k0": "admin"}}}
+
+	cost := func(opts ...ProgramOption) uint64 {
+		t.Helper()
+		prg, err := env.Program(ast, append([]ProgramOption{CostTracking(nil)}, opts...)...)
+		if err != nil {
+			t.Fatalf("Program() failed: %v", err)
+		}
+		out, det, err := prg.Eval(vars)
+		if err != nil {
+			t.Fatalf("Eval() failed: %v", err)
+		}
+		if out != types.True {
+			t.Fatalf("Eval() got %v, wanted true", out)
+		}
+		actual := det.ActualCost()
+		if actual == nil {
+			t.Fatal("Eval() reported no actual cost")
+		}
+		return *actual
+	}
+
+	plain := cost()
+	fused := cost(CustomDecorator(fuseAttrEquals))
+	if fused >= plain {
+		t.Fatalf("fused cost %d, wanted less than the unfused %d; if fusion has become "+
+			"cost-preserving, update this test and the note above", fused, plain)
+	}
+	t.Logf("unfused cost %d, fused cost %d (%d units absorbed)", plain, fused, plain-fused)
+}
+
+// TestEqualsCostIsDataDependent shows why a fused node cannot simply add a
+// constant to make up the difference. The default model charges equality as
+// ceil(min(size(lhs), size(rhs)) * common.StringTraversalCostFactor), so the
+// charge depends on the operand values, not just on the node.
+//
+// A fused node can still compute this without boxing -- for a native Go string
+// the size is len(s) -- but only while the default model is in play. Once a
+// caller installs an ActualCostEstimator or an overload tracker, costCall hands
+// that user code []ref.Val, so an accurate charge requires materializing the
+// very ref.Val that fusion exists to avoid. A fusion pass should decline to
+// fuse when a custom estimator is configured.
+func TestEqualsCostIsDataDependent(t *testing.T) {
+	env, err := NewEnv(Variable("s", StringType))
+	if err != nil {
+		t.Fatalf("NewEnv() failed: %v", err)
+	}
+	long := strings.Repeat("a", 4096)
+	tests := []struct {
+		name string
+		expr string
+		vars map[string]any
+	}{
+		{"short-vs-short", `s == "admin"`, map[string]any{"s": "admin"}},
+		{"long-vs-short", `s == "admin"`, map[string]any{"s": long}},
+		{"long-vs-long", `s == "` + long + `"`, map[string]any{"s": long}},
+	}
+	costs := make([]uint64, len(tests))
+	for i, tc := range tests {
+		ast, iss := env.Compile(tc.expr)
+		if iss.Err() != nil {
+			t.Fatalf("Compile(%s) failed: %v", tc.name, iss.Err())
+		}
+		prg, err := env.Program(ast, CostTracking(nil))
+		if err != nil {
+			t.Fatalf("Program() failed: %v", err)
+		}
+		if _, det, err := prg.Eval(tc.vars); err != nil {
+			t.Fatalf("Eval(%s) failed: %v", tc.name, err)
+		} else {
+			costs[i] = *det.ActualCost()
+		}
+	}
+	// Cost tracks min(lhs, rhs), so comparing a long value against a short
+	// constant stays cheap, while long against long does not.
+	if costs[0] != costs[1] {
+		t.Errorf("short-vs-short cost %d and long-vs-short cost %d differ, wanted both to "+
+			"track the shorter operand", costs[0], costs[1])
+	}
+	if costs[2] <= costs[1] {
+		t.Errorf("long-vs-long cost %d, wanted more than long-vs-short %d", costs[2], costs[1])
+	}
+	t.Logf("costs: short-vs-short=%d long-vs-short=%d long-vs-long=%d", costs[0], costs[1], costs[2])
 }
