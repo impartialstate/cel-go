@@ -62,6 +62,17 @@ package cel
 //     see BenchmarkAttrActivationScale, where a slot table built from the
 //     declarations degrades to 107ns at 32 variables while one pruned by the
 //     reference map stays flat at ~22ns.
+//
+//  7. Fusing an operator with its attribute removes a boxing step. The default
+//     plan for `attr == const` resolves the attribute, wraps it in a ref.Val,
+//     and immediately unwraps it in types.Equal. A fused node that compares
+//     native Go values runs 105ns/16B/1alloc -> 73ns/0allocs for a string leaf
+//     and 82ns -> 71ns for an int. The string allocation is the types.String
+//     boxing; an int64 small enough for the runtime's cache never allocated.
+//     Fused, `attr == const` costs about what resolving the attribute alone
+//     costs -- the comparison becomes free. The price is observability: the
+//     fused node absorbs an id, so state tracking sees one fewer node. See
+//     TestFuseAttrEqualsLosesObservability.
 
 import (
 	"fmt"
@@ -69,7 +80,10 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/google/cel-go/common/operators"
 	"github.com/google/cel-go/common/types"
+	"github.com/google/cel-go/common/types/ref"
+	"github.com/google/cel-go/interpreter"
 
 	proto3pb "cel.dev/expr/conformance/proto3"
 )
@@ -597,5 +611,277 @@ func TestSlotActivationMissingVar(t *testing.T) {
 	act := newSlotActivation(ast, map[string]any{"x": int64(1)})
 	if _, _, err := prg.Eval(act); err == nil {
 		t.Fatal("Eval() succeeded with an unbound variable, wanted an error")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Operator fusion
+//
+// The default plan for `attr == const` is three nodes: evalEq drives an
+// evalAttr, which resolves the attribute and then wraps the native Go value in
+// a ref.Val via NativeToValue, only for types.Equal to unwrap it again.
+//
+// InterpretableAttribute exposes Resolve, which hands back the native value
+// before that wrapping. When the checker has already fixed the comparison type
+// -- a primitive constant on one side pins it, since CEL equality is
+// homogeneous -- the plan can fuse the three nodes into one that compares
+// native Go values and never builds an intermediate ref.Val.
+//
+// This is a superinstruction: it removes a boxing step and two interface
+// dispatches per evaluation. It is a benchmark fixture, not a proposed API.
+// ---------------------------------------------------------------------------
+
+// evalAttrEqString compares a resolved attribute against a string constant
+// without boxing the attribute value.
+type evalAttrEqString struct {
+	id      int64
+	attr    interpreter.InterpretableAttribute
+	val     string
+	generic interpreter.Interpretable
+}
+
+func (e *evalAttrEqString) ID() int64 { return e.id }
+
+func (e *evalAttrEqString) Eval(ctx interpreter.Activation) ref.Val {
+	v, err := e.attr.Resolve(ctx)
+	if err != nil {
+		return types.LabelErrNode(e.id, types.WrapErr(err))
+	}
+	if s, ok := v.(string); ok {
+		if s == e.val {
+			return types.True
+		}
+		return types.False
+	}
+	// Anything else -- an alias type, an unknown, a ref.Val supplied by the
+	// activation -- keeps the semantics of the unfused plan.
+	return e.generic.Eval(ctx)
+}
+
+// evalAttrEqInt is the same fusion for int64 constants.
+type evalAttrEqInt struct {
+	id      int64
+	attr    interpreter.InterpretableAttribute
+	val     int64
+	generic interpreter.Interpretable
+}
+
+func (e *evalAttrEqInt) ID() int64 { return e.id }
+
+func (e *evalAttrEqInt) Eval(ctx interpreter.Activation) ref.Val {
+	v, err := e.attr.Resolve(ctx)
+	if err != nil {
+		return types.LabelErrNode(e.id, types.WrapErr(err))
+	}
+	if i, ok := v.(int64); ok {
+		if i == e.val {
+			return types.True
+		}
+		return types.False
+	}
+	return e.generic.Eval(ctx)
+}
+
+// fuseAttrEquals rewrites `attr == <primitive const>` into a fused node. The
+// constant's type is what pins the comparison: CEL equality is homogeneous, so
+// a string constant on one side means the checker proved both sides are
+// strings.
+func fuseAttrEquals(i interpreter.Interpretable) (interpreter.Interpretable, error) {
+	call, ok := i.(interpreter.InterpretableCall)
+	if !ok || call.Function() != operators.Equals {
+		return i, nil
+	}
+	args := call.Args()
+	if len(args) != 2 {
+		return i, nil
+	}
+	// Accept the constant on either side; equality is commutative.
+	attr, isAttr := args[0].(interpreter.InterpretableAttribute)
+	konst, isConst := args[1].(interpreter.InterpretableConst)
+	if !isAttr || !isConst {
+		attr, isAttr = args[1].(interpreter.InterpretableAttribute)
+		konst, isConst = args[0].(interpreter.InterpretableConst)
+	}
+	if !isAttr || !isConst {
+		return i, nil
+	}
+	switch v := konst.Value().(type) {
+	case types.String:
+		return &evalAttrEqString{id: call.ID(), attr: attr, val: string(v), generic: i}, nil
+	case types.Int:
+		return &evalAttrEqInt{id: call.ID(), attr: attr, val: int64(v), generic: i}, nil
+	}
+	return i, nil
+}
+
+func BenchmarkAttrFusedEquals(b *testing.B) {
+	strLeaf := map[string]any{"m": map[string]any{"k0": map[string]any{"k0": "admin"}}}
+	intLeaf := map[string]any{"m": nestedAny(2)}
+
+	cases := []struct {
+		name string
+		expr string
+		vars map[string]any
+		want bool
+	}{
+		{"string/match", `m.k0.k0 == "admin"`, strLeaf, true},
+		{"string/no-match", `m.k0.k0 == "viewer"`, strLeaf, false},
+		{"int/match", "m.k0.k0 == 0", intLeaf, true},
+	}
+	for _, tc := range cases {
+		for _, fused := range []bool{false, true} {
+			label := tc.name + "/unfused"
+			if fused {
+				label = tc.name + "/fused"
+			}
+			b.Run(label, func(b *testing.B) {
+				env, err := NewEnv(Variable("m", mapAnyType))
+				if err != nil {
+					b.Fatalf("NewEnv() failed: %v", err)
+				}
+				ast, iss := env.Compile(tc.expr)
+				if iss.Err() != nil {
+					b.Fatalf("Compile(%q) failed: %v", tc.expr, iss.Err())
+				}
+				opts := []ProgramOption{}
+				if fused {
+					opts = append(opts, CustomDecorator(fuseAttrEquals))
+				}
+				prg, err := env.Program(ast, opts...)
+				if err != nil {
+					b.Fatalf("Program() failed: %v", err)
+				}
+				out, _, err := prg.Eval(tc.vars)
+				if err != nil {
+					b.Fatalf("Eval() failed: %v", err)
+				}
+				if out != types.Bool(tc.want) {
+					b.Fatalf("Eval(%q) got %v, wanted %v", tc.expr, out, tc.want)
+				}
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					prg.Eval(tc.vars)
+				}
+			})
+		}
+	}
+}
+
+// TestFuseAttrEqualsMatchesUnfused is the differential test for the fusion
+// above: for every input the fused plan must agree with the default plan, on
+// values and on errors alike. A plan rewrite that is faster but disagrees is
+// not an optimization.
+func TestFuseAttrEqualsMatchesUnfused(t *testing.T) {
+	type namedString string
+
+	reg, err := types.NewRegistry()
+	if err != nil {
+		t.Fatalf("NewRegistry() failed: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		expr string
+		vars map[string]any
+	}{
+		{"string-match", `m.k0 == "admin"`, map[string]any{"m": map[string]any{"k0": "admin"}}},
+		{"string-no-match", `m.k0 == "admin"`, map[string]any{"m": map[string]any{"k0": "viewer"}}},
+		{"const-on-lhs", `"admin" == m.k0`, map[string]any{"m": map[string]any{"k0": "admin"}}},
+		{"int-match", "m.k0 == 42", map[string]any{"m": map[string]any{"k0": int64(42)}}},
+		{"int-no-match", "m.k0 == 42", map[string]any{"m": map[string]any{"k0": int64(7)}}},
+		// Heterogeneous comparison: the leaf is not the constant's type.
+		{"type-mismatch", `m.k0 == "admin"`, map[string]any{"m": map[string]any{"k0": int64(42)}}},
+		// The native value is not a plain Go string, so the fused fast path
+		// must decline and defer to the generic comparison.
+		{"named-string-leaf", `m.k0 == "admin"`, map[string]any{"m": map[string]any{"k0": namedString("admin")}}},
+		{"refval-leaf", `m.k0 == "admin"`, map[string]any{"m": map[string]any{"k0": reg.NativeToValue("admin")}}},
+		// Error paths.
+		{"missing-key", `m.absent == "admin"`, map[string]any{"m": map[string]any{"k0": "admin"}}},
+		{"missing-root", `m.k0 == "admin"`, map[string]any{}},
+		// Typed map rather than map[string]any.
+		{"typed-map", `m.k0 == "admin"`, map[string]any{"m": map[string]string{"k0": "admin"}}},
+		// A large int, which does not fit the runtime's small-value cache.
+		{"large-int", "m.k0 == 1000000", map[string]any{"m": map[string]any{"k0": int64(1000000)}}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env, err := NewEnv(Variable("m", mapAnyType))
+			if err != nil {
+				t.Fatalf("NewEnv() failed: %v", err)
+			}
+			ast, iss := env.Compile(tc.expr)
+			if iss.Err() != nil {
+				t.Fatalf("Compile(%q) failed: %v", tc.expr, iss.Err())
+			}
+			plain, err := env.Program(ast)
+			if err != nil {
+				t.Fatalf("Program() failed: %v", err)
+			}
+			fused, err := env.Program(ast, CustomDecorator(fuseAttrEquals))
+			if err != nil {
+				t.Fatalf("Program(fused) failed: %v", err)
+			}
+
+			wantVal, _, wantErr := plain.Eval(tc.vars)
+			gotVal, _, gotErr := fused.Eval(tc.vars)
+
+			if (wantErr == nil) != (gotErr == nil) {
+				t.Fatalf("Eval() error mismatch: unfused %v, fused %v", wantErr, gotErr)
+			}
+			if wantErr != nil {
+				if gotErr.Error() != wantErr.Error() {
+					t.Errorf("Eval() error got %q, wanted %q", gotErr, wantErr)
+				}
+				return
+			}
+			if gotVal.Equal(wantVal) != types.True {
+				t.Errorf("Eval() got %v (%T), wanted %v (%T)", gotVal, gotVal, wantVal, wantVal)
+			}
+		})
+	}
+}
+
+// TestFuseAttrEqualsLosesObservability records the cost of collapsing nodes.
+// Fusing `attr == const` removes the intermediate attribute node from the
+// plan, so an observer -- state tracking, exhaustive eval, cost tracking --
+// sees one fewer id. Any real fusion pass has to either decline to fuse when
+// observers are installed, or report the ids it absorbed.
+func TestFuseAttrEqualsLosesObservability(t *testing.T) {
+	env, err := NewEnv(Variable("m", mapAnyType))
+	if err != nil {
+		t.Fatalf("NewEnv() failed: %v", err)
+	}
+	ast, iss := env.Compile(`m.k0 == "admin"`)
+	if iss.Err() != nil {
+		t.Fatalf("Compile() failed: %v", iss.Err())
+	}
+	vars := map[string]any{"m": map[string]any{"k0": "admin"}}
+
+	trackedIDs := func(opts ...ProgramOption) int {
+		t.Helper()
+		prg, err := env.Program(ast, append([]ProgramOption{EvalOptions(OptTrackState)}, opts...)...)
+		if err != nil {
+			t.Fatalf("Program() failed: %v", err)
+		}
+		out, det, err := prg.Eval(vars)
+		if err != nil {
+			t.Fatalf("Eval() failed: %v", err)
+		}
+		if out != types.True {
+			t.Fatalf("Eval() got %v, wanted true", out)
+		}
+		if det == nil || det.State() == nil {
+			t.Fatal("Eval() returned no eval state")
+		}
+		return len(det.State().IDs())
+	}
+
+	plain := trackedIDs()
+	fused := trackedIDs(CustomDecorator(fuseAttrEquals))
+	if fused >= plain {
+		t.Errorf("fused plan tracked %d ids, wanted fewer than the unfused %d; if fusion "+
+			"has become observability-preserving, update this test and the note above", fused, plain)
 	}
 }
