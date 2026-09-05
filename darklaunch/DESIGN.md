@@ -44,7 +44,7 @@ top of `cel.Program`.
 | Execution | Asynchronous, off the request path, each candidate under its own `context.Context` with an independent budget |
 | Input safety | Caller guarantees the input is immutable and safe for concurrent read for the lifetime of the async work |
 | Packaging | `cel/darklaunch.go` holds probes + evaluator hooks; `darklaunch/` is a **separate Go module** holding the runner, comparator, records and sinks |
-| Node alignment | Author-written `trace('name', <expr>)` — a real function, identity binding by default |
+| Node alignment | Author-written `trace('name', <expr>)` — a real function, declared **non-strict** and **late-bound**, with an identity binding installed by the library |
 | Divergence | Layered: value equality / normalized error class / unknown attribute set |
 | Output | Per-evaluation `Record` to a `Sink`, plus an in-process aggregate snapshot |
 
@@ -137,22 +137,31 @@ The dependency edge points one way: `darklaunch` imports `cel`. Nothing in
 
 ### 5.1 Shape
 
+`trace` is a real, declared, type-checked function whose value is the identity
+on its second argument. It is declared **non-strict** and **late-bound**:
+
 ```go
-// cel/darklaunch.go
+// cel/darklaunch.go — CompileOptions()
 paramT := TypeParamType("T")
 Function("trace",
     FunctionDocs("records the value of an expression for dark-launch analysis; returns it unchanged"),
     Overload("trace_string_dyn", []*Type{StringType, paramT}, paramT,
         OverloadExamples(`trace('is_member', request.user in allowed_users) // -> true`),
-        BinaryBinding(func(_, val ref.Val) ref.Val { return val })),
-)
+        OverloadIsNonStrict(),
+        LateFunctionBinding()))
 ```
 
-`trace` is a real, declared, type-checked function whose default binding is the
-identity on its second argument. It appears in the source text of both the
-control and the candidate, so the two expressions stay comparable and both
-unparse cleanly. In production, with no dark launch configured, the only cost
-is one extra call frame.
+```go
+// cel/darklaunch.go — ProgramOptions()
+Functions(&functions.Overload{
+    Operator:  "trace_string_dyn",
+    Binary:    func(_, val ref.Val) ref.Val { return val },
+    NonStrict: true,
+})
+```
+
+It appears in the source text of both the control and the candidate, so the two
+expressions stay comparable and both unparse cleanly:
 
 ```
 control:    trace('member', user in allowed) && trace('fresh', age < duration('5m'))
@@ -162,25 +171,89 @@ candidate:  trace('fresh', age < duration('5m')) && trace('member', user in allo
 The comparator aligns `member` with `member` and `fresh` with `fresh` even
 though the operands were reordered and the expression IDs share nothing.
 
-### 5.2 Constant names are enforced at compile time
+### 5.2 Non-strict: the probe must be transparent to errors and unknowns
 
-A dynamic probe name gives unbounded metric cardinality and unstable
-alignment. A `cel.ASTValidator` shipped with the library rejects any `trace`
-call whose first argument is not a string literal, so the failure is a compile
-error for everyone rather than a surprise when probes are switched on.
+`evalBinary.Eval` (interpreter/interpretable.go:507) evaluates both arguments
+and then, **only when strict**, returns early if either is an error or an
+unknown — the implementation is never reached. A strict `trace` would therefore
+have two distinct evaluation paths: identity-via-binding for ordinary values,
+and an early return that bypasses the binding entirely for errors and unknowns.
 
-### 5.3 Recording is a planner decorator, not a rebinding
+Non-strict collapses that to one path. Every value, including `*types.Err` and
+`*types.Unknown`, flows through the same identity binding, which makes "the
+probe observes exactly what the node returns" a structural property rather than
+a coincidence of two paths happening to agree today. It is also the honest
+declaration: `trace` is an observation point and must never be the reason an
+error or an unknown stops propagating.
 
-Swapping the identity binding for a recording binding looks simpler, but
-`trace` is a strict function: if the traced subexpression errors, the binding
-is never invoked and the probe silently disappears exactly when it is most
-interesting.
+Two mechanical notes:
 
-So recording is a `StatefulObserver` + decorator pair modelled directly on
-`CostObserver` (interpreter/runtimecost.go:50), with one deliberate
-difference. `decObserveEval` wraps every planned node; `decObserveProbes`
-returns the node unchanged unless it is an `InterpretableCall` with
-`Function() == "trace"`:
+- `OverloadIsNonStrict()` on the *declaration* and `NonStrict: true` on the
+  *installed* `functions.Overload` are different switches. The planner reads
+  `impl.NonStrict` from the dispatcher entry (interpreter/planner.go:365), and a
+  late-bound declaration contributes no dispatcher entry of its own — so the
+  declaration flag alone would be inert. Both must be set: the declaration for
+  checker and documentation consistency, the installed overload for actual
+  runtime behaviour.
+- On the non-strict path the result passes through
+  `types.LabelErrNode(bin.id, ...)`, which stamps the trace node's ID onto an
+  error only when the error carries no ID yet (common/types/err.go:81). Errors
+  raised by ordinary nodes are already labelled, so attribution is unchanged;
+  an unlabelled error surfacing through a probe gains the probe's ID, which is
+  the more useful attribution anyway.
+
+### 5.3 Late binding: fold exemption for free, and a per-program swap point
+
+`cel.NewConstantFoldingOptimizer` would otherwise fold `trace('n', 1 + 2)` to
+`3` and erase the probe. The folder already skips late-bound calls —
+`isLateBoundFunctionCall` (cel/folding.go:171) consults
+`FunctionDecl.HasLateBinding()`, and the check is applied both to direct folds
+(cel/folding.go:100) and inside comprehensions (cel/folding.go:521). Declaring
+`trace` late-bound therefore buys the fold exemption with **no change to
+cel/folding.go at all**, using a mechanism whose documented purpose — functions
+that are side-effecting or not deterministically computable — describes `trace`
+exactly.
+
+Late binding also moves the implementation from a compile-time property of the
+declaration to a per-program input, which is what makes an identity binding in
+production and a recording binding under dark launch expressible at all (§5.5).
+
+Three constraints come with it, all load-bearing:
+
+- **`LateFunctionBinding()` and `BinaryBinding()` are mutually exclusive**
+  (common/decls/decls.go:878), as is `SingletonBinaryBinding`
+  (common/decls/decls.go:357). The declaration carries no implementation; the
+  implementation is installed separately.
+- **A missing binding is a runtime failure, not a compile failure.**
+  `FunctionDecl.Bindings()` emits nothing for a late-bound overload
+  (common/decls/decls.go:339), and `planCallBinary` accepts a nil
+  implementation without error (interpreter/planner.go:359) — the program plans
+  cleanly and then fails at evaluation with `no such overload: trace`. This is
+  why the identity binding is supplied by the library's own `ProgramOptions()`
+  rather than left to the caller: `cel.Lib(ProbeLibrary())` installs the
+  declaration and the binding together, and there is no configuration in which
+  one arrives without the other.
+- **A binding cannot be layered over an existing one.**
+  `defaultDispatcher.Add` rejects a duplicate operator
+  (interpreter/dispatcher.go:63), so a second `cel.Functions()` call cannot
+  override the identity binding. Any binding swap has to be chosen when the
+  library is constructed — `ProbeLibrary(WithRecorder(rec))` — not bolted on
+  afterwards.
+
+### 5.4 Recording is a planner decorator
+
+Recording lives in a `StatefulObserver` + decorator pair modelled on
+`CostObserver` (interpreter/runtimecost.go:50), not in the binding, for one
+reason: **a `functions.BinaryOp` receives no `Activation`.** Per-evaluation
+state has to be reachable from the activation — that is how `EvalState` and
+`CostTracker` stay concurrency-safe when one `Program` serves many simultaneous
+evaluations — and a binding has no way to reach it. A recorder closed over by
+the binding would be shared mutable state across concurrent evaluations of the
+same program.
+
+The decorator differs from `decObserveEval` in one deliberate way: that one
+wraps every planned node, whereas `decObserveProbes` returns the node unchanged
+unless it is an `InterpretableCall` named `trace`:
 
 ```go
 func decObserveProbes(observer EvalObserver) InterpretableDecorator {
@@ -196,20 +269,42 @@ func decObserveProbes(observer EvalObserver) InterpretableDecorator {
 
 Probe tracing is therefore O(number of probes), not O(number of nodes) — the
 whole reason for named probes rather than `OptTrackState` plus offline
-alignment. It also observes the node's *result*, so an error or an unknown
-flowing out of a traced subexpression is captured like any other value.
+alignment. Because the decorator wraps the node rather than the implementation,
+it observes the node's result and so captures errors and unknowns regardless of
+strictness; non-strict guarantees that result and the binding's input are the
+same value on every path.
 
-### 5.4 `trace()` must not be folded away
+### 5.5 Alternative unlocked by non-strict + late binding: record in the binding
 
-`cel.NewConstantFoldingOptimizer` will happily fold `trace('n', 1 + 2)` to `3`
-and erase the probe. The folder already exempts late-bound calls
-(cel/folding.go:100, :521); this needs an equivalent, explicit exemption —
-either a non-foldable marker on the function declaration or a name check in
-`constantCallMatcher`. A declaration-level marker is preferable: it is
-reusable by any function whose value is in being observed rather than in its
-result.
+The two changes together make binding-based recording viable, and it is worth
+stating explicitly because it would remove nearly all of the core plumbing:
+late binding supplies the swap point (identity in production, recorder under
+dark launch), and non-strict guarantees the recorder is invoked for errors and
+unknowns rather than being bypassed. `interpreter/probes.go`, `OptTrackProbes`
+and `EvalDetails.Probes()` would all disappear, leaving the `trace` declaration
+as the only addition to the root module.
 
-### 5.5 Probes inside comprehensions
+The blocker is the missing `Activation`, and there is exactly one way around
+it: give each background worker its own program instances, so a recorder is
+owned by a single goroutine and needs no synchronisation. With a fixed worker
+pool that is `workers × candidates` plans held in memory, and programs are
+planned once at candidate registration.
+
+Recommendation: keep the decorator as the default. It costs four additive items
+in the root module and buys shareable programs, a probe trace available to
+anyone through `EvalDetails` for ordinary debugging, and no coupling between
+the runner's concurrency model and its correctness. The binding-based variant
+is the right answer if the root-module footprint turns out to be the sticking
+point in review, and the declaration above supports either without change.
+
+### 5.6 Constant names are enforced at compile time
+
+A dynamic probe name gives unbounded metric cardinality and unstable
+alignment. A `cel.ASTValidator` shipped with the library rejects any `trace`
+call whose first argument is not a string literal, so the failure is a compile
+error for everyone rather than a surprise when probes are switched on.
+
+### 5.7 Probes inside comprehensions
 
 A probe under `.all()` fires once per iteration. `ProbeTrace` records
 observations in evaluation order with an occurrence index rather than
@@ -217,6 +312,7 @@ collapsing them, and the comparator compares the *sequence* per name and
 reports hit-count divergence as its own signal — a candidate that produces the
 right answer while iterating a different number of times is a finding, not
 noise.
+
 
 ## 6. Input handling
 
@@ -387,16 +483,24 @@ branch inside the evaluator.
    `newProgram`'s observer block alongside `OptTrackState`/`OptTrackCost`.
 3. `cel/program.go` — `probes` field on `EvalDetails`, populated from the
    existing `ObserveEval` callback switch; `Probes()` accessor.
-4. `cel/darklaunch.go` — the `trace` library, its validator, `TrackProbes()`.
-5. `cel/folding.go` — a non-foldable marker honoured by `constantCallMatcher`.
+4. `cel/darklaunch.go` — the `trace` library (declaration, identity binding,
+   validator) and `TrackProbes()`.
 
-All five are additive. No existing program plans differently unless it opts in.
+All four are additive. No existing program plans differently unless it opts in.
+
+Nothing in `cel/folding.go` changes: declaring `trace` late-bound reuses the
+folder's existing late-binding exemption (§5.3). Adopting the binding-based
+variant in §5.5 would reduce this list to item 4 alone.
 
 ## 12. Phasing
 
-1. **Probes in core** (items 1–5 above) with unit tests, including probes under
-   comprehensions, probes wrapping erroring subexpressions, and a fold test
-   proving `trace` survives.
+1. **Probes in core** (items 1–4 above) with unit tests covering: probes under
+   comprehensions; probes wrapping subexpressions that produce errors and
+   unknowns, asserting the value is unchanged and the probe still fires; a fold
+   test proving `trace` survives `NewConstantFoldingOptimizer` with constant
+   arguments; and a negative test that a program built without the library's
+   `ProgramOptions()` fails at evaluation rather than silently dropping probes
+   (§5.3).
 2. **`darklaunch` module skeleton**: `Runner`, synchronous execution only,
    comparator, `Record`, a logging sink. Synchronous first keeps the comparator
    under test without the concurrency surface.
