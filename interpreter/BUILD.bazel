@@ -16,7 +16,6 @@ go_library(
         "evalstate.go",
         "interpretable.go",
         "interpreter.go",
-        "latebinding.go",
         "optimizations.go",
         "planner.go",
         "prune.go",

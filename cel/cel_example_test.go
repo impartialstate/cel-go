@@ -205,29 +205,17 @@ func Example_lateBoundOverload() {
 		log.Fatalf("env.Program() error: %s\n", err)
 	}
 
-	// The function implementation is bound to a request-scoped context and supplied to the
-	// evaluation alongside the variables.
+	// The implementation is bound to a request-scoped context and supplied to the evaluation by
+	// name, alongside the variables.
 	ctx := context.WithValue(context.TODO(), contextString("my-resource"), "my-value")
-	fns, err := cel.NewLateFunctionBindings(
-		cel.LateFunction("fetch",
-			cel.Overload("fetch_string",
-				[]*cel.Type{cel.StringType}, cel.StringType,
-				cel.UnaryBinding(func(resource ref.Val) ref.Val {
-					return types.DefaultTypeAdapter.NativeToValue(
-						ctx.Value(contextString(string(resource.(types.String)))),
-					)
-				}),
-			),
-		),
-	)
-	if err != nil {
-		log.Fatalf("cel.NewLateFunctionBindings() failed: %s\n", err)
-	}
-	vars, err := cel.NewLateBindingActivation(map[string]any{"resource": "my-resource"}, fns)
-	if err != nil {
-		log.Fatalf("cel.NewLateBindingActivation() failed: %s\n", err)
-	}
-	out, _, err := prg.Eval(vars)
+	out, _, err := prg.Eval(map[string]any{
+		"resource": "my-resource",
+		"fetch": func(resource ref.Val) ref.Val {
+			return types.DefaultTypeAdapter.NativeToValue(
+				ctx.Value(contextString(string(resource.(types.String)))),
+			)
+		},
+	})
 	if err != nil {
 		log.Fatalf("runtime error: %s\n", err)
 	}

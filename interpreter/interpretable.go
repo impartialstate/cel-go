@@ -630,13 +630,13 @@ func (fn *evalLateBound) ID() int64 {
 
 // Eval implements the Interpretable interface method.
 func (fn *evalLateBound) Eval(ctx Activation) ref.Val {
-	impl, found := resolveLateBoundOverload(ctx, fn.function, fn.overload)
-	if !found {
+	impl := fn.resolve(ctx)
+	if !impl.found() {
 		return types.NewErrWithNodeID(fn.id, "no such overload: %s", fn.function)
 	}
-	// The declaration determines whether the call tolerates error and unknown arguments, but a
-	// late binding may also opt into non-strict evaluation for the implementation it supplies.
-	strict := !fn.nonStrict && !impl.NonStrict
+	// The declaration determines whether the call tolerates error and unknown arguments, though a
+	// binding supplied as a *functions.Overload may also opt into non-strict evaluation.
+	strict := !fn.nonStrict && !impl.nonStrict
 	argVals := make([]ref.Val, len(fn.args))
 	for i, arg := range fn.args {
 		argVals[i] = arg.Eval(ctx)
@@ -645,31 +645,31 @@ func (fn *evalLateBound) Eval(ctx Activation) ref.Val {
 		}
 	}
 	if len(argVals) == 0 {
-		if impl.Function == nil {
+		if impl.varArgs == nil {
 			return types.NewErrWithNodeID(fn.id, "no such overload: %s()", fn.function)
 		}
-		return types.LabelErrNode(fn.id, impl.Function())
+		return types.LabelErrNode(fn.id, impl.varArgs())
 	}
-	// The operand trait is declared by the function definition, but may also be specified by the
-	// late binding when the declaration does not require one.
+	// The operand trait is declared by the function definition, but may also be specified by a
+	// binding supplied as a *functions.Overload when the declaration does not require one.
 	trait := fn.trait
 	if trait == 0 {
-		trait = impl.OperandTrait
+		trait = impl.trait
 	}
 	arg0 := argVals[0]
 	if trait == 0 || (!strict && types.IsUnknownOrError(arg0)) || arg0.Type().HasTrait(trait) {
 		switch len(argVals) {
 		case 1:
-			if impl.Unary != nil {
-				return types.LabelErrNode(fn.id, impl.Unary(arg0))
+			if impl.unary != nil {
+				return types.LabelErrNode(fn.id, impl.unary(arg0))
 			}
 		case 2:
-			if impl.Binary != nil {
-				return types.LabelErrNode(fn.id, impl.Binary(arg0, argVals[1]))
+			if impl.binary != nil {
+				return types.LabelErrNode(fn.id, impl.binary(arg0, argVals[1]))
 			}
 		}
-		if impl.Function != nil {
-			return types.LabelErrNode(fn.id, impl.Function(argVals...))
+		if impl.varArgs != nil {
+			return types.LabelErrNode(fn.id, impl.varArgs(argVals...))
 		}
 	}
 	// Otherwise, if the argument is a ReceiverType attempt to invoke the receiver method on the
@@ -678,6 +678,75 @@ func (fn *evalLateBound) Eval(ctx Activation) ref.Val {
 		return types.LabelErrNode(fn.id, arg0.(traits.Receiver).Receive(fn.function, fn.overload, argVals[1:]))
 	}
 	return types.NewErrWithNodeID(fn.id, "no such overload: %s", fn.function)
+}
+
+// resolve looks up the implementation of the call within the Activation, preferring a binding for
+// the overload id over one for the function name.
+//
+// Since late bindings are resolved by name from the same Activation which supplies variables, an
+// implementation may be provided anywhere within the activation hierarchy.
+func (fn *evalLateBound) resolve(ctx Activation) lateBoundOverload {
+	if fn.overload != "" {
+		if impl := lateBoundImpl(ctx, fn.overload); impl.found() {
+			return impl
+		}
+	}
+	return lateBoundImpl(ctx, fn.function)
+}
+
+// lateBoundOverload is a function implementation resolved from an Activation. The zero value
+// indicates that no implementation was found.
+type lateBoundOverload struct {
+	unary     functions.UnaryOp
+	binary    functions.BinaryOp
+	varArgs   functions.FunctionOp
+	trait     int
+	nonStrict bool
+}
+
+// found returns whether the resolution produced an implementation to call.
+func (o lateBoundOverload) found() bool {
+	return o.unary != nil || o.binary != nil || o.varArgs != nil
+}
+
+// lateBoundImpl resolves a function implementation bound to the given name within the Activation.
+//
+// Implementations may be supplied as a unary, binary, or variadic function, or as a fully
+// specified *functions.Overload when an operand trait, non-strict evaluation, or a runtime
+// type-guard is needed. Values of any other type are ignored, which ensures that a variable whose
+// name matches a late-bound function does not masquerade as its implementation.
+func lateBoundImpl(ctx Activation, name string) lateBoundOverload {
+	val, found := ctx.ResolveName(name)
+	if !found {
+		return lateBoundOverload{}
+	}
+	switch impl := val.(type) {
+	case functions.UnaryOp:
+		return lateBoundOverload{unary: impl}
+	case func(ref.Val) ref.Val:
+		return lateBoundOverload{unary: impl}
+	case functions.BinaryOp:
+		return lateBoundOverload{binary: impl}
+	case func(ref.Val, ref.Val) ref.Val:
+		return lateBoundOverload{binary: impl}
+	case functions.FunctionOp:
+		return lateBoundOverload{varArgs: impl}
+	case func(...ref.Val) ref.Val:
+		return lateBoundOverload{varArgs: impl}
+	case *functions.Overload:
+		if impl == nil || impl.LateBound {
+			return lateBoundOverload{}
+		}
+		return lateBoundOverload{
+			unary:     impl.Unary,
+			binary:    impl.Binary,
+			varArgs:   impl.Function,
+			trait:     impl.OperandTrait,
+			nonStrict: impl.NonStrict,
+		}
+	default:
+		return lateBoundOverload{}
+	}
 }
 
 // Function implements the InterpretableCall interface method.

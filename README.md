@@ -221,35 +221,28 @@ ast, _ := env.Compile(`is_admin(user)`)
 prg, _ := env.Program(ast)
 ```
 
-The implementation is then supplied with the input to `Eval`, using the same
-overload options which configure functions within an environment:
+The implementation is then supplied in the evaluation input, alongside the
+variables, as a unary, binary, or variadic function over `ref.Val`:
 
 ```go
-fns, _ := cel.NewLateFunctionBindings(
-    cel.LateFunction("is_admin",
-        cel.Overload("is_admin_string", []*cel.Type{cel.StringType}, cel.BoolType,
-            cel.UnaryBinding(func(u ref.Val) ref.Val {
-                return types.Bool(admins.Contains(u))
-            }))),
-)
-vars, _ := cel.NewLateBindingActivation(map[string]any{"user": "alice"}, fns)
-out, _, err := prg.Eval(vars)
+out, _, err := prg.Eval(map[string]any{
+    "user":     "alice",
+    "is_admin": func(u ref.Val) ref.Val { return types.Bool(admins.Contains(u)) },
+})
 ```
 
-Calls are resolved by overload id first and by function name second, so a
-parse-only expression will dispatch dynamically across the supplied overloads.
-A call whose implementation cannot be resolved reports a `no such overload`
-error.
+Bindings are resolved by overload id first and by function name second, so a
+binding may be given per-overload, and a parse-only expression will find the
+implementation under the plain function name. Because bindings are looked up the
+same way variables are, they may also be supplied as a sibling of the variables
+via `interpreter.NewHierarchicalActivation`, or once for the lifetime of a
+program via `cel.Globals`. A call whose implementation cannot be resolved
+reports a `no such overload` error.
 
-Alternatively, the input `Activation` may serve the function implementations
-itself by implementing `cel.FunctionResolver`:
-
-```go
-func (a *requestActivation) ResolveFunction(name string) (*functions.Overload, bool) {
-    fn, found := a.fns[name]
-    return fn, found
-}
-```
+Values which aren't functions are ignored during this lookup, so a variable may
+share a name with a late-bound function without shadowing it. Supplying a
+`*functions.Overload` instead of a plain function additionally allows an operand
+trait, non-strict evaluation, or a runtime type-guard to be specified.
 
 Note that constant folding will not fold a call to a late-bound function, and
 that late-bound functions may not be mixed with eagerly bound implementations

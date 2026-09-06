@@ -15,7 +15,6 @@
 package interpreter
 
 import (
-	"sort"
 	"strings"
 	"testing"
 
@@ -36,15 +35,9 @@ func lateBoundFunc(t testing.TB, name string, opts ...decls.FunctionOpt) *decls.
 	return fn
 }
 
-// testFunctionActivation is an Activation which serves both variables and late-bound functions.
-type testFunctionActivation struct {
-	Activation
-	fns map[string]*functions.Overload
-}
-
-func (a *testFunctionActivation) ResolveFunction(name string) (*functions.Overload, bool) {
-	fn, found := a.fns[name]
-	return fn, found
+// isAlice reports whether the input value is the string 'alice'.
+func isAlice(v ref.Val) ref.Val {
+	return types.Bool(v.Equal(types.String("alice")) == types.True)
 }
 
 func TestLateBindingCalls(t *testing.T) {
@@ -62,7 +55,6 @@ func TestLateBindingCalls(t *testing.T) {
 		vars      []*decls.VariableDecl
 		funcs     []*decls.FunctionDecl
 		in        map[string]any
-		bindings  []*functions.Overload
 		out       ref.Val
 		err       string
 	}{
@@ -74,9 +66,7 @@ func TestLateBindingCalls(t *testing.T) {
 					decls.Overload("request_id", []*types.Type{}, types.StringType,
 						decls.LateFunctionBinding())),
 			},
-			bindings: []*functions.Overload{
-				{Operator: "request_id", Function: func(...ref.Val) ref.Val { return types.String("abc") }},
-			},
+			in:  map[string]any{"request_id": func(...ref.Val) ref.Val { return types.String("abc") }},
 			out: types.String("abc"),
 		},
 		{
@@ -88,11 +78,46 @@ func TestLateBindingCalls(t *testing.T) {
 					decls.Overload("is_admin_string", []*types.Type{types.StringType}, types.BoolType,
 						decls.LateFunctionBinding())),
 			},
-			in: map[string]any{"user": "alice"},
-			bindings: []*functions.Overload{
-				{Operator: "is_admin_string", Unary: func(u ref.Val) ref.Val {
-					return types.Bool(u.Equal(types.String("alice")) == types.True)
-				}},
+			in:  map[string]any{"user": "alice", "is_admin_string": isAlice},
+			out: types.True,
+		},
+		{
+			name: "unary bound to the function name",
+			expr: `is_admin(user)`,
+			vars: []*decls.VariableDecl{decls.NewVariable("user", types.StringType)},
+			funcs: []*decls.FunctionDecl{
+				lateBoundFunc(t, "is_admin",
+					decls.Overload("is_admin_string", []*types.Type{types.StringType}, types.BoolType,
+						decls.LateFunctionBinding())),
+			},
+			in:  map[string]any{"user": "alice", "is_admin": isAlice},
+			out: types.True,
+		},
+		{
+			name: "unary bound as a functions.UnaryOp",
+			expr: `is_admin(user)`,
+			vars: []*decls.VariableDecl{decls.NewVariable("user", types.StringType)},
+			funcs: []*decls.FunctionDecl{
+				lateBoundFunc(t, "is_admin",
+					decls.Overload("is_admin_string", []*types.Type{types.StringType}, types.BoolType,
+						decls.LateFunctionBinding())),
+			},
+			in:  map[string]any{"user": "alice", "is_admin": functions.UnaryOp(isAlice)},
+			out: types.True,
+		},
+		{
+			name: "overload id preferred over function name",
+			expr: `is_admin(user)`,
+			vars: []*decls.VariableDecl{decls.NewVariable("user", types.StringType)},
+			funcs: []*decls.FunctionDecl{
+				lateBoundFunc(t, "is_admin",
+					decls.Overload("is_admin_string", []*types.Type{types.StringType}, types.BoolType,
+						decls.LateFunctionBinding())),
+			},
+			in: map[string]any{
+				"user":            "alice",
+				"is_admin_string": isAlice,
+				"is_admin":        func(v ref.Val) ref.Val { return types.False },
 			},
 			out: types.True,
 		},
@@ -106,12 +131,12 @@ func TestLateBindingCalls(t *testing.T) {
 						[]*types.Type{types.StringType, types.StringType}, types.BoolType,
 						decls.LateFunctionBinding())),
 			},
-			in: map[string]any{"user": "alice"},
-			bindings: []*functions.Overload{
-				{Operator: "can_access_string_string", Binary: func(u, res ref.Val) ref.Val {
+			in: map[string]any{
+				"user": "alice",
+				"can_access": func(u, res ref.Val) ref.Val {
 					return types.Bool(u.Equal(types.String("alice")) == types.True &&
 						res.Equal(types.String("secrets")) == types.True)
-				}},
+				},
 			},
 			out: types.True,
 		},
@@ -124,22 +149,18 @@ func TestLateBindingCalls(t *testing.T) {
 						[]*types.Type{types.StringType, types.StringType, types.StringType},
 						types.StringType, decls.LateFunctionBinding())),
 			},
-			bindings: []*functions.Overload{
-				{Operator: "greet_strings", Function: greet},
-			},
+			in:  map[string]any{"greet": greet},
 			out: types.String("hello alice, bob, carl"),
 		},
 		{
-			name: "unary resolved by function op",
+			name: "unary resolved by a var args binding",
 			expr: `greet('alice')`,
 			funcs: []*decls.FunctionDecl{
 				lateBoundFunc(t, "greet",
 					decls.Overload("greet_string", []*types.Type{types.StringType}, types.StringType,
 						decls.LateFunctionBinding())),
 			},
-			bindings: []*functions.Overload{
-				{Operator: "greet_string", Function: greet},
-			},
+			in:  map[string]any{"greet": functions.FunctionOp(greet)},
 			out: types.String("hello alice"),
 		},
 		{
@@ -151,12 +172,7 @@ func TestLateBindingCalls(t *testing.T) {
 					decls.MemberOverload("string_is_admin", []*types.Type{types.StringType},
 						types.BoolType, decls.LateFunctionBinding())),
 			},
-			in: map[string]any{"user": "alice"},
-			bindings: []*functions.Overload{
-				{Operator: "string_is_admin", Unary: func(u ref.Val) ref.Val {
-					return types.Bool(u.Equal(types.String("alice")) == types.True)
-				}},
-			},
+			in:  map[string]any{"user": "alice", "string_is_admin": isAlice},
 			out: types.True,
 		},
 		{
@@ -167,11 +183,7 @@ func TestLateBindingCalls(t *testing.T) {
 					decls.Overload("is_admin_string", []*types.Type{types.StringType}, types.BoolType,
 						decls.LateFunctionBinding())),
 			},
-			bindings: []*functions.Overload{
-				{Operator: "is_admin_string", Unary: func(u ref.Val) ref.Val {
-					return types.Bool(u.Equal(types.String("alice")) == types.True)
-				}},
-			},
+			in:  map[string]any{"is_admin": isAlice},
 			out: types.DefaultTypeAdapter.NativeToValue([]string{"alice"}),
 		},
 		{
@@ -183,9 +195,7 @@ func TestLateBindingCalls(t *testing.T) {
 					decls.Overload("is_admin_string", []*types.Type{types.StringType}, types.BoolType,
 						decls.LateFunctionBinding())),
 			},
-			bindings: []*functions.Overload{
-				{Operator: "is_admin", Unary: func(u ref.Val) ref.Val { return types.True }},
-			},
+			in:  map[string]any{"is_admin": isAlice},
 			out: types.True,
 		},
 		{
@@ -199,13 +209,9 @@ func TestLateBindingCalls(t *testing.T) {
 						[]*types.Type{types.NewListType(types.IntType)}, types.IntType,
 						decls.LateFunctionBinding())),
 			},
-			bindings: []*functions.Overload{
-				{Operator: "size_of_string", Unary: func(v ref.Val) ref.Val {
-					return types.Int(len(string(v.(types.String))))
-				}},
-				{Operator: "size_of_list", Unary: func(v ref.Val) ref.Val {
-					return v.(traits.Sizer).Size()
-				}},
+			in: map[string]any{
+				"size_of_string": func(v ref.Val) ref.Val { return types.Int(len(string(v.(types.String)))) },
+				"size_of_list":   func(v ref.Val) ref.Val { return v.(traits.Sizer).Size() },
 			},
 			out: types.Int(7),
 		},
@@ -218,9 +224,7 @@ func TestLateBindingCalls(t *testing.T) {
 						decls.LateFunctionBinding(),
 						decls.OverloadOperandTrait(traits.SizerType))),
 			},
-			bindings: []*functions.Overload{
-				{Operator: "count_any", Unary: func(v ref.Val) ref.Val { return v.(traits.Sizer).Size() }},
-			},
+			in:  map[string]any{"count": func(v ref.Val) ref.Val { return v.(traits.Sizer).Size() }},
 			out: types.Int(5),
 		},
 		{
@@ -232,9 +236,7 @@ func TestLateBindingCalls(t *testing.T) {
 						decls.LateFunctionBinding(),
 						decls.OverloadOperandTrait(traits.SizerType))),
 			},
-			bindings: []*functions.Overload{
-				{Operator: "count_any", Unary: func(v ref.Val) ref.Val { return v.(traits.Sizer).Size() }},
-			},
+			in:  map[string]any{"count": func(v ref.Val) ref.Val { return v.(traits.Sizer).Size() }},
 			err: "no such overload: count",
 		},
 		{
@@ -246,14 +248,14 @@ func TestLateBindingCalls(t *testing.T) {
 					decls.Overload("describe_any", []*types.Type{types.DynType}, types.StringType,
 						decls.LateFunctionBinding(), decls.OverloadIsNonStrict())),
 			},
-			in: map[string]any{"unknown_var": types.NewUnknown(1, nil)},
-			bindings: []*functions.Overload{
-				{Operator: "describe_any", NonStrict: true, Unary: func(v ref.Val) ref.Val {
+			in: map[string]any{
+				"unknown_var": types.NewUnknown(1, nil),
+				"describe": func(v ref.Val) ref.Val {
 					if types.IsUnknown(v) {
 						return types.String("unknown")
 					}
 					return types.String("known")
-				}},
+				},
 			},
 			out: types.String("unknown"),
 		},
@@ -266,11 +268,35 @@ func TestLateBindingCalls(t *testing.T) {
 					decls.Overload("describe_any", []*types.Type{types.DynType}, types.StringType,
 						decls.LateFunctionBinding())),
 			},
-			in: map[string]any{"unknown_var": types.NewUnknown(1, nil)},
-			bindings: []*functions.Overload{
-				{Operator: "describe_any", Unary: func(v ref.Val) ref.Val { return types.String("known") }},
+			in: map[string]any{
+				"unknown_var": types.NewUnknown(1, nil),
+				"describe":    func(v ref.Val) ref.Val { return types.String("known") },
 			},
 			out: types.NewUnknown(1, nil),
+		},
+		{
+			name: "overload binding supplies traits and strictness",
+			expr: `describe(unknown_var)`,
+			vars: []*decls.VariableDecl{decls.NewVariable("unknown_var", types.DynType)},
+			funcs: []*decls.FunctionDecl{
+				lateBoundFunc(t, "describe",
+					decls.Overload("describe_any", []*types.Type{types.DynType}, types.StringType,
+						decls.LateFunctionBinding())),
+			},
+			in: map[string]any{
+				"unknown_var": types.NewUnknown(1, nil),
+				"describe": &functions.Overload{
+					Operator:  "describe_any",
+					NonStrict: true,
+					Unary: func(v ref.Val) ref.Val {
+						if types.IsUnknown(v) {
+							return types.String("unknown")
+						}
+						return types.String("known")
+					},
+				},
+			},
+			out: types.String("unknown"),
 		},
 		{
 			name: "no binding supplied",
@@ -292,10 +318,41 @@ func TestLateBindingCalls(t *testing.T) {
 					decls.Overload("is_admin_int", []*types.Type{types.IntType}, types.BoolType,
 						decls.LateFunctionBinding())),
 			},
-			bindings: []*functions.Overload{
-				{Operator: "is_admin_int", Unary: func(v ref.Val) ref.Val { return types.True }},
-			},
+			in:  map[string]any{"is_admin_int": isAlice},
 			err: "no such overload: is_admin",
+		},
+		{
+			name: "binding is not a function",
+			expr: `is_admin('alice')`,
+			funcs: []*decls.FunctionDecl{
+				lateBoundFunc(t, "is_admin",
+					decls.Overload("is_admin_string", []*types.Type{types.StringType}, types.BoolType,
+						decls.LateFunctionBinding())),
+			},
+			in:  map[string]any{"is_admin": "not a function"},
+			err: "no such overload: is_admin",
+		},
+		{
+			name: "variable of the same name does not shadow the binding",
+			expr: `is_admin('alice')`,
+			funcs: []*decls.FunctionDecl{
+				lateBoundFunc(t, "is_admin",
+					decls.Overload("is_admin_string", []*types.Type{types.StringType}, types.BoolType,
+						decls.LateFunctionBinding())),
+			},
+			in:  map[string]any{"is_admin": true, "is_admin_string": isAlice},
+			out: types.True,
+		},
+		{
+			name: "zero arity bound to a unary function",
+			expr: `request_id()`,
+			funcs: []*decls.FunctionDecl{
+				lateBoundFunc(t, "request_id",
+					decls.Overload("request_id", []*types.Type{}, types.StringType,
+						decls.LateFunctionBinding())),
+			},
+			in:  map[string]any{"request_id": func(v ref.Val) ref.Val { return v }},
+			err: "no such overload: request_id()",
 		},
 	}
 	for _, tst := range tests {
@@ -312,15 +369,7 @@ func TestLateBindingCalls(t *testing.T) {
 			if err != nil {
 				t.Fatalf("program() failed: %v", err)
 			}
-			fns, err := NewFunctionBindings(tc.bindings...)
-			if err != nil {
-				t.Fatalf("NewFunctionBindings() failed: %v", err)
-			}
-			lateVars, err := NewLateBindingActivation(vars, fns)
-			if err != nil {
-				t.Fatalf("NewLateBindingActivation() failed: %v", err)
-			}
-			out := prg.Eval(lateVars)
+			out := prg.Eval(vars)
 			if tc.err != "" {
 				if !types.IsError(out) {
 					t.Fatalf("Eval() got %v, wanted error %q", out, tc.err)
@@ -347,7 +396,9 @@ func TestLateBindingCalls(t *testing.T) {
 	}
 }
 
-func TestLateBindingActivationResolvesFunctions(t *testing.T) {
+// TestLateBindingActivationHierarchy verifies that a binding is found wherever it is supplied
+// within an activation hierarchy, since resolution reuses ordinary variable name resolution.
+func TestLateBindingActivationHierarchy(t *testing.T) {
 	prg, vars, err := program(t, &testCase{
 		expr: `is_admin(user)`,
 		vars: []*decls.VariableDecl{decls.NewVariable("user", types.StringType)},
@@ -361,40 +412,26 @@ func TestLateBindingActivationResolvesFunctions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("program() failed: %v", err)
 	}
-	isAdmin := &functions.Overload{
-		Operator: "is_admin_string",
-		Unary:    func(u ref.Val) ref.Val { return types.Bool(u.Equal(types.String("alice")) == types.True) },
-	}
-	fns, err := NewFunctionBindings(isAdmin)
+	// The functions may be supplied as a sibling of the variables rather than alongside them.
+	fns, err := NewActivation(map[string]any{"is_admin_string": isAlice})
 	if err != nil {
-		t.Fatalf("NewFunctionBindings() failed: %v", err)
+		t.Fatalf("NewActivation() failed: %v", err)
 	}
-	lateVars, err := NewLateBindingActivation(map[string]any{"user": "alice"}, fns)
-	if err != nil {
-		t.Fatalf("NewLateBindingActivation() failed: %v", err)
-	}
-	partialVars, err := NewPartialActivation(lateVars)
+	partialVars, err := NewPartialActivation(NewHierarchicalActivation(fns, vars))
 	if err != nil {
 		t.Fatalf("NewPartialActivation() failed: %v", err)
-	}
-	// An activation which serves both variables and functions.
-	selfResolving := &testFunctionActivation{
-		Activation: vars,
-		fns:        map[string]*functions.Overload{"is_admin_string": isAdmin},
 	}
 	tests := []struct {
 		name string
 		vars Activation
 	}{
-		{name: "late binding activation", vars: lateVars},
-		{name: "self-resolving activation", vars: selfResolving},
-		{name: "hierarchical child", vars: NewHierarchicalActivation(vars, lateVars)},
-		{name: "hierarchical parent", vars: NewHierarchicalActivation(lateVars, vars)},
+		{name: "functions in the parent", vars: NewHierarchicalActivation(fns, vars)},
+		{name: "functions in the child", vars: NewHierarchicalActivation(vars, fns)},
 		{name: "partial activation", vars: partialVars},
-		{name: "activation wrapper", vars: &testActivationWrapper{Activation: lateVars, name: "wrapper"}},
-		{name: "state tracking activation", vars: evalStateActivation{vars: lateVars, state: NewEvalState()}},
-		{name: "late bindings over an existing resolver",
-			vars: mustLateBindingActivation(t, selfResolving)},
+		{name: "activation wrapper", vars: &testActivationWrapper{
+			Activation: NewHierarchicalActivation(fns, vars), name: "wrapper"}},
+		{name: "state tracking activation", vars: evalStateActivation{
+			vars: NewHierarchicalActivation(fns, vars), state: NewEvalState()}},
 	}
 	for _, tst := range tests {
 		tc := tst
@@ -404,121 +441,5 @@ func TestLateBindingActivationResolvesFunctions(t *testing.T) {
 				t.Errorf("Eval() got %v, wanted true", out)
 			}
 		})
-	}
-}
-
-func mustLateBindingActivation(t testing.TB, vars any, fns ...FunctionResolver) Activation {
-	t.Helper()
-	a, err := NewLateBindingActivation(vars, fns...)
-	if err != nil {
-		t.Fatalf("NewLateBindingActivation() failed: %v", err)
-	}
-	return a
-}
-
-func TestNewFunctionBindingsErrors(t *testing.T) {
-	tests := []struct {
-		name      string
-		overloads []*functions.Overload
-		err       string
-	}{
-		{
-			name:      "nil overload",
-			overloads: []*functions.Overload{nil},
-			err:       "overload must be non-nil",
-		},
-		{
-			name:      "late-bound placeholder",
-			overloads: []*functions.Overload{{Operator: "size_of", LateBound: true}},
-			err:       "late-binding placeholder",
-		},
-		{
-			name:      "missing implementation",
-			overloads: []*functions.Overload{{Operator: "size_of"}},
-			err:       "overload has no implementation: size_of",
-		},
-		{
-			name: "duplicate overload",
-			overloads: []*functions.Overload{
-				{Operator: "size_of", Unary: func(v ref.Val) ref.Val { return types.Int(0) }},
-				{Operator: "size_of", Unary: func(v ref.Val) ref.Val { return types.Int(1) }},
-			},
-			err: "overload already exists 'size_of'",
-		},
-	}
-	for _, tst := range tests {
-		tc := tst
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := NewFunctionBindings(tc.overloads...)
-			if err == nil || !strings.Contains(err.Error(), tc.err) {
-				t.Errorf("NewFunctionBindings() got error %v, wanted %q", err, tc.err)
-			}
-		})
-	}
-}
-
-func TestNewLateBindingActivationErrors(t *testing.T) {
-	if _, err := NewLateBindingActivation(nil); err == nil {
-		t.Error("NewLateBindingActivation(nil) succeeded, wanted error")
-	}
-	if _, err := NewLateBindingActivation(map[string]any{}, nil); err == nil {
-		t.Error("NewLateBindingActivation() with a nil resolver succeeded, wanted error")
-	}
-}
-
-func TestFunctionBindingsOverloadIds(t *testing.T) {
-	var nilBindings *FunctionBindings
-	if ids := nilBindings.OverloadIds(); len(ids) != 0 {
-		t.Errorf("OverloadIds() got %v, wanted empty", ids)
-	}
-	if _, found := nilBindings.ResolveFunction("size_of"); found {
-		t.Error("ResolveFunction() found a binding in a nil binding set")
-	}
-	fns, err := NewFunctionBindings(
-		&functions.Overload{Operator: "size_of", Unary: func(v ref.Val) ref.Val { return types.Int(0) }},
-		&functions.Overload{Operator: "size_of_string", Unary: func(v ref.Val) ref.Val { return types.Int(1) }},
-	)
-	if err != nil {
-		t.Fatalf("NewFunctionBindings() failed: %v", err)
-	}
-	ids := fns.OverloadIds()
-	sort.Strings(ids)
-	if len(ids) != 2 || ids[0] != "size_of" || ids[1] != "size_of_string" {
-		t.Errorf("OverloadIds() got %v, wanted [size_of size_of_string]", ids)
-	}
-}
-
-func TestAsFunctionResolver(t *testing.T) {
-	if _, found := AsFunctionResolver(nil); found {
-		t.Error("AsFunctionResolver(nil) found a resolver")
-	}
-	if _, found := AsFunctionResolver(EmptyActivation()); found {
-		t.Error("AsFunctionResolver(EmptyActivation()) found a resolver")
-	}
-	sizeOf := &functions.Overload{Operator: "size_of", Unary: func(v ref.Val) ref.Val { return types.Int(0) }}
-	fns, err := NewFunctionBindings(sizeOf)
-	if err != nil {
-		t.Fatalf("NewFunctionBindings() failed: %v", err)
-	}
-	childFns, err := NewFunctionBindings(
-		&functions.Overload{Operator: "size_of_string", Unary: func(v ref.Val) ref.Val { return types.Int(1) }})
-	if err != nil {
-		t.Fatalf("NewFunctionBindings() failed: %v", err)
-	}
-	parent := mustLateBindingActivation(t, map[string]any{}, fns)
-	child := mustLateBindingActivation(t, map[string]any{}, childFns)
-	resolver, found := AsFunctionResolver(NewHierarchicalActivation(parent, child))
-	if !found {
-		t.Fatal("AsFunctionResolver() found no resolver in a hierarchical activation")
-	}
-	// Both the child and parent bindings are visible.
-	if _, found := resolver.ResolveFunction("size_of"); !found {
-		t.Error("ResolveFunction('size_of') found no parent binding")
-	}
-	if _, found := resolver.ResolveFunction("size_of_string"); !found {
-		t.Error("ResolveFunction('size_of_string') found no child binding")
-	}
-	if _, found := resolver.ResolveFunction("missing"); found {
-		t.Error("ResolveFunction('missing') found a binding")
 	}
 }

@@ -342,6 +342,20 @@ func FunctionBinding(binding functions.FunctionOp) OverloadOpt {
 
 // LateFunctionBinding indicates that the function has a binding which is not known at compile time.
 // This is useful for functions which have side-effects or are not deterministically computable.
+//
+// The implementation is resolved from the Activation supplied to the evaluation, looked up by
+// overload id first and by function name second. Bindings may be provided as a functions.UnaryOp,
+// functions.BinaryOp, or functions.FunctionOp -- or as a *functions.Overload when an operand
+// trait, non-strict evaluation, or a runtime type-guard is needed. Values of any other type are
+// ignored, so a variable may share a name with a late-bound function:
+//
+//	prg.Eval(map[string]any{
+//	    "user":     "alice",
+//	    "is_admin": func(u ref.Val) ref.Val { return types.Bool(admins.Contains(u)) },
+//	})
+//
+// A function may not mix late bindings with eagerly bound implementations, and calls to a
+// late-bound function are never constant folded.
 func LateFunctionBinding() OverloadOpt {
 	return decls.LateFunctionBinding()
 }

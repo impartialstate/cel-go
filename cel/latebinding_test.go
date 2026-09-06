@@ -19,14 +19,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/google/cel-go/common/decls"
-	"github.com/google/cel-go/common/functions"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
+	"github.com/google/cel-go/interpreter"
 )
 
-// isAdminIn returns a unary binding which reports whether the input value is in the admin set.
-func isAdminIn(admins ...string) functions.UnaryOp {
+// isAdminIn returns a unary function which reports whether the input value is in the admin set.
+func isAdminIn(admins ...string) func(ref.Val) ref.Val {
 	set := make(map[string]bool, len(admins))
 	for _, a := range admins {
 		set[a] = true
@@ -76,19 +75,10 @@ func TestLateFunctionBindingEval(t *testing.T) {
 		{admins: []string{"bob"}, user: "bob", out: types.True},
 	}
 	for _, tc := range tests {
-		fns, err := NewLateFunctionBindings(
-			LateFunction("is_admin",
-				Overload("is_admin_string", []*Type{StringType}, BoolType,
-					UnaryBinding(isAdminIn(tc.admins...)))),
-		)
-		if err != nil {
-			t.Fatalf("NewLateFunctionBindings() failed: %v", err)
-		}
-		vars, err := NewLateBindingActivation(map[string]any{"user": tc.user}, fns)
-		if err != nil {
-			t.Fatalf("NewLateBindingActivation() failed: %v", err)
-		}
-		out, _, err := prg.Eval(vars)
+		out, _, err := prg.Eval(map[string]any{
+			"user":     tc.user,
+			"is_admin": isAdminIn(tc.admins...),
+		})
 		if err != nil {
 			t.Fatalf("Eval() failed: %v", err)
 		}
@@ -114,19 +104,59 @@ func TestLateFunctionBindingMissing(t *testing.T) {
 	}
 }
 
+func TestLateFunctionBindingSiblingActivation(t *testing.T) {
+	env := lateBoundEnv(t)
+	ast, iss := env.Compile(`is_admin(user)`)
+	if iss.Err() != nil {
+		t.Fatalf("Compile() failed: %v", iss.Err())
+	}
+	prg, err := env.Program(ast)
+	if err != nil {
+		t.Fatalf("Program() failed: %v", err)
+	}
+	// The functions may be kept in an activation of their own, separate from the variables.
+	fns, err := NewActivation(map[string]any{"is_admin_string": isAdminIn("alice")})
+	if err != nil {
+		t.Fatalf("NewActivation() failed: %v", err)
+	}
+	vars, err := NewActivation(map[string]any{"user": "alice"})
+	if err != nil {
+		t.Fatalf("NewActivation() failed: %v", err)
+	}
+	out, _, err := prg.Eval(interpreter.NewHierarchicalActivation(fns, vars))
+	if err != nil {
+		t.Fatalf("Eval() failed: %v", err)
+	}
+	if out != types.True {
+		t.Errorf("Eval() got %v, wanted true", out)
+	}
+}
+
+func TestLateFunctionBindingGlobals(t *testing.T) {
+	env := lateBoundEnv(t)
+	ast, iss := env.Compile(`is_admin(user)`)
+	if iss.Err() != nil {
+		t.Fatalf("Compile() failed: %v", iss.Err())
+	}
+	// A binding may also be supplied once for the lifetime of the program.
+	prg, err := env.Program(ast, Globals(map[string]any{"is_admin": isAdminIn("alice")}))
+	if err != nil {
+		t.Fatalf("Program() failed: %v", err)
+	}
+	out, _, err := prg.Eval(map[string]any{"user": "alice"})
+	if err != nil {
+		t.Fatalf("Eval() failed: %v", err)
+	}
+	if out != types.True {
+		t.Errorf("Eval() got %v, wanted true", out)
+	}
+}
+
 func TestLateFunctionBindingEvalOptions(t *testing.T) {
 	env := lateBoundEnv(t)
 	ast, iss := env.Compile(`is_admin(user) && is_admin('bob')`)
 	if iss.Err() != nil {
 		t.Fatalf("Compile() failed: %v", iss.Err())
-	}
-	fns, err := NewLateFunctionBindings(
-		LateFunction("is_admin",
-			Overload("is_admin_string", []*Type{StringType}, BoolType,
-				UnaryBinding(isAdminIn("alice", "bob")))),
-	)
-	if err != nil {
-		t.Fatalf("NewLateFunctionBindings() failed: %v", err)
 	}
 	tests := []struct {
 		name string
@@ -146,11 +176,10 @@ func TestLateFunctionBindingEvalOptions(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Program() failed: %v", err)
 			}
-			vars, err := NewLateBindingActivation(map[string]any{"user": "alice"}, fns)
-			if err != nil {
-				t.Fatalf("NewLateBindingActivation() failed: %v", err)
-			}
-			out, det, err := prg.Eval(vars)
+			out, det, err := prg.Eval(map[string]any{
+				"user":     "alice",
+				"is_admin": isAdminIn("alice", "bob"),
+			})
 			if err != nil {
 				t.Fatalf("Eval() failed: %v", err)
 			}
@@ -176,19 +205,10 @@ func TestLateFunctionBindingContextEval(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Program() failed: %v", err)
 	}
-	fns, err := NewLateFunctionBindings(
-		LateFunction("is_admin",
-			Overload("is_admin_string", []*Type{StringType}, BoolType,
-				UnaryBinding(isAdminIn("alice")))),
-	)
-	if err != nil {
-		t.Fatalf("NewLateFunctionBindings() failed: %v", err)
-	}
-	vars, err := NewLateBindingActivation(map[string]any{"user": "alice"}, fns)
-	if err != nil {
-		t.Fatalf("NewLateBindingActivation() failed: %v", err)
-	}
-	out, _, err := prg.ContextEval(context.Background(), vars)
+	out, _, err := prg.ContextEval(context.Background(), map[string]any{
+		"user":     "alice",
+		"is_admin": isAdminIn("alice"),
+	})
 	if err != nil {
 		t.Fatalf("ContextEval() failed: %v", err)
 	}
@@ -207,19 +227,9 @@ func TestLateFunctionBindingPartialEval(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Program() failed: %v", err)
 	}
-	fns, err := NewLateFunctionBindings(
-		LateFunction("is_admin",
-			Overload("is_admin_string", []*Type{StringType}, BoolType,
-				UnaryBinding(isAdminIn("bob")))),
-	)
-	if err != nil {
-		t.Fatalf("NewLateFunctionBindings() failed: %v", err)
-	}
-	lateVars, err := NewLateBindingActivation(map[string]any{"user": "alice"}, fns)
-	if err != nil {
-		t.Fatalf("NewLateBindingActivation() failed: %v", err)
-	}
-	vars, err := PartialVars(lateVars, AttributePattern("resource"))
+	vars, err := PartialVars(
+		map[string]any{"user": "alice", "is_admin": isAdminIn("bob")},
+		AttributePattern("resource"))
 	if err != nil {
 		t.Fatalf("PartialVars() failed: %v", err)
 	}
@@ -253,19 +263,7 @@ func TestLateFunctionBindingParseOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Program() failed: %v", err)
 	}
-	fns, err := NewLateFunctionBindings(
-		LateFunction("is_admin",
-			Overload("is_admin_string", []*Type{StringType}, BoolType,
-				UnaryBinding(isAdminIn("alice")))),
-	)
-	if err != nil {
-		t.Fatalf("NewLateFunctionBindings() failed: %v", err)
-	}
-	vars, err := NewLateBindingActivation(NoVars(), fns)
-	if err != nil {
-		t.Fatalf("NewLateBindingActivation() failed: %v", err)
-	}
-	out, _, err := prg.Eval(vars)
+	out, _, err := prg.Eval(map[string]any{"is_admin": isAdminIn("alice")})
 	if err != nil {
 		t.Fatalf("Eval() failed: %v", err)
 	}
@@ -292,61 +290,15 @@ func TestLateFunctionBindingMemberOverload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Program() failed: %v", err)
 	}
-	fns, err := NewLateFunctionBindings(
-		LateFunction("isAdmin",
-			MemberOverload("string_is_admin", []*Type{StringType}, BoolType,
-				UnaryBinding(isAdminIn("alice")))),
-	)
-	if err != nil {
-		t.Fatalf("NewLateFunctionBindings() failed: %v", err)
-	}
-	vars, err := NewLateBindingActivation(map[string]any{"user": "alice"}, fns)
-	if err != nil {
-		t.Fatalf("NewLateBindingActivation() failed: %v", err)
-	}
-	out, _, err := prg.Eval(vars)
+	out, _, err := prg.Eval(map[string]any{
+		"user":            "alice",
+		"string_is_admin": isAdminIn("alice"),
+	})
 	if err != nil {
 		t.Fatalf("Eval() failed: %v", err)
 	}
 	if out != types.True {
 		t.Errorf("Eval() got %v, wanted true", out)
-	}
-}
-
-func TestLateFunctionBindingTypeGuard(t *testing.T) {
-	env, err := NewEnv(
-		Variable("value", DynType),
-		Function("is_admin",
-			Overload("is_admin_string", []*Type{DynType}, BoolType,
-				LateFunctionBinding())),
-	)
-	if err != nil {
-		t.Fatalf("NewEnv() failed: %v", err)
-	}
-	ast, iss := env.Compile(`is_admin(value)`)
-	if iss.Err() != nil {
-		t.Fatalf("Compile() failed: %v", iss.Err())
-	}
-	prg, err := env.Program(ast)
-	if err != nil {
-		t.Fatalf("Program() failed: %v", err)
-	}
-	// The runtime binding declares a string argument, so the generated type-guard rejects an int.
-	fns, err := NewLateFunctionBindings(
-		LateFunction("is_admin",
-			Overload("is_admin_string", []*Type{StringType}, BoolType,
-				UnaryBinding(isAdminIn("alice")))),
-	)
-	if err != nil {
-		t.Fatalf("NewLateFunctionBindings() failed: %v", err)
-	}
-	vars, err := NewLateBindingActivation(map[string]any{"value": 42}, fns)
-	if err != nil {
-		t.Fatalf("NewLateBindingActivation() failed: %v", err)
-	}
-	_, _, err = prg.Eval(vars)
-	if err == nil || !strings.Contains(err.Error(), "no such overload") {
-		t.Errorf("Eval() got error %v, wanted 'no such overload'", err)
 	}
 }
 
@@ -360,15 +312,17 @@ func TestLateFunctionBindingMultipleOverloads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewEnv() failed: %v", err)
 	}
-	fns, err := NewLateFunctionBindings(
-		LateFunction("describe",
-			Overload("describe_string", []*Type{StringType}, StringType,
-				UnaryBinding(func(v ref.Val) ref.Val { return types.String("string:" + string(v.(types.String))) })),
-			Overload("describe_int", []*Type{IntType}, StringType,
-				UnaryBinding(func(v ref.Val) ref.Val { return types.String("int") }))),
-	)
-	if err != nil {
-		t.Fatalf("NewLateFunctionBindings() failed: %v", err)
+	// Each overload is bound by its own id, while the function name serves parse-only
+	// expressions which have not resolved an overload.
+	fns := map[string]any{
+		"describe_string": func(v ref.Val) ref.Val { return types.String("string:" + string(v.(types.String))) },
+		"describe_int":    func(v ref.Val) ref.Val { return types.String("int") },
+		"describe": func(v ref.Val) ref.Val {
+			if _, ok := v.(types.String); ok {
+				return types.String("string:" + string(v.(types.String)))
+			}
+			return types.String("int")
+		},
 	}
 	tests := []struct {
 		expr      string
@@ -377,7 +331,6 @@ func TestLateFunctionBindingMultipleOverloads(t *testing.T) {
 	}{
 		{expr: `describe('hi')`, out: types.String("string:hi")},
 		{expr: `describe(1)`, out: types.String("int")},
-		// Parse-only expressions dispatch dynamically by function name.
 		{expr: `describe('hi')`, unchecked: true, out: types.String("string:hi")},
 		{expr: `describe(1)`, unchecked: true, out: types.String("int")},
 	}
@@ -396,11 +349,7 @@ func TestLateFunctionBindingMultipleOverloads(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Program() failed: %v", err)
 		}
-		vars, err := NewLateBindingActivation(NoVars(), fns)
-		if err != nil {
-			t.Fatalf("NewLateBindingActivation() failed: %v", err)
-		}
-		out, _, err := prg.Eval(vars)
+		out, _, err := prg.Eval(fns)
 		if err != nil {
 			t.Fatalf("Eval(%q) failed: %v", tc.expr, err)
 		}
@@ -420,138 +369,16 @@ func TestLateFunctionBindingComprehension(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Program() failed: %v", err)
 	}
-	fns, err := NewLateFunctionBindings(
-		LateFunction("is_admin",
-			Overload("is_admin_string", []*Type{StringType}, BoolType,
-				UnaryBinding(isAdminIn("alice", "carl")))),
-	)
-	if err != nil {
-		t.Fatalf("NewLateFunctionBindings() failed: %v", err)
-	}
-	vars, err := NewLateBindingActivation(
-		map[string]any{"user": "alice", "users": []string{"alice", "bob", "carl"}}, fns)
-	if err != nil {
-		t.Fatalf("NewLateBindingActivation() failed: %v", err)
-	}
-	out, _, err := prg.Eval(vars)
+	out, _, err := prg.Eval(map[string]any{
+		"user":     "alice",
+		"users":    []string{"alice", "bob", "carl"},
+		"is_admin": isAdminIn("alice", "carl"),
+	})
 	if err != nil {
 		t.Fatalf("Eval() failed: %v", err)
 	}
 	want := types.DefaultTypeAdapter.NativeToValue([]string{"alice", "carl"})
 	if out.Equal(want) != types.True {
 		t.Errorf("Eval() got %v, wanted %v", out, want)
-	}
-}
-
-func TestLateFunctionBindingsOptions(t *testing.T) {
-	isAdmin, err := decls.NewFunction("is_admin",
-		decls.Overload("is_admin_string", []*Type{StringType}, BoolType,
-			decls.UnaryBinding(isAdminIn("alice"))))
-	if err != nil {
-		t.Fatalf("decls.NewFunction() failed: %v", err)
-	}
-	tests := []struct {
-		name string
-		opt  LateFunctionBindingsOpt
-	}{
-		{name: "function decls", opt: LateFunctionDecls(isAdmin)},
-		{
-			name: "raw overloads",
-			opt: LateOverloads(&functions.Overload{
-				Operator: "is_admin_string",
-				Unary:    isAdminIn("alice"),
-			}),
-		},
-	}
-	env := lateBoundEnv(t)
-	ast, iss := env.Compile(`is_admin(user)`)
-	if iss.Err() != nil {
-		t.Fatalf("Compile() failed: %v", iss.Err())
-	}
-	prg, err := env.Program(ast)
-	if err != nil {
-		t.Fatalf("Program() failed: %v", err)
-	}
-	for _, tst := range tests {
-		tc := tst
-		t.Run(tc.name, func(t *testing.T) {
-			fns, err := NewLateFunctionBindings(tc.opt)
-			if err != nil {
-				t.Fatalf("NewLateFunctionBindings() failed: %v", err)
-			}
-			vars, err := NewLateBindingActivation(map[string]any{"user": "alice"}, fns)
-			if err != nil {
-				t.Fatalf("NewLateBindingActivation() failed: %v", err)
-			}
-			out, _, err := prg.Eval(vars)
-			if err != nil {
-				t.Fatalf("Eval() failed: %v", err)
-			}
-			if out != types.True {
-				t.Errorf("Eval() got %v, wanted true", out)
-			}
-		})
-	}
-}
-
-func TestNewLateFunctionBindingsErrors(t *testing.T) {
-	tests := []struct {
-		name string
-		opts []LateFunctionBindingsOpt
-		err  string
-	}{
-		{
-			name: "declaration without an implementation",
-			opts: []LateFunctionBindingsOpt{
-				LateFunction("is_admin",
-					Overload("is_admin_string", []*Type{StringType}, BoolType)),
-			},
-			err: "late function binding must provide an implementation: is_admin",
-		},
-		{
-			name: "declaration with a late binding",
-			opts: []LateFunctionBindingsOpt{
-				LateFunction("is_admin",
-					Overload("is_admin_string", []*Type{StringType}, BoolType,
-						LateFunctionBinding())),
-			},
-			err: "late function binding must provide an implementation: is_admin",
-		},
-		{
-			name: "invalid declaration",
-			opts: []LateFunctionBindingsOpt{
-				LateFunction("is_admin",
-					Overload("is_admin_string", []*Type{StringType}, BoolType,
-						UnaryBinding(isAdminIn("alice")),
-						UnaryBinding(isAdminIn("bob")))),
-			},
-			err: "already has a binding",
-		},
-		{
-			name: "nil declaration",
-			opts: []LateFunctionBindingsOpt{LateFunctionDecls(nil)},
-			err:  "function declaration must be non-nil",
-		},
-		{
-			name: "duplicate bindings",
-			opts: []LateFunctionBindingsOpt{
-				LateFunction("is_admin",
-					Overload("is_admin_string", []*Type{StringType}, BoolType,
-						UnaryBinding(isAdminIn("alice")))),
-				LateFunction("is_admin",
-					Overload("is_admin_string", []*Type{StringType}, BoolType,
-						UnaryBinding(isAdminIn("bob")))),
-			},
-			err: "overload already exists 'is_admin_string'",
-		},
-	}
-	for _, tst := range tests {
-		tc := tst
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := NewLateFunctionBindings(tc.opts...)
-			if err == nil || !strings.Contains(err.Error(), tc.err) {
-				t.Errorf("NewLateFunctionBindings() got error %v, wanted %q", err, tc.err)
-			}
-		})
 	}
 }
