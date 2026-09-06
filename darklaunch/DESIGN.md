@@ -367,11 +367,14 @@ func equal(a, b ref.Val) bool {
   are not part of the CEL contract and change between releases. The classifier
   buckets on `errors.Is` against exported sentinels plus prefix normalization
   for the common runtime errors (`no such key`, `no such overload`,
-  `division by zero`, `index out of range`, integer overflow). This is
-  best-effort, and honestly so: cel-go has no stable runtime error taxonomy
-  today, which is why the classifier lives in the `darklaunch` module where it
-  can evolve without an API commitment. A typed error kind on `types.Err` in
-  core would make it exact and is worth proposing separately.
+  `division by zero`, `index out of range`, integer overflow). cel-go has no
+  stable runtime error taxonomy today, but that is not the blocker it first
+  appears: OTel's `error.type` requires a documented, closed, low-cardinality
+  list with an `_OTHER` fallback rather than an exhaustive mapping, and the
+  class list is fixed to that shape in §10.5. The classifier still lives in the
+  `darklaunch` module so it can evolve without an API commitment; a typed error
+  kind on `types.Err` in core would make it exact and is worth proposing
+  separately.
 - **Unknowns.** Compared by attribute trail, never by expression ID —
   `*types.Unknown` is keyed by expr ID (common/types/unknown.go:148) and IDs
   are meaningless across two ASTs. `AttributeTrail.String()` gives a
@@ -459,7 +462,233 @@ that varies per deployment and belongs in whatever owns the rollout — a thin
 `Report` helper over `Snapshot` can be added later without disturbing anything
 here.
 
-## 10. Safety
+## 10. OpenTelemetry signal mapping
+
+Sources read on 2026-09-06 from `open-telemetry/semantic-conventions@main`
+(opentelemetry.io is unreachable from this environment; paths below are
+repository paths). Stability labels are the spec's own.
+
+### 10.1 What OTel already defines, and what it does not
+
+`feature_flag.*` (`docs/registry/attributes/feature-flag.md`, **Release
+Candidate**) is a near-exact structural fit for a policy decision:
+
+| Attribute | Notes |
+|---|---|
+| `feature_flag.key` | lookup key |
+| `feature_flag.set.id` | flag set the key belongs to |
+| `feature_flag.version` | version of the **ruleset** used in the evaluation |
+| `feature_flag.context.id` | evaluation-context id, "for example, the targeting key" |
+| `feature_flag.result.variant` | semantic identifier for the evaluated value |
+| `feature_flag.result.value` | the evaluated value, any type |
+| `feature_flag.result.reason` | closed enum: `cached`, `default`, `disabled`, `error`, `split`, `stale`, `static`, `targeting_match`, `unknown` |
+| `feature_flag.error.message` | human-readable error detail |
+
+Four older names are deprecated and must not be emitted: `feature_flag.variant`,
+`feature_flag.evaluation.reason`, `feature_flag.provider_name`,
+`feature_flag.evaluation.error.message`.
+
+Three absences matter more than the presences:
+
+- **There are no feature-flag metrics.** `docs/feature-flags/` contains only
+  `README.md` and `feature-flags-events.md`; `model/feature-flags/` contains
+  only `events.yaml`, `registry.yaml` and a `deprecated/` directory. Any
+  aggregate is ours to name.
+- **There is no span convention any more.** The evaluation is defined as an
+  event: `feature_flag.evaluation` (RC), whose attributes "SHOULD be recorded as
+  attributes on the Event passed to the Logger emit operations"
+  (`docs/feature-flags/feature-flags-events.md`). A prior spans convention
+  existed and is gone. High-volume sub-millisecond evaluations belong on the
+  log/event path, not the span path, and OTel has already made that call.
+- **There is no shadow, candidate or dark-launch concept anywhere.** Nothing in
+  the registry expresses "this result was computed and discarded" (§10.4).
+
+### 10.2 `result.reason` is about the provider, not about the policy
+
+The enum answers *how the provider resolved a value* — cached, stale, static,
+split, targeting matched. It does not answer *why the policy decided what it
+decided*. Emitting a matched CEL rule name into `feature_flag.result.reason`
+would be a misuse that also blows up its cardinality.
+
+The mapping that is actually defensible is narrow:
+
+| Evaluator state | `feature_flag.result.reason` |
+|---|---|
+| Result came from a constant-folded / fully static plan | `static` |
+| Policy fell through to its default branch | `default` |
+| Evaluation produced `*types.Err` | `error` |
+| Ordinary evaluation over input | `targeting_match` |
+
+And one state has no member at all: a **partial evaluation returning
+`*types.Unknown`** is neither a value nor an error. `unknown` exists in the enum
+but means "reason unknown", not "result unknown" — using it would be a second
+misuse. Unknown-ness therefore needs its own attribute (§10.4), and this gap is
+worth raising upstream: partial evaluation is not CEL-specific, and any flag
+provider that supports deferred resolution has it.
+
+*Which rule matched* has a better existing home: `security_rule.name` and
+`security_rule.ruleset.name` (`docs/registry/attributes/security-rule.md`,
+**Development**). The namespace is framed for "security monitoring and detection
+systems", which fits authorization and admission policies and does not fit
+routing or data-filtering policies. Recommendation: use it for the authz and
+admission archetypes, where the framing is honest, and do not stretch it to the
+others.
+
+### 10.3 Signals a range of common policies should capture
+
+Every archetype below shares the same core: policy identity and version, a
+low-cardinality decision label, a normalized error class, duration, cost, and
+whether the result was unknown. What differs is the decision label's domain and
+the subject attributes worth attaching.
+
+| Policy archetype | Decision label (`feature_flag.result.variant`) | Additional signals | Existing OTel home |
+|---|---|---|---|
+| Authorization (RBAC/ABAC) | `allow` / `deny` | matched rule, subject roles, resource, action | `security_rule.name`, `user.roles`, `enduser.pseudo.id` |
+| Admission / validation | `valid` / `invalid` | violation count, first failing field path | `error.type`, custom `cel.violations` |
+| Rate limit / quota | `permit` / `throttle` | limit, remaining | no OTel home; custom |
+| Routing / traffic selection | route name | candidate set size | `feature_flag.result.variant` fits natively |
+| Data filtering / redaction | `full` / `filtered` / `denied` | fields redacted count | custom; never the field values |
+| Feature gating | variant name | — | `feature_flag.*` verbatim |
+
+Subject identity: `user.*` and `enduser.*` are all **Development** stability.
+Prefer `enduser.pseudo.id`, explicitly defined as a random value not linked to
+the real identity, over `enduser.id`, which the registry marks as containing
+PII. `user.roles` (`string[]`) is the replacement for the deprecated
+`enduser.role`. Note that `enduser.scope` was deprecated with **no
+replacement** — OAuth-scope-driven policies have no standard attribute today,
+and inventing `cel.subject.scopes` is preferable to resurrecting a deprecated
+name.
+
+Stage: `deployment.environment.name` is **Stable** and is the right partition
+for "is this staging or production". There are no canary or rollout attributes
+in `deployment.*`, which is a second reason the dark-launch role attribute in
+§10.4 has to be ours.
+
+### 10.4 Dark-launch attributes: the ones OTel cannot supply
+
+```
+cel.evaluation.role      string   required   control | candidate | shadow_control
+cel.evaluation.applied   boolean  required   false when the result was discarded
+cel.result.kind          string   required   value | error | unknown
+cel.divergence.verdict   string   cond. req. match | value_differ | error_class_differ |
+                                             control_error_only | candidate_error_only |
+                                             unknown_differ | candidate_timeout |
+                                             candidate_cost_limit | candidate_panic
+cel.evaluation.cost      int      recommended
+cel.probe.name           string   cond. req.  on per-probe records only
+cel.expression.id        string   recommended stable identity across control and candidates
+```
+
+`cel.evaluation.applied` is the safety-critical one and is why it is *required*
+rather than recommended. Without it a shadow evaluation is indistinguishable in
+the backend from a real decision, and someone will eventually build an alert, a
+dashboard, or — worst — an audit trail on discarded results. A required boolean
+that is `false` for every candidate makes the mistake impossible to make
+silently.
+
+`cel.result.kind` covers the `unknown` gap from §10.2 and makes
+"value / error / unknown" a first-class partition, matching the layered
+comparison in §7 exactly.
+
+Namespace choice: `otel.*` is reserved to the specification
+(`docs/general/naming.md`), and the guidance for organization-specific names is
+reverse-domain or unique-application prefixing. `cel.*` is unregistered and
+therefore a mild squat, justified by CEL being a named language rather than one
+organization's product, and by the intent to propose it upstream. The risk is a
+future OTel `cel.*` with different semantics; the mitigation is that everything
+above is emitted through a `Sink` the user controls, so a rename is a
+one-file change in the exporter rather than a change to the runner.
+
+### 10.5 `error.type` resolves the error-taxonomy problem from §7
+
+`error.type` (`docs/registry/attributes/error.md`) is **Stable** and its
+guidance is directly usable: it "SHOULD be predictable, and SHOULD have low
+cardinality", the well-known fallback is `_OTHER`, and instrumentation libraries
+"SHOULD document their error reporting lists".
+
+That is the shape the §7 classifier needed. cel-go's lack of a stable runtime
+error taxonomy stops being a blocker, because the requirement is not an
+exhaustive mapping — it is a **documented, closed, low-cardinality list plus
+`_OTHER`**. The comparator's error classes become that list:
+`no_such_key`, `no_such_overload`, `no_such_attribute`, `division_by_zero`,
+`index_out_of_range`, `overflow`, `interrupt`, `cost_limit`, `_OTHER`. An
+unrecognized message falls to `_OTHER` rather than to a raw string, which caps
+cardinality by construction. Two candidates whose errors both classify as
+`_OTHER` are reported as `error_class_differ` only if their raw messages
+differ, and the raw message goes in `feature_flag.error.message`, which carries
+no cardinality obligation because it is an event attribute rather than a metric
+dimension.
+
+### 10.6 Never emit the result value by default
+
+The events convention warns that flag results "can be quite large or contain
+private or sensitive details", tells instrumentation authors to "redact or
+otherwise limit the size and scope" of `feature_flag.result.value`, and makes
+`result.variant` the preferred attribute because it conveys meaning without the
+value. `result.value` is Conditionally Required — required only when the
+provider supplies no variant, and **opt-in** otherwise.
+
+This is the same conclusion §9.1 reached independently, and the spec's framing
+sharpens it: the default emission is the low-cardinality decision label in
+`feature_flag.result.variant`, and the full `ref.Val` reaches
+`feature_flag.result.value` only on divergence, only when a redactor is
+installed, and never as a metric dimension. Policy inputs are exactly where
+PII lives, so this is not a formality.
+
+The probe-name validator in §5.6 gains a second justification here: probe names
+become metric attributes, and OTel's cardinality rules make a dynamic name a
+defect rather than merely inconvenient.
+
+### 10.7 Instruments
+
+No counter is proposed alongside the duration histogram. A histogram already
+carries a count, and the attribute set below distinguishes success from error,
+so a separate `cel.evaluations` counter would be redundant. Naming follows
+`docs/general/naming.md`: no `_total` suffix, plural only for discrete countable
+quantities with a `{unit}` annotation, and `.duration` for elapsed time.
+
+```
+cel.evaluation.duration            Histogram   s              per evaluation
+  attrs: feature_flag.key, feature_flag.set.id, cel.evaluation.role,
+         cel.result.kind, error.type, deployment.environment.name
+
+cel.evaluation.cost                Histogram   {cost}         actual cost, when tracked
+  attrs: as above
+
+cel.darklaunch.comparisons         Counter     {comparison}   one per candidate per job
+  attrs: feature_flag.key, cel.candidate.name, cel.divergence.verdict
+
+cel.darklaunch.probe.comparisons   Counter     {comparison}   one per probe per candidate
+  attrs: feature_flag.key, cel.candidate.name, cel.probe.name,
+         cel.divergence.verdict
+
+cel.darklaunch.dropped             Counter     {evaluation}   queue-full and unsafe-input drops
+  attrs: feature_flag.key, cel.drop.reason
+```
+
+Agreement rate is `verdict=match` over the total of
+`cel.darklaunch.comparisons`, so a single instrument answers the rollout
+question without a derived metric. Probe comparisons are a separate instrument
+because probe name multiplies the cardinality of every other dimension.
+
+### 10.8 Trace context across the async boundary
+
+The per-evaluation event belongs on the log path, but a background job may still
+warrant a span — and it must not be a child of the request span, which has
+already ended. The Tracing API defines Links as references to `SpanContext`s
+"from the same or a different trace"
+(`opentelemetry-specification/specification/trace/api.md`), which is the right
+primitive for work that is causally related to a finished operation.
+
+One constraint from that spec falls straight onto our design: adding links at
+span creation "is preferred to calling `AddLink` later ... because head sampling
+decisions can only consider information present during span creation". The
+originating `SpanContext` therefore has to be captured at **enqueue** time, on
+the request goroutine, and carried in the job struct — it cannot be recovered in
+the worker, where the request context is already dead. That is one more field on
+the job, and it has to be added when the job is built, not when it runs.
+
+## 11. Safety
 
 Overload never reaches the request path. `Runner.Eval` does a non-blocking send
 to a bounded queue and drops on full, counting the drop; the request path is
@@ -474,7 +703,7 @@ deadline. A runner with zero candidates, or with sampling at zero, is a
 pass-through with no worker pool: the kill switch is the absence of work, not a
 branch inside the evaluator.
 
-## 11. Required changes in the root module
+## 12. Required changes in the root module
 
 1. `interpreter/probes.go` — `ProbeObserver()` PlannerOption, `ProbeTrace`
    state, `decObserveProbes` decorator. Mirrors the `CostObserver` structure
@@ -492,9 +721,9 @@ Nothing in `cel/folding.go` changes: declaring `trace` late-bound reuses the
 folder's existing late-binding exemption (§5.3). Adopting the binding-based
 variant in §5.5 would reduce this list to item 4 alone.
 
-## 12. Phasing
+## 13. Phasing
 
-1. **Probes in core** (items 1–4 above) with unit tests covering: probes under
+1. **Probes in core** (items 1–4 of §12) with unit tests covering: probes under
    comprehensions; probes wrapping subexpressions that produce errors and
    unknowns, asserting the value is unchanged and the probe still fires; a fold
    test proving `trace` survives `NewConstantFoldingOptimizer` with constant
@@ -512,7 +741,7 @@ variant in §5.5 would reduce this list to item 4 alone.
    its source. Explicitly deferred — it only makes sense once the hand-annotated
    path has proven which probe placements are worth having.
 
-## 13. Open questions
+## 14. Open questions
 
 - Should the instrumented control's probe trace be compared against the
   *request-path* control at all, beyond the final value? Doing so would catch
@@ -524,3 +753,13 @@ variant in §5.5 would reduce this list to item 4 alone.
 - Cost comparison assumes both programs share a cost estimator. Candidates from
   a different env may not. The record should probably carry the estimator
   identity so incomparable costs are dropped rather than charted.
+- `feature_flag.*` is Release Candidate, not Stable, and four of its attribute
+  names were renamed in the last revision (§10.1). Adopting it now means
+  tracking one more rename before it settles. The alternative — an entirely
+  private namespace — trades that churn for permanent incompatibility with every
+  flag-aware backend, which seems the worse deal, but it is a call worth making
+  explicitly rather than by default.
+- Two gaps look worth proposing upstream rather than solving only here: no
+  `result.reason` member for a partial or unknown result (§10.2), and no
+  attribute anywhere for a shadow evaluation whose result was discarded
+  (§10.4). Neither is CEL-specific.
