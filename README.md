@@ -198,6 +198,63 @@ This technique can be useful when there are variables that are expensive to
 compute unless they are absolutely needed. This functionality will be the
 focus of many future improvements, so keep an eye out for more goodness here!
 
+#### Late-Bound Functions
+
+Function implementations are usually supplied when the environment is created,
+which allows the same `cel.Program` to be evaluated concurrently by many
+callers. Sometimes the implementation isn't known until evaluation time: the
+function may depend on a request context, on caller credentials, or on a cache
+whose lifetime is scoped to a single evaluation.
+
+Declare such a function with the `cel.LateFunctionBinding()` overload option.
+The declaration participates in type-checking as usual, but no implementation is
+resolved when the program is planned:
+
+```go
+env, _ := cel.NewEnv(
+    cel.Variable("user", cel.StringType),
+    cel.Function("is_admin",
+        cel.Overload("is_admin_string", []*cel.Type{cel.StringType}, cel.BoolType,
+            cel.LateFunctionBinding())),
+)
+ast, _ := env.Compile(`is_admin(user)`)
+prg, _ := env.Program(ast)
+```
+
+The implementation is then supplied with the input to `Eval`, using the same
+overload options which configure functions within an environment:
+
+```go
+fns, _ := cel.NewLateFunctionBindings(
+    cel.LateFunction("is_admin",
+        cel.Overload("is_admin_string", []*cel.Type{cel.StringType}, cel.BoolType,
+            cel.UnaryBinding(func(u ref.Val) ref.Val {
+                return types.Bool(admins.Contains(u))
+            }))),
+)
+vars, _ := cel.NewLateBindingActivation(map[string]any{"user": "alice"}, fns)
+out, _, err := prg.Eval(vars)
+```
+
+Calls are resolved by overload id first and by function name second, so a
+parse-only expression will dispatch dynamically across the supplied overloads.
+A call whose implementation cannot be resolved reports a `no such overload`
+error.
+
+Alternatively, the input `Activation` may serve the function implementations
+itself by implementing `cel.FunctionResolver`:
+
+```go
+func (a *requestActivation) ResolveFunction(name string) (*functions.Overload, bool) {
+    fn, found := a.fns[name]
+    return fn, found
+}
+```
+
+Note that constant folding will not fold a call to a late-bound function, and
+that late-bound functions may not be mixed with eagerly bound implementations
+within a single function declaration.
+
 ### Errors
 
 Parse and check errors have friendly error messages with pointers to where the

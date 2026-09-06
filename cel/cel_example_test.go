@@ -178,4 +178,62 @@ func Example_statefulOverload() {
 	// Output:true
 }
 
+func Example_lateBoundOverload() {
+	// Unlike the stateful overload example, the 'fetch' function is declared without an
+	// implementation, which means the expression only needs to be compiled and planned once.
+	env, err := cel.NewEnv(
+		// Identifiers used within this expression.
+		cel.Variable("resource", cel.StringType),
+		// Function to fetch a resource whose implementation is supplied at evaluation time.
+		//    fetch(resource)
+		cel.Function("fetch",
+			cel.Overload("fetch_string",
+				[]*cel.Type{cel.StringType}, cel.StringType,
+				cel.LateFunctionBinding(),
+			),
+		),
+	)
+	if err != nil {
+		log.Fatalf("environment creation error: %s\n", err)
+	}
+	ast, iss := env.Compile("fetch(resource) == 'my-value'")
+	if iss.Err() != nil {
+		log.Fatalf("Compile() failed: %v", iss.Err())
+	}
+	prg, err := env.Program(ast)
+	if err != nil {
+		log.Fatalf("env.Program() error: %s\n", err)
+	}
+
+	// The function implementation is bound to a request-scoped context and supplied to the
+	// evaluation alongside the variables.
+	ctx := context.WithValue(context.TODO(), contextString("my-resource"), "my-value")
+	fns, err := cel.NewLateFunctionBindings(
+		cel.LateFunction("fetch",
+			cel.Overload("fetch_string",
+				[]*cel.Type{cel.StringType}, cel.StringType,
+				cel.UnaryBinding(func(resource ref.Val) ref.Val {
+					return types.DefaultTypeAdapter.NativeToValue(
+						ctx.Value(contextString(string(resource.(types.String)))),
+					)
+				}),
+			),
+		),
+	)
+	if err != nil {
+		log.Fatalf("cel.NewLateFunctionBindings() failed: %s\n", err)
+	}
+	vars, err := cel.NewLateBindingActivation(map[string]any{"resource": "my-resource"}, fns)
+	if err != nil {
+		log.Fatalf("cel.NewLateBindingActivation() failed: %s\n", err)
+	}
+	out, _, err := prg.Eval(vars)
+	if err != nil {
+		log.Fatalf("runtime error: %s\n", err)
+	}
+
+	fmt.Println(out)
+	// Output:true
+}
+
 type contextString string

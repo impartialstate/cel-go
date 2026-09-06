@@ -127,6 +127,23 @@ func (a *hierarchicalActivation) ResolveName(name string) (any, bool) {
 	return a.parent.ResolveName(name)
 }
 
+// AsFunctionResolver implements the functionResolverConverter interface, prioritizing late-bound
+// function implementations supplied by the child activation over those of the parent.
+func (a *hierarchicalActivation) AsFunctionResolver() (FunctionResolver, bool) {
+	childFns, childFound := AsFunctionResolver(a.child)
+	parentFns, parentFound := AsFunctionResolver(a.parent)
+	switch {
+	case childFound && parentFound:
+		return functionResolvers{childFns, parentFns}, true
+	case childFound:
+		return childFns, true
+	case parentFound:
+		return parentFns, true
+	default:
+		return nil, false
+	}
+}
+
 // NewHierarchicalActivation takes two activations and produces a new one which prioritizes
 // resolution in the child first and parent(s) second.
 func NewHierarchicalActivation(parent Activation, child Activation) Activation {
@@ -176,6 +193,12 @@ func (a *partActivation) UnknownAttributePatterns() []*AttributePattern {
 // AsPartialActivation returns the partActivation as a PartialActivation interface.
 func (a *partActivation) AsPartialActivation() (PartialActivation, bool) {
 	return a, true
+}
+
+// AsFunctionResolver implements the functionResolverConverter interface, exposing any late-bound
+// function implementations supplied with the variables which the partial activation wraps.
+func (a *partActivation) AsFunctionResolver() (FunctionResolver, bool) {
+	return AsFunctionResolver(a.Activation)
 }
 
 // AsPartialActivation walks the activation hierarchy and returns the first PartialActivation, if found.

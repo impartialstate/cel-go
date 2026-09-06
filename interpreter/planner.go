@@ -281,6 +281,12 @@ func (p *planBuilder) planCall(expr ast.Expr) (Interpretable, error) {
 	if fnDef == nil {
 		fnDef, _ = p.disp.FindOverload(fnName)
 	}
+	// Functions declared with a late binding have no implementation at plan time. The call is
+	// planned as an arity-agnostic dispatch which resolves the implementation from the Activation
+	// supplied at evaluation time.
+	if fnDef != nil && fnDef.LateBound {
+		return p.planCallLateBound(expr, fnName, oName, fnDef, args)
+	}
 	switch argCount {
 	case 0:
 		return p.planCallZero(expr, fnName, oName, fnDef)
@@ -401,6 +407,23 @@ func (p *planBuilder) planCallVarArgs(expr ast.Expr,
 		trait:     trait,
 		impl:      fn,
 		nonStrict: nonStrict,
+	}, nil
+}
+
+// planCallLateBound generates a callable Interpretable whose implementation is resolved from the
+// Activation at evaluation time rather than from the Dispatcher at plan time.
+func (p *planBuilder) planCallLateBound(expr ast.Expr,
+	function string,
+	overload string,
+	impl *functions.Overload,
+	args []Interpretable) (Interpretable, error) {
+	return &evalLateBound{
+		id:        expr.ID(),
+		function:  function,
+		overload:  overload,
+		args:      args,
+		trait:     impl.OperandTrait,
+		nonStrict: impl.NonStrict,
 	}, nil
 }
 

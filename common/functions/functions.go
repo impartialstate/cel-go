@@ -48,6 +48,14 @@ type Overload struct {
 	// NonStrict specifies whether the Overload will tolerate arguments that
 	// are types.Err or types.Unknown.
 	NonStrict bool
+
+	// LateBound indicates that the Overload is a placeholder for an implementation which is
+	// supplied at evaluation time rather than at program planning time.
+	//
+	// Late-bound overloads do not declare a Unary, Binary, or Function implementation. Instead,
+	// the implementation is resolved from the input Activation. See the interpreter package
+	// FunctionResolver interface and the NewLateBindingActivation function for more detail.
+	LateBound bool
 }
 
 // UnaryOp is a function that takes a single value and produces an output.

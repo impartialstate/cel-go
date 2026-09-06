@@ -773,6 +773,84 @@ func TestOverloadFunctionLateBinding(t *testing.T) {
 	}
 }
 
+func TestFunctionLateBindingsPlaceholders(t *testing.T) {
+	fn, err := NewFunction("id",
+		Overload("id_bool", []*types.Type{types.BoolType}, types.AnyType,
+			LateFunctionBinding(), OverloadIsNonStrict()),
+	)
+	if err != nil {
+		t.Fatalf("NewFunction() failed: %v", err)
+	}
+	bindings, err := fn.Bindings()
+	if err != nil {
+		t.Fatalf("fn.Bindings() failed: %v", err)
+	}
+	// The overload id and the function name both resolve to a late-bound placeholder.
+	if len(bindings) != 2 {
+		t.Fatalf("fn.Bindings() got %d bindings, wanted 2", len(bindings))
+	}
+	for _, b := range bindings {
+		if !b.LateBound {
+			t.Errorf("binding %q was not marked as late-bound", b.Operator)
+		}
+		if !b.NonStrict {
+			t.Errorf("binding %q was not marked as non-strict", b.Operator)
+		}
+		if b.Unary != nil || b.Binary != nil || b.Function != nil {
+			t.Errorf("binding %q declared an implementation", b.Operator)
+		}
+	}
+	if bindings[0].Operator != "id_bool" || bindings[1].Operator != "id" {
+		t.Errorf("fn.Bindings() got operators %q, %q, wanted 'id_bool', 'id'",
+			bindings[0].Operator, bindings[1].Operator)
+	}
+}
+
+func TestFunctionLateBindingsMultipleOverloads(t *testing.T) {
+	fn, err := NewFunction("id",
+		Overload("id_bool", []*types.Type{types.BoolType}, types.AnyType, LateFunctionBinding()),
+		Overload("id_int", []*types.Type{types.IntType}, types.AnyType, LateFunctionBinding()),
+	)
+	if err != nil {
+		t.Fatalf("NewFunction() failed: %v", err)
+	}
+	bindings, err := fn.Bindings()
+	if err != nil {
+		t.Fatalf("fn.Bindings() failed: %v", err)
+	}
+	// Each overload plus a function-level placeholder for parse-only expressions. No dynamic
+	// dispatch function is generated since there are no implementations to dispatch between.
+	want := []string{"id_bool", "id_int", "id"}
+	if len(bindings) != len(want) {
+		t.Fatalf("fn.Bindings() got %d bindings, wanted %d", len(bindings), len(want))
+	}
+	for i, b := range bindings {
+		if b.Operator != want[i] {
+			t.Errorf("fn.Bindings()[%d] got operator %q, wanted %q", i, b.Operator, want[i])
+		}
+		if !b.LateBound {
+			t.Errorf("binding %q was not marked as late-bound", b.Operator)
+		}
+		if b.Function != nil {
+			t.Errorf("binding %q declared an implementation", b.Operator)
+		}
+	}
+}
+
+func TestFunctionLateBindingsWithSingleton(t *testing.T) {
+	fn, err := NewFunction("id",
+		Overload("id_bool", []*types.Type{types.BoolType}, types.AnyType, LateFunctionBinding()),
+		SingletonUnaryBinding(func(arg ref.Val) ref.Val { return arg }),
+	)
+	if err != nil {
+		t.Fatalf("NewFunction() failed: %v", err)
+	}
+	_, err = fn.Bindings()
+	if err == nil || !strings.Contains(err.Error(), "singleton function incompatible with late bindings") {
+		t.Errorf("fn.Bindings() got %v, wanted singleton function incompatible with late bindings", err)
+	}
+}
+
 func TestOverloadFunctionMixLateAndNonLateBinding(t *testing.T) {
 	_, err := NewFunction("id",
 		Overload("id_bool", []*types.Type{types.BoolType}, types.AnyType, LateFunctionBinding()),

@@ -611,6 +611,90 @@ func (fn *evalVarArgs) Args() []Interpretable {
 	return fn.args
 }
 
+// evalLateBound is an InterpretableCall whose implementation is resolved from the Activation at
+// evaluation time. Late-bound calls are generated for functions whose overloads are declared with
+// the decls.LateFunctionBinding() option.
+type evalLateBound struct {
+	id        int64
+	function  string
+	overload  string
+	args      []Interpretable
+	trait     int
+	nonStrict bool
+}
+
+// ID implements the Interpretable interface method.
+func (fn *evalLateBound) ID() int64 {
+	return fn.id
+}
+
+// Eval implements the Interpretable interface method.
+func (fn *evalLateBound) Eval(ctx Activation) ref.Val {
+	impl, found := resolveLateBoundOverload(ctx, fn.function, fn.overload)
+	if !found {
+		return types.NewErrWithNodeID(fn.id, "no such overload: %s", fn.function)
+	}
+	// The declaration determines whether the call tolerates error and unknown arguments, but a
+	// late binding may also opt into non-strict evaluation for the implementation it supplies.
+	strict := !fn.nonStrict && !impl.NonStrict
+	argVals := make([]ref.Val, len(fn.args))
+	for i, arg := range fn.args {
+		argVals[i] = arg.Eval(ctx)
+		if strict && types.IsUnknownOrError(argVals[i]) {
+			return argVals[i]
+		}
+	}
+	if len(argVals) == 0 {
+		if impl.Function == nil {
+			return types.NewErrWithNodeID(fn.id, "no such overload: %s()", fn.function)
+		}
+		return types.LabelErrNode(fn.id, impl.Function())
+	}
+	// The operand trait is declared by the function definition, but may also be specified by the
+	// late binding when the declaration does not require one.
+	trait := fn.trait
+	if trait == 0 {
+		trait = impl.OperandTrait
+	}
+	arg0 := argVals[0]
+	if trait == 0 || (!strict && types.IsUnknownOrError(arg0)) || arg0.Type().HasTrait(trait) {
+		switch len(argVals) {
+		case 1:
+			if impl.Unary != nil {
+				return types.LabelErrNode(fn.id, impl.Unary(arg0))
+			}
+		case 2:
+			if impl.Binary != nil {
+				return types.LabelErrNode(fn.id, impl.Binary(arg0, argVals[1]))
+			}
+		}
+		if impl.Function != nil {
+			return types.LabelErrNode(fn.id, impl.Function(argVals...))
+		}
+	}
+	// Otherwise, if the argument is a ReceiverType attempt to invoke the receiver method on the
+	// operand (arg0).
+	if arg0.Type().HasTrait(traits.ReceiverType) {
+		return types.LabelErrNode(fn.id, arg0.(traits.Receiver).Receive(fn.function, fn.overload, argVals[1:]))
+	}
+	return types.NewErrWithNodeID(fn.id, "no such overload: %s", fn.function)
+}
+
+// Function implements the InterpretableCall interface method.
+func (fn *evalLateBound) Function() string {
+	return fn.function
+}
+
+// OverloadID implements the InterpretableCall interface method.
+func (fn *evalLateBound) OverloadID() string {
+	return fn.overload
+}
+
+// Args returns the arguments to the late-bound function.
+func (fn *evalLateBound) Args() []Interpretable {
+	return fn.args
+}
+
 type evalList struct {
 	id           int64
 	elems        []Interpretable

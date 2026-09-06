@@ -336,6 +336,20 @@ func (f *FunctionDecl) Bindings() ([]*functions.Overload, error) {
 	for _, oID := range f.overloadOrdinals {
 		o := f.overloads[oID]
 		hasLateBinding = hasLateBinding || o.HasLateBinding()
+		if o.HasLateBinding() {
+			// Late-bound overloads have no implementation at plan time. A placeholder is emitted
+			// so that the planner can generate a call which resolves its implementation from the
+			// input Activation. Note, the operand trait and strictness of the call are properties
+			// of the declaration rather than of the runtime binding.
+			overloads = append(overloads, &functions.Overload{
+				Operator:     o.ID(),
+				OperandTrait: o.OperandTrait(),
+				NonStrict:    o.IsNonStrict(),
+				LateBound:    true,
+			})
+			nonStrict = nonStrict || o.IsNonStrict()
+			continue
+		}
 		if o.HasBinding() {
 			overload := &functions.Overload{
 				Operator:     o.ID(),
@@ -350,11 +364,11 @@ func (f *FunctionDecl) Bindings() ([]*functions.Overload, error) {
 		}
 	}
 	if f.singleton != nil {
-		if len(overloads) != 0 {
-			return nil, fmt.Errorf("singleton function incompatible with specialized overloads: %s", f.Name())
-		}
 		if hasLateBinding {
 			return nil, fmt.Errorf("singleton function incompatible with late bindings: %s", f.Name())
+		}
+		if len(overloads) != 0 {
+			return nil, fmt.Errorf("singleton function incompatible with specialized overloads: %s", f.Name())
 		}
 		overloads = []*functions.Overload{
 			{
@@ -382,11 +396,22 @@ func (f *FunctionDecl) Bindings() ([]*functions.Overload, error) {
 			Function:     overloads[0].Function,
 			NonStrict:    overloads[0].NonStrict,
 			OperandTrait: overloads[0].OperandTrait,
+			LateBound:    overloads[0].LateBound,
 		}), nil
 	}
 	// All of the defined overloads are wrapped into a top-level function which
 	// performs dynamic dispatch to the proper overload based on the argument types.
 	bindings := append([]*functions.Overload{}, overloads...)
+	if hasLateBinding {
+		// Late-bound functions have no implementations to dispatch between at plan time, so the
+		// function name is registered as a late-bound placeholder as well. Dynamic dispatch for
+		// parse-only expressions is handled by the runtime bindings supplied to the evaluation.
+		return append(bindings, &functions.Overload{
+			Operator:  f.Name(),
+			NonStrict: nonStrict,
+			LateBound: true,
+		}), nil
+	}
 	funcDispatch := func(args ...ref.Val) ref.Val {
 		for _, oID := range f.overloadOrdinals {
 			o := f.overloads[oID]

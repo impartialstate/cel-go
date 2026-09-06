@@ -166,6 +166,11 @@ func decRegexOptimizer(regexOptimizations ...*RegexOptimization) InterpretableDe
 }
 
 func maybeOptimizeConstUnary(i Interpretable, call InterpretableCall) (Interpretable, error) {
+	// Late-bound calls cannot be folded as their implementation is only known once an Activation
+	// is supplied to the evaluation.
+	if _, lateBound := i.(*evalLateBound); lateBound {
+		return i, nil
+	}
 	args := call.Args()
 	if len(args) != 1 {
 		return i, nil
