@@ -253,6 +253,13 @@ runtime bindings and error handling to do the right thing.
 * See the [CEL Spec][1] for the specification and conformance test suite.
 * Ask for support on the [CEL Go Discuss][2] Google group.
 
+### Can I use CEL as the expression language for templates?
+
+* See the [`template`](template/README.md) package, a text templating language which embeds CEL
+  expressions in `{{ ... }}` actions and type-checks the whole template up front. Its
+  [comparison](template/COMPARISON.md) with Go `text/template`, Jinja, and Helm + Sprig covers
+  when it is and is not the right tool.
+
 ### Where can I learn more about the internals?
 
 * See [GoDoc][6] to learn how to integrate CEL into services written in Go.
