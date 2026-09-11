@@ -195,6 +195,12 @@ Two mechanical notes:
   declaration flag alone would be inert. Both must be set: the declaration for
   checker and documentation consistency, the installed overload for actual
   runtime behaviour.
+- Non-strict makes the implementation responsible for propagating an error or
+  unknown in the **name** argument. A strict call returns the left-hand value
+  first; a non-strict one hands it to the binding, so a binding that
+  unconditionally returns argument two would swallow an error a strict call
+  would have surfaced. Both the identity and recording bindings test
+  `types.IsUnknownOrError(name)` first. Confirmed in the proof of concept.
 - On the non-strict path the result passes through
   `types.LabelErrNode(bin.id, ...)`, which stamps the trace node's ID onto an
   error only when the error carries no ID yet (common/types/err.go:81). Errors
@@ -228,11 +234,17 @@ Three constraints come with it, all load-bearing:
   `FunctionDecl.Bindings()` emits nothing for a late-bound overload
   (common/decls/decls.go:339), and `planCallBinary` accepts a nil
   implementation without error (interpreter/planner.go:359) — the program plans
-  cleanly and then fails at evaluation with `no such overload: trace`. This is
-  why the identity binding is supplied by the library's own `ProgramOptions()`
-  rather than left to the caller: `cel.Lib(ProbeLibrary())` installs the
-  declaration and the binding together, and there is no configuration in which
-  one arrives without the other.
+  cleanly and then fails at evaluation with `no such overload: trace`.
+  A library cannot close this hole on its own: `Library.ProgramOptions()` is
+  required to be static across every `Env.Program()` call (cel/library.go:51),
+  but a recording binding carries per-program state and must differ per
+  program. A library that supplied the identity binding statically would also
+  *block* the recording one, since `dispatcher.Add` rejects the duplicate —
+  verified in the proof of concept, which gets
+  `overload already exists 'trace_string_dyn'`. The library therefore supplies
+  no program options at all, and both paths are routed through constructors
+  that install exactly one binding: `NewProgram` for production identity,
+  `NewPool` for recording.
 - **A binding cannot be layered over an existing one.**
   `defaultDispatcher.Add` rejects a duplicate operator
   (interpreter/dispatcher.go:63), so a second `cel.Functions()` call cannot
@@ -610,10 +622,22 @@ That is the shape the §7 classifier needed. cel-go's lack of a stable runtime
 error taxonomy stops being a blocker, because the requirement is not an
 exhaustive mapping — it is a **documented, closed, low-cardinality list plus
 `_OTHER`**. The comparator's error classes become that list:
-`no_such_key`, `no_such_overload`, `no_such_attribute`, `division_by_zero`,
-`index_out_of_range`, `overflow`, `interrupt`, `cost_limit`, `_OTHER`. An
+`no_such_key`, `no_such_field`, `no_such_overload`, `no_such_attribute`,
+`division_by_zero`, `modulus_by_zero`, `overflow`, `index_out_of_range`,
+`conversion_error`, `interrupted`, `cost_limit_exceeded`, `_OTHER`. An
 unrecognized message falls to `_OTHER` rather than to a raw string, which caps
-cardinality by construction. Two candidates whose errors both classify as
+cardinality by construction.
+
+Classification is by message prefix because cel-go's error sentinels
+(`errDivideByZero`, `errIntOverflow` and the rest, common/types/err.go:42) are
+unexported, with two exceptions that arrive as typed errors and are matched
+with `errors.Is`/`errors.As`: `interpreter.InterruptError` and
+`interpreter.EvalCancelledError`, whose `CostLimitExceeded` cause distinguishes
+a cost-limit abort from a cancellation. The prefix table has to be checked
+against the evaluator rather than written from memory — the proof of concept's
+first draft guessed `index '%d' out of range` and the real message is
+`index out of bounds`, caught by a test that classifies errors from actual
+evaluations. Two candidates whose errors both classify as
 `_OTHER` are reported as `error_class_differ` only if their raw messages
 differ, and the raw message goes in `feature_flag.error.message`, which carries
 no cardinality obligation because it is an event attribute rather than a metric
@@ -730,9 +754,18 @@ variant in §5.5 would reduce this list to item 4 alone.
    arguments; and a negative test that a program built without the library's
    `ProgramOptions()` fails at evaluation rather than silently dropping probes
    (§5.3).
-2. **`darklaunch` module skeleton**: `Runner`, synchronous execution only,
+2. **`darklaunch` package skeleton**: `Runner`, synchronous execution only,
    comparator, `Record`, a logging sink. Synchronous first keeps the comparator
    under test without the concurrency surface.
+
+   *Partly built.* The proof of concept in this directory implements the §5.5
+   binding-based variant end to end — `trace()` declaration and bindings,
+   `Recorder`, `Pool`, error classification and the §10.7 instruments — with no
+   change to any existing package. What remains for this phase is the
+   comparator and the sink; `Result` already carries what they need. It lives in
+   the root module rather than its own because the offline development
+   environment cannot resolve a separate module's dependencies; see
+   README.md.
 3. **Async execution**: worker pool, sampling, bounded queue, deadlines,
    nondeterminism detection.
 4. **Aggregate and snapshot**, plus a worked example under `examples/`.
